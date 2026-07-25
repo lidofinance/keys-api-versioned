@@ -3,7 +3,9 @@
 //
 // The ABI files are the ones the canonical service uses, copied verbatim, so
 // both implementations are guaranteed to call the same methods with the same
-// signatures. Only the pieces actually needed are wired up.
+// signatures. Only the pieces actually needed are wired up. The one exception is
+// multicall3.json, which the canonical service has no use for: it is the standard
+// Multicall3 interface, and only aggregate3 is declared.
 package eth
 
 import (
@@ -18,6 +20,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/ethereum/go-ethereum/accounts/abi"
@@ -36,6 +39,7 @@ var (
 	CSMABI           abi.ABI
 	CMv2ABI          abi.ABI
 	MetaRegistryABI  abi.ABI
+	MulticallABI     abi.ABI
 	loadedABIs       []*abi.ABI
 	loadABIsOnce     sync.Once
 	loadABIsErr      error
@@ -54,6 +58,7 @@ func loadABIs() error {
 			{"abi/csm.json", &CSMABI},
 			{"abi/cmv2.json", &CMv2ABI},
 			{"abi/meta-registry.json", &MetaRegistryABI},
+			{"abi/multicall3.json", &MulticallABI},
 		} {
 			raw, err := abiFS.ReadFile(spec.file)
 			if err != nil {
@@ -101,6 +106,18 @@ type Client struct {
 	batchSz int
 	log     *slog.Logger
 
+	// Multicall3 aggregation: whether it was asked for, where it lives, what the
+	// presence probe found, and how much of it the endpoint turned out to tolerate.
+	multicall  bool
+	mcAddress  string
+	mcMaxCalls int
+	mcMaxCost  atomic.Int64
+	mcMu       sync.Mutex
+	mcProbed   bool
+	mcPresent  bool
+
+	stats stats
+
 	nextID int
 	mu     sync.Mutex
 }
@@ -112,10 +129,56 @@ type Options struct {
 	// BatchSize caps how many calls travel in one JSON-RPC request.
 	BatchSize int
 	Timeout   time.Duration
+	// Multicall packs a multi-call read into one Multicall3.aggregate3 instead of a
+	// JSON-RPC batch, which turns N round trips into one. Off by default because it
+	// depends on a contract being deployed; when on, presence is probed and the
+	// plain path stays as the fallback.
+	Multicall bool
+	// MulticallAddress overrides the standard deployment address. Only a chain that
+	// has Multicall3 somewhere else needs this.
+	MulticallAddress string
+	// MulticallMaxCalls caps how many reads go into one aggregate, and
+	// MulticallMaxCost caps their total Cost — the one that binds in practice, since
+	// an aggregate's inner calls share a single gas budget. A read whose own cost is
+	// above the budget is never aggregated.
+	MulticallMaxCalls int
+	MulticallMaxCost  int
 	// Log receives one debug line per JSON-RPC request. At debug level this is the
 	// only place that shows what a long sync is actually waiting on, which matters
 	// because a cold sync spends minutes inside these calls and says nothing.
 	Log *slog.Logger
+}
+
+// stats counts what the client sent. Round trips are the figure the ingest
+// throughput work is about: a cold sync's cost is dominated by how many requests
+// it makes, not by how many bytes they carry.
+type stats struct {
+	requests   atomic.Int64
+	calls      atomic.Int64
+	aggregates atomic.Int64
+	splits     atomic.Int64
+	fallbacks  atomic.Int64
+}
+
+// Stats is a snapshot of the request counters.
+type Stats struct {
+	// Requests is HTTP round trips, Calls the contract reads they carried.
+	Requests, Calls int64
+	// Aggregates is how many requests carried an aggregate3, Splits how many were
+	// halved after a node refused one, Fallbacks how many single calls ended up on
+	// the plain path.
+	Aggregates, Splits, Fallbacks int64
+}
+
+// Stats reports the counters so far.
+func (c *Client) Stats() Stats {
+	return Stats{
+		Requests:   c.stats.requests.Load(),
+		Calls:      c.stats.calls.Load(),
+		Aggregates: c.stats.aggregates.Load(),
+		Splits:     c.stats.splits.Load(),
+		Fallbacks:  c.stats.fallbacks.Load(),
+	}
 }
 
 // NewClient builds a client over a comma-separated endpoint list.
@@ -129,6 +192,15 @@ func NewClient(urls string, o Options) *Client {
 	if o.Timeout == 0 {
 		o.Timeout = 60 * time.Second
 	}
+	if o.MulticallAddress == "" {
+		o.MulticallAddress = MulticallAddress
+	}
+	if o.MulticallMaxCalls <= 0 {
+		o.MulticallMaxCalls = defaultMulticallMaxCalls
+	}
+	if o.MulticallMaxCost <= 0 {
+		o.MulticallMaxCost = defaultMulticallMaxCost
+	}
 
 	var list []string
 	for _, u := range strings.Split(urls, ",") {
@@ -141,13 +213,18 @@ func NewClient(urls string, o Options) *Client {
 		o.Log = slog.New(slog.NewTextHandler(io.Discard, nil))
 	}
 
-	return &Client{
-		urls:    list,
-		http:    &http.Client{Timeout: o.Timeout},
-		sem:     make(chan struct{}, o.Concurrency),
-		batchSz: o.BatchSize,
-		log:     o.Log,
+	c := &Client{
+		urls:       list,
+		http:       &http.Client{Timeout: o.Timeout},
+		sem:        make(chan struct{}, o.Concurrency),
+		batchSz:    o.BatchSize,
+		log:        o.Log,
+		multicall:  o.Multicall,
+		mcAddress:  strings.ToLower(o.MulticallAddress),
+		mcMaxCalls: o.MulticallMaxCalls,
 	}
+	c.mcMaxCost.Store(int64(o.MulticallMaxCost))
+	return c
 }
 
 type rpcRequest struct {
@@ -202,6 +279,7 @@ func (c *Client) do(ctx context.Context, reqs []rpcRequest) ([]json.RawMessage, 
 		req.Header.Set("Content-Type", "application/json")
 
 		started := time.Now()
+		c.stats.requests.Add(1)
 		resp, err := c.http.Do(req)
 		if err != nil {
 			lastErr = err
@@ -411,16 +489,61 @@ type Call struct {
 	ABI    *abi.ABI
 	Method string
 	Args   []any
+
+	// Cost is how much this read returns, in whatever unit the caller counts in —
+	// keys for a key read, and 0 (meaning one) for a plain getter.
+	//
+	// It exists because aggregation and batching have different economics.
+	// Separate eth_calls in a JSON-RPC batch each get their own gas budget; the
+	// inner calls of an aggregate share one, and the ceiling is real: on mainnet
+	// geth, two reads of 1100 curated keys in one aggregate come back "out of gas"
+	// while either alone is fine. So the client packs by cost, not by count, and a
+	// read too expensive to share goes out on its own.
+	Cost int
 }
 
-// CallBatch performs reads at one block, packing them into JSON-RPC batches, and
-// unpacks each result with its own ABI. Results come back in request order.
+func (c Call) cost() int {
+	if c.Cost <= 0 {
+		return 1
+	}
+	return c.Cost
+}
+
+// CallBatch performs reads at one block and unpacks each result with its own ABI.
+// Results come back in request order.
+//
+// How they travel depends on whether aggregating would save a round trip.
+// Multicall3 is used only when the plain path would need more than one request —
+// more calls than BatchSize allows — because that is the only case where it wins:
+// wrapping calls that already fit one JSON-RPC batch measured slightly *worse* on
+// the freshness cycle (0.99 s against 0.87 s per quiet cycle), the node having to
+// execute a dispatching contract for reads it would otherwise answer directly.
+//
+// The rule also explains why a hosted provider changes the picture without any
+// configuration: dRPC's free plan caps a batch at three requests, so a group of 200
+// key reads exceeds it by a wide margin and aggregation carries all of them in one
+// call.
 func (c *Client) CallBatch(ctx context.Context, at BlockRef, calls []Call) ([][]any, error) {
 	if err := loadABIs(); err != nil {
 		return nil, err
 	}
+	c.stats.calls.Add(int64(len(calls)))
 
 	out := make([][]any, len(calls))
+	if len(calls) > c.batchSz && c.aggregateReady(ctx, at) {
+		if err := c.callAggregate(ctx, at, calls, out); err != nil {
+			return nil, err
+		}
+		return out, nil
+	}
+	if err := c.callPlain(ctx, at, calls, out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// callPlain sends the reads as JSON-RPC batches, one eth_call per read.
+func (c *Client) callPlain(ctx context.Context, at BlockRef, calls []Call, out [][]any) error {
 	for start := 0; start < len(calls); start += c.batchSz {
 		end := min(start+c.batchSz, len(calls))
 		chunk := calls[start:end]
@@ -429,7 +552,7 @@ func (c *Client) CallBatch(ctx context.Context, at BlockRef, calls []Call) ([][]
 		for _, call := range chunk {
 			data, err := call.ABI.Pack(call.Method, call.Args...)
 			if err != nil {
-				return nil, fmt.Errorf("pack %s: %w", call.Method, err)
+				return fmt.Errorf("pack %s: %w", call.Method, err)
 			}
 			reqs = append(reqs, rpcRequest{
 				JSONRPC: "2.0", ID: c.id(), Method: "eth_call",
@@ -442,22 +565,22 @@ func (c *Client) CallBatch(ctx context.Context, at BlockRef, calls []Call) ([][]
 
 		results, err := c.do(ctx, reqs)
 		if err != nil {
-			return nil, err
+			return err
 		}
 
 		for i, raw := range results {
 			var hexResult string
 			if err := json.Unmarshal(raw, &hexResult); err != nil {
-				return nil, err
+				return err
 			}
 			values, err := chunk[i].ABI.Unpack(chunk[i].Method, common.FromHex(hexResult))
 			if err != nil {
-				return nil, fmt.Errorf("unpack %s: %w", chunk[i].Method, err)
+				return fmt.Errorf("unpack %s: %w", chunk[i].Method, err)
 			}
 			out[start+i] = values
 		}
 	}
-	return out, nil
+	return nil
 }
 
 // CallOne is CallBatch for a single read.

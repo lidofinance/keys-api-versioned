@@ -7,7 +7,6 @@ import (
 	"math/big"
 	"strconv"
 	"sync"
-	"time"
 
 	"github.com/lidofinance/keys-api-versioned/internal/eth"
 	"github.com/lidofinance/keys-api-versioned/internal/model"
@@ -29,9 +28,11 @@ import (
 //   - Operators have no on-chain name in CSM. CSM gets a generated one; CMv2
 //     resolves it through the module's META_REGISTRY, which is a second contract.
 type CommunityReader struct {
-	KeysBatch   uint64
-	Concurrency int
-	Log         *slog.Logger
+	KeysBatch       uint64
+	CallsPerRequest int
+	KeysPerRequest  uint64
+	Concurrency     int
+	Log             *slog.Logger
 
 	// metaRegistry caches the META_REGISTRY address per module, since it is an
 	// immutable pointer in practice and resolving it costs a call.
@@ -173,77 +174,17 @@ func (r *CommunityReader) resolveMetaRegistry(ctx context.Context, c *eth.Client
 	return address, nil
 }
 
-// Keys streams the keys of a community module.
+// Keys streams the keys of a community module — the walk is in keys.go.
 func (r *CommunityReader) Keys(ctx context.Context, c *eth.Client, at eth.BlockRef, moduleAddress string, operators []model.Operator, fn func(model.Key) error) error {
-	batchSize := r.KeysBatch
-	if batchSize == 0 {
-		batchSize = KeysBatchSize
-	}
-	concurrency := r.Concurrency
-	if concurrency <= 0 {
-		concurrency = 4
-	}
-
-	started := time.Now()
-	var read int
-	for _, op := range operators {
-		if op.TotalSigningKeys == 0 {
-			continue
-		}
-
-		spans := batchSpans(uint64(op.TotalSigningKeys), batchSize)
-		results := make([][]model.Key, len(spans))
-
-		var (
-			wg      sync.WaitGroup
-			sem     = make(chan struct{}, concurrency)
-			firstMu sync.Mutex
-			firstEr error
-		)
-		for i, span := range spans {
-			wg.Add(1)
-			go func(i int, span keySpan) {
-				defer wg.Done()
-				sem <- struct{}{}
-				defer func() { <-sem }()
-
-				out, err := c.CallOne(ctx, at, eth.Call{
-					To: moduleAddress, ABI: &eth.CSMABI, Method: "getSigningKeysWithSignatures",
-					Args: []any{
-						big.NewInt(int64(op.Index)),
-						new(big.Int).SetUint64(span.offset),
-						new(big.Int).SetUint64(span.limit),
-					},
-				})
-				if err == nil {
-					results[i], err = decodeCommunityKeys(out, moduleAddress, op, int32(span.offset))
-				}
-				if err != nil {
-					firstMu.Lock()
-					if firstEr == nil {
-						firstEr = fmt.Errorf("getSigningKeysWithSignatures(op %d, offset %d): %w", op.Index, span.offset, err)
-					}
-					firstMu.Unlock()
-				}
-			}(i, span)
-		}
-		wg.Wait()
-		if firstEr != nil {
-			return firstEr
-		}
-
-		for _, keys := range results {
-			for i := range keys {
-				if err := fn(keys[i]); err != nil {
-					return err
-				}
-				read++
-			}
-		}
-
-		logProgress(r.Log, moduleAddress, op, read, len(spans), started)
-	}
-	return nil
+	return streamKeys(ctx, c, at, moduleAddress, operators,
+		keysSpec{abi: &eth.CSMABI, method: "getSigningKeysWithSignatures", decode: decodeCommunityKeys},
+		keysPacing{
+			keysBatch:       r.KeysBatch,
+			callsPerRequest: r.CallsPerRequest,
+			keysPerRequest:  r.KeysPerRequest,
+			concurrency:     r.Concurrency,
+		},
+		r.Log, fn)
 }
 
 var _ ModuleReader = (*CommunityReader)(nil)

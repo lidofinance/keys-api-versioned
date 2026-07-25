@@ -68,7 +68,7 @@ Byte-identical covers the framing whitespace and the JSON property order of the 
 
 Two differences are structural rather than accidental, and `-live` accounts for both. **Module order:** the canonical service returns modules in physical row order (1, 2, 4, 3 on mainnet) and this one sorts by id, so the runner sorts module, operator and grouped arrays before comparing — without that it read module 4 against module 3 and called every field wrong. **Per-module `lastChangedBlockHash`:** it cannot match by design, since there it moves on every re-read and here only when the module's content changed.
 
-One thing a live pair does show honestly: a module mid-deposit differs on its counters. CSM deposits every minute or two, its rebuild takes about 70 s in a 1-CPU container, so this service sits one nonce behind on that module — two consecutive runs went `OK` then `FAIL .data[2].nonce: 5213 vs 5212`. That is lag, not disagreement; the key sets matched byte for byte in both runs. Closing it means faster CSM reads (Multicall3, or event logs), which is the ingest-throughput work in [docs/next-steps.md](docs/next-steps.md).
+One thing a live pair does show honestly: a module mid-deposit differs on its counters. CSM deposits every minute or two, its rebuild took about 70 s in a 1-CPU container, so this service sat one nonce behind on that module — two consecutive runs went `OK` then `FAIL .data[2].nonce: 5213 vs 5212`. That is lag, not disagreement; the key sets matched byte for byte in both runs. CSM's chain reads are now under 4 s rather than 51 s (see below), so what remains of the 70 s is the writer; whether the lag actually closes needs a fresh live-pair run.
 
 One trailing byte used to separate us from byte-identical on the non-streamed endpoints: `json.Encoder.Encode` appends a newline and Fastify does not.
 
@@ -101,17 +101,51 @@ The language is worth 15×; publishing versions is what removes the degradation 
 
 ### Our own writer, cold sync from an empty database
 
+Latest, with reads packed across operators. Same 1-CPU container and the same deliberately throttled knobs (batch 40 / concurrency 6) as the run before it, so the difference is the packing.
+
+| | now | before packing |
+|---|---|---|
+| Empty database to published version | **49 s** in a 1-CPU container | 2 m 28 s – 4 m 15 s (107 s on the host) |
+| module 1 — 471 732 keys, 39 operators | 40.5 s | 47 s |
+| module 2 — 14 205 keys, 82 operators | 1.5 s | 8 s |
+| module 3 (CSM) — 25 940 keys, 609 operators | 3.5 s keys, 2.3 s operators | 51 s |
+| module 4 (CMv2) — 0 keys, 1 operator | 0.4 s | 0.5 s |
+| On disk | key table 105 MB, key indexes 97 MB, database 211 MB | |
+| Idle memory after the sync | 26 MiB of 512 | |
+| Quiet cycle, steady state | 0.70 s mean over 12 cycles | 0.81 s |
+
+**Still node-bound, not database-bound.** Module 1's chain read alone is 83 % of the sync, and the writer's share does not stand out above the node's own variance: the same reads with no database at all, at the same knobs, took 49.6 s in one run against a 49.0 s full sync in another, while module 1 came back at 40.5, 43.4 and 46.4 s across three runs an hour apart. So the writer costs single-digit seconds at most, and it is not what to optimise next. Opening the throttled knobs is worth roughly a quarter (37.7 s of chain reads at batch 100 / concurrency 8), and after that the only lever left on module 1 is event logs.
+
+Worth stating because subtracting across runs led the wrong way once already: 37 s of chain reads against a 58 s sync looked like Postgres had become the bottleneck, when most of the gap was the throttling the read-only run had not used.
+
+Round-trip bound, not key bound: CSM's 26 000 keys cost more wall clock than module 1's 472 000, because CSM has 609 operators and module 1 has 39. That is what the next section fixes.
+
+### Ingest: packing reads into requests
+
+Key reads used to go one per HTTP request, one operator at a time, so mainnet's 731 operators cost 731 round trips and the tail of small CSM operators dominated the sync. Reads are now packed across operators — into a JSON-RPC batch, or into one `Multicall3.aggregate3` call — and the reader hands whole groups to the client, which decides how they travel. Measured against our own mainnet geth, chain reads only, batch 100 and concurrency 8:
+
+| | CSM (module 3), 25 940 keys, 609 operators | all four modules, 511 877 keys |
+|---|---|---|
+| One read per request, as before | 58.2 s, 606 requests | — |
+| Packed into JSON-RPC batches | 3.8 s, 29 requests | 39.2 s, 273 requests, 9.5 calls per request |
+| Packed into Multicall3 aggregates | 3.7 s, 44 requests | 37.7 s, 306 requests, 8.5 calls per request |
+
+**Against a node of our own with a batch of 100, packing is the whole win and aggregation adds nothing measurable.** 15× on CSM comes from batching; the 1.5 s between the last two rows is inside the run-to-run spread. Module 1 barely moves either way (33.2 s against 30.9 s for 471 732 keys) because it is bound by execution on the node — about half a second per 1100-key read — not by latency. The tail was the problem, and packing of any kind removes it.
+
+Aggregation earns its place exactly where a batch cannot carry the group. At the stand's throttled batch of 40, a 200-call group needs five requests plainly and one aggregated, and CSM goes 5.78 s / 53 requests to 4.44 s / 35. So the rule is not "aggregate when possible" but **aggregate when the plain path would need more than one request**, which is what the client does. Wrapping calls that already fit one batch measured slightly worse — 0.99 s against 0.87 s per quiet freshness cycle — because the node executes a dispatching contract for reads it would otherwise answer directly.
+
+**Against a hosted provider, aggregation is the only packing available.** On dRPC's free plan a JSON-RPC batch of more than three requests is refused outright (`Batch of more than 3 requests are not allowed on free plan`), which caps the plain path at 3 calls per round trip. Module 2, 14 205 keys, concurrency 2:
+
 | | |
 |---|---|
-| Empty database to published version | **107 s** on the host, **2 m 28 s – 4 m 15 s** in a 1-CPU container; batch 40 / concurrency 6 |
-| module 1 — 471 732 keys, 39 operators | 47 s |
-| module 2 — 14 205 keys, 82 operators | 8 s |
-| module 3 (CSM) — 25 940 keys, 609 operators | 51 s |
-| module 4 (CMv2) — 0 keys, 1 operator | 0.5 s |
-| On disk | key table 105 MB, key indexes 97 MB, database 211 MB |
-| Quiet cycle, steady state | 0.81 s mean — a header, module nonces, one log filter per module, one row update |
+| No aggregation, batch capped at 3 | 8.96 s, 86 requests, 2.8 calls per request |
+| Multicall3 | 2.50 s, 18 requests, 10.7 calls per request |
 
-Round-trip bound, not key bound: CSM's 26 000 keys cost more wall clock than module 1's 472 000, because CSM has 609 operators and module 1 has 39. Opening the provider knobs is the first lever, not code.
+So the two mechanisms are not redundant: batching wins where we run the node, aggregation wins where someone else does and meters it.
+
+**The ceiling that shaped the design.** An aggregate's inner calls share one `eth_call` gas budget while separate calls in a JSON-RPC batch each get their own. Two reads of 1100 curated keys in one aggregate come back `out of gas` from mainnet geth; 200 reads of one key each are fine. So aggregates are bounded by *keys returned* rather than by call count (`Call.Cost`), and a read too expensive to share goes out plainly. The first version bounded them by count, which cost nothing on the CSM tail and quietly wrecked module 1 — it bisected on every group, then dragged a permanently lowered call cap into the modules after it, turning CSM's 22 requests into 908. Worth recording because both halves of the mistake were invisible in a per-module run: the failure showed up only in a full sync, in the module that had not failed.
+
+Nothing about this needs configuring per endpoint. Presence of the contract is probed once (devnets have none), a refused aggregate is bisected and the budget lowered to what worked, and an endpoint that refuses even a single aggregated read turns aggregation off for the process. `PROVIDER_MULTICALL=false` is the manual escape hatch.
 
 ### Paging and diffs
 

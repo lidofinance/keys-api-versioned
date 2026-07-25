@@ -24,7 +24,23 @@
 //	PROVIDER_JSON_RPC_MAX_BATCH_SIZE  calls per JSON-RPC request (default 100)
 //	PROVIDER_CONCURRENT_REQUESTS      in-flight requests (default 8)
 //	KEYS_BATCH_SIZE                   keys per contract call (default 1100)
+//	KEYS_CALLS_PER_REQUEST            key reads packed into one request (default 200)
+//	KEYS_PER_REQUEST                  keys one request may return (default 2200)
+//	KEYS_READ_CONCURRENCY             request groups in flight per module read
+//	                                  (defaults to PROVIDER_CONCURRENT_REQUESTS)
+//	PROVIDER_MULTICALL                pack reads into Multicall3 (default true)
+//	PROVIDER_MULTICALL_ADDRESS        override the standard deployment address
+//	PROVIDER_MULTICALL_MAX_CALLS      reads per aggregate (default 200)
+//	PROVIDER_MULTICALL_MAX_KEYS       keys one aggregate may return (default 1000)
 //	LOG_LEVEL                         debug | info (default) | warn | error
+//
+// Multicall3 is a contract, not a node feature, so it needs no support from the
+// endpoint — but what an endpoint tolerates in one eth_call does vary, and a hosted
+// provider caps it lower than a node of our own. Nothing has to be configured for
+// that: presence is probed, a refused aggregate is bisected and the budget lowered
+// to what worked, and an endpoint that refuses even one aggregated read turns
+// aggregation off for the process. PROVIDER_MULTICALL=false is the manual escape
+// hatch, and with it off the ingest behaves as it did before aggregation existed.
 //
 // LOG_LEVEL=debug is worth knowing about: it adds one line per JSON-RPC request, a
 // staging heartbeat every five seconds during a long module read, the freshness
@@ -221,16 +237,27 @@ func buildSource(ctx context.Context, chainID int64, log *slog.Logger) (source.P
 		}
 
 		client := eth.NewClient(urls, eth.Options{
-			Concurrency: envInt("PROVIDER_CONCURRENT_REQUESTS", 8),
-			BatchSize:   envInt("PROVIDER_JSON_RPC_MAX_BATCH_SIZE", 100),
-			Timeout:     time.Duration(envInt("PROVIDER_TIMEOUT_MS", 120_000)) * time.Millisecond,
+			Concurrency:       envInt("PROVIDER_CONCURRENT_REQUESTS", 8),
+			BatchSize:         envInt("PROVIDER_JSON_RPC_MAX_BATCH_SIZE", 100),
+			Timeout:           time.Duration(envInt("PROVIDER_TIMEOUT_MS", 120_000)) * time.Millisecond,
+			Multicall:         envBool("PROVIDER_MULTICALL", true),
+			MulticallAddress:  envOr("PROVIDER_MULTICALL_ADDRESS", eth.MulticallAddress),
+			MulticallMaxCalls: envInt("PROVIDER_MULTICALL_MAX_CALLS", 0),
+			MulticallMaxCost:  envInt("PROVIDER_MULTICALL_MAX_KEYS", 0),
 			// At LOG_LEVEL=debug this prints one line per JSON-RPC request, which is
 			// how a slow sync becomes legible instead of silent.
 			Log: log,
 		})
 		provider := lidocore.NewProvider(client, locator, lidocore.Options{
-			KeysBatch:   uint64(envInt("KEYS_BATCH_SIZE", lidocore.KeysBatchSize)),
-			Concurrency: envInt("PROVIDER_CONCURRENT_REQUESTS", 8),
+			KeysBatch:       uint64(envInt("KEYS_BATCH_SIZE", lidocore.KeysBatchSize)),
+			CallsPerRequest: envInt("KEYS_CALLS_PER_REQUEST", lidocore.CallsPerRequest),
+			KeysPerRequest:  uint64(envInt("KEYS_PER_REQUEST", lidocore.KeysPerRequest)),
+			// How many request groups a module read keeps in flight. It defaults to the
+			// client's own limit because that is the ceiling anyway — the semaphore in
+			// the client is what actually bounds requests — and is separable for the
+			// case where the two want different values: many groups queued against a
+			// node that tolerates few concurrent requests.
+			Concurrency: envInt("KEYS_READ_CONCURRENCY", envInt("PROVIDER_CONCURRENT_REQUESTS", 8)),
 			Log:         log,
 		})
 		log.Info("source: lido core",
@@ -331,6 +358,18 @@ func envInt(key string, def int) int {
 		return def
 	}
 	return n
+}
+
+func envBool(key string, def bool) bool {
+	v := os.Getenv(key)
+	if v == "" {
+		return def
+	}
+	parsed, err := strconv.ParseBool(v)
+	if err != nil {
+		return def
+	}
+	return parsed
 }
 
 func logLevel() slog.Level {

@@ -5,6 +5,12 @@
 // the read half: it answers "can we reach the chain, do the module types resolve,
 // how fast do keys come back" in one command, which is what you want when a node is
 // misbehaving and you do not want to involve a database.
+//
+// It is also where ingest throughput is measured, because it reports round trips
+// per module alongside the keys. A cold sync is bound by requests rather than
+// bytes, so the comparison worth running against a given endpoint is
+// -multicall=false against the default, and the number to read is calls per
+// request: 1.0 means every read cost its own round trip.
 package main
 
 import (
@@ -34,10 +40,22 @@ func main() {
 		batchSize   = flag.Int("rpc-batch", 20, "calls per JSON-RPC request")
 		concurrency = flag.Int("rpc-concurrency", 4, "in-flight JSON-RPC requests")
 		keysBatch   = flag.Uint64("keys-batch", lidocore.KeysBatchSize, "keys per contract call")
+		keysWorkers = flag.Int("keys-concurrency", 0, "request groups in flight per module; 0 follows -rpc-concurrency")
+		callsPerReq = flag.Int("calls-per-request", lidocore.CallsPerRequest, "key reads packed into one request")
+		keysPerReq  = flag.Uint64("keys-per-request", lidocore.KeysPerRequest, "keys one request may return")
+		multicall   = flag.Bool("multicall", true, "pack reads into one Multicall3.aggregate3 per request")
+		mcAddress   = flag.String("multicall-address", eth.MulticallAddress, "Multicall3 address")
+		mcMaxCalls  = flag.Int("multicall-max-calls", 0, "reads per aggregate; 0 uses the default")
+		mcMaxCost   = flag.Int("multicall-max-cost", 0, "keys one aggregate may return; 0 uses the default")
+		verbose     = flag.Bool("v", false, "debug logging: one line per JSON-RPC request")
 	)
 	flag.Parse()
 
-	log := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	level := slog.LevelInfo
+	if *verbose {
+		level = slog.LevelDebug
+	}
+	log := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: level}))
 
 	if *rpc == "" {
 		log.Error("no execution endpoint: pass -rpc or set PROVIDERS_URLS")
@@ -46,13 +64,25 @@ func main() {
 
 	ctx := context.Background()
 	client := eth.NewClient(*rpc, eth.Options{
-		Concurrency: *concurrency,
-		BatchSize:   *batchSize,
-		Timeout:     2 * time.Minute,
+		Concurrency:       *concurrency,
+		BatchSize:         *batchSize,
+		Timeout:           2 * time.Minute,
+		Multicall:         *multicall,
+		MulticallAddress:  *mcAddress,
+		MulticallMaxCalls: *mcMaxCalls,
+		MulticallMaxCost:  *mcMaxCost,
+		Log:               log,
 	})
+	readWorkers := *keysWorkers
+	if readWorkers <= 0 {
+		readWorkers = *concurrency
+	}
 	provider := lidocore.NewProvider(client, *locator, lidocore.Options{
-		KeysBatch:   *keysBatch,
-		Concurrency: *concurrency,
+		KeysBatch:       *keysBatch,
+		CallsPerRequest: *callsPerReq,
+		KeysPerRequest:  *keysPerReq,
+		Concurrency:     readWorkers,
+		Log:             log,
 	})
 
 	head, err := provider.Head(ctx)
@@ -98,6 +128,7 @@ func main() {
 		}
 
 		started := time.Now()
+		before := client.Stats()
 		var (
 			count  int
 			used   int
@@ -123,18 +154,54 @@ func main() {
 		}
 
 		took := time.Since(started)
+		spent := since(before, client.Stats())
 		log.Info("keys read",
 			"module", m.ID,
 			"keys", count,
 			"used", used,
 			"vetted", vetted,
 			"took", took.Round(time.Millisecond).String(),
-			"keys/s", int(float64(count)/took.Seconds()))
+			"keys/s", int(float64(count)/took.Seconds()),
+			// Round trips are the figure to watch: this module's cost is latency ×
+			// requests far more than it is bytes.
+			"requests", spent.Requests,
+			"calls", spent.Calls,
+			"aggregates", spent.Aggregates,
+			"aggregates_split", spent.Splits,
+			"aggregate_fallbacks", spent.Fallbacks)
 		if count > 0 {
 			fmt.Printf("    first key: operator %d index %d used %t vetted %t\n      %s\n      %s\n",
 				sample.OperatorIndex, sample.Index, sample.Used, sample.Vetted,
 				model.EncodeHex(sample.PubkeyBin), model.EncodeHex(sample.SignatureBin))
 		}
+	}
+
+	total := client.Stats()
+	log.Info("rpc totals",
+		"requests", total.Requests, "calls", total.Calls,
+		"calls_per_request", ratio(total.Calls, total.Requests),
+		"aggregates", total.Aggregates, "aggregates_split", total.Splits,
+		"aggregate_fallbacks", total.Fallbacks)
+}
+
+// ratio renders calls per request to one decimal, which is the packing figure: 1.0
+// means every read cost its own round trip.
+func ratio(calls, requests int64) string {
+	if requests == 0 {
+		return "0"
+	}
+	return fmt.Sprintf("%.1f", float64(calls)/float64(requests))
+}
+
+// since is the difference between two counter snapshots, so a per-module line
+// reports that module's cost rather than the process total.
+func since(before, after eth.Stats) eth.Stats {
+	return eth.Stats{
+		Requests:   after.Requests - before.Requests,
+		Calls:      after.Calls - before.Calls,
+		Aggregates: after.Aggregates - before.Aggregates,
+		Splits:     after.Splits - before.Splits,
+		Fallbacks:  after.Fallbacks - before.Fallbacks,
 	}
 }
 

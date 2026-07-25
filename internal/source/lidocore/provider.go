@@ -70,7 +70,13 @@ type ModuleReader interface {
 type Options struct {
 	// KeysBatch is how many keys one contract call asks for.
 	KeysBatch uint64
-	// Concurrency bounds in-flight key batches per module.
+	// CallsPerRequest is how many key reads are packed into one request group, and
+	// KeysPerRequest caps how many keys those may return in total. Together they
+	// decide how much of the per-operator round-trip cost is paid: mainnet's 731
+	// operators cost 731 requests at 1, and a few dozen at 200.
+	CallsPerRequest int
+	KeysPerRequest  uint64
+	// Concurrency bounds in-flight request groups per module.
 	Concurrency int
 	// Readers overrides the default reader set. Empty means curated + community.
 	Readers []ModuleReader
@@ -95,8 +101,14 @@ func NewProvider(client *eth.Client, locator string, o Options) *Provider {
 	readers := o.Readers
 	if len(readers) == 0 {
 		readers = []ModuleReader{
-			&CuratedReader{KeysBatch: o.KeysBatch, Concurrency: o.Concurrency, Log: o.Log},
-			&CommunityReader{KeysBatch: o.KeysBatch, Concurrency: o.Concurrency, Log: o.Log},
+			&CuratedReader{
+				KeysBatch: o.KeysBatch, CallsPerRequest: o.CallsPerRequest,
+				KeysPerRequest: o.KeysPerRequest, Concurrency: o.Concurrency, Log: o.Log,
+			},
+			&CommunityReader{
+				KeysBatch: o.KeysBatch, CallsPerRequest: o.CallsPerRequest,
+				KeysPerRequest: o.KeysPerRequest, Concurrency: o.Concurrency, Log: o.Log,
+			},
 		}
 	}
 
@@ -345,6 +357,22 @@ const KeysBatchSize = 1100
 // operatorBatchSize is how many per-operator call pairs go into one request
 // group; it mirrors the canonical REGISTRY_OPERATORS_BATCH_SIZE.
 const operatorBatchSize = 200
+
+// CallsPerRequest and KeysPerRequest bound one group of key reads.
+//
+// The pair exists because two different things can make a group too big for a
+// node: too many calls (each one costs base gas and a bounds check) or too many
+// keys returned (each key is five storage words plus its share of the response).
+// 200 calls of one key each and two calls of 1100 keys each are both a fraction of
+// geth's 50M eth_call gas cap; either limit alone would allow a group that is not.
+//
+// Neither is a correctness bound — a node that refuses a group has it bisected —
+// so these are the starting point, and the number a provider actually tolerates is
+// what E9 measures.
+const (
+	CallsPerRequest = 200
+	KeysPerRequest  = 2 * KeysBatchSize
+)
 
 var (
 	_ source.Provider        = (*Provider)(nil)
