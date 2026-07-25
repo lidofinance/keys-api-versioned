@@ -228,9 +228,9 @@ paths:
       tags: [keys]
       summary: Keys grouped by module
       description: |
-        Not streamed, matching the canonical shape: the whole response is built in
-        memory. At mainnet scale that is a ~28 MiB peak here; it is the one endpoint in
-        this service that is not streamed.
+        Streamed, unlike the canonical service, which builds the whole response in
+        memory and does not fit in 512 MiB at mainnet scale. The bytes are the same
+        either way.
       parameters:
         - $ref: '#/components/parameters/Used'
         - $ref: '#/components/parameters/OperatorIndex'

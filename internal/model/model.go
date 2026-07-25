@@ -29,6 +29,22 @@ type Key struct {
 	SignatureBin []byte `json:"-"`
 }
 
+// EnsureHex fills the string fields from the binary ones.
+//
+// It exists because two response paths coexist: the streaming encoder writes hex
+// straight from the bytes and never needs the strings, while the few endpoints that
+// marshal with encoding/json do. A key that came from the binary store and goes
+// through the second path without this returns `"key": ""` — which is exactly what
+// /v1/modules/keys did until a parity run against the canonical service caught it.
+func (k *Key) EnsureHex() {
+	if k.Key == "" && k.PubkeyBin != nil {
+		k.Key = EncodeHex(k.PubkeyBin)
+	}
+	if k.DepositSignature == "" && k.SignatureBin != nil {
+		k.DepositSignature = EncodeHex(k.SignatureBin)
+	}
+}
+
 // EncodeHex renders bytes the way the API does: lowercase hex with a 0x prefix.
 func EncodeHex(b []byte) string {
 	if b == nil {

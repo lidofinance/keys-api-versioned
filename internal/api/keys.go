@@ -194,22 +194,21 @@ func (s *Server) handleModuleKeys(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// handleGroupedKeys returns keys grouped by module (not streamed in canonical
-// either, so the shape is a plain object).
+// handleGroupedKeys returns keys grouped by module.
+//
+// Streamed, unlike the canonical service, which builds the whole response in memory
+// and dies at a 512 MiB limit on mainnet data. Ours did too for one commit: an
+// earlier version collected every key into a slice, which only looked survivable
+// while a bug left the hex strings empty — 511 877 keys with their pubkeys and
+// signatures materialised is around half a gigabyte of strings.
+//
+// The bytes are identical to the collected version, envelope and property order
+// included; only the memory is different.
 func (s *Server) handleGroupedKeys(w http.ResponseWriter, r *http.Request) {
 	filter, err := parseFilter(r, false)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err.(errBadRequest).messages)
 		return
-	}
-
-	type group struct {
-		Keys   []model.Key         `json:"keys"`
-		Module model.StakingModule `json:"module"`
-	}
-	type response struct {
-		Data []group `json:"data"`
-		Meta meta    `json:"meta"`
 	}
 
 	ctx := r.Context()
@@ -230,20 +229,37 @@ func (s *Server) handleGroupedKeys(w http.ResponseWriter, r *http.Request) {
 			return err
 		}
 
-		out := response{Data: make([]group, 0, len(modules)), Meta: meta{ELBlockSnapshot: elMeta}}
+		w.Header().Set("Content-Type", "application/json")
+		bw := bufio.NewWriterSize(w, streamBufferSize)
+		defer bw.Flush()
+
+		bw.WriteString(`{"data":[`)
 		for i := range modules {
-			keys := make([]model.Key, 0, 1024)
-			err := snap.StreamKeys(ctx, modules[i].RawAddress(), filter, func(k *model.Key) error {
-				keys = append(keys, *k)
+			if i > 0 {
+				bw.WriteByte(',')
+			}
+			bw.WriteString(`{"keys":[`)
+
+			first := true
+			if err := snap.StreamKeys(ctx, modules[i].RawAddress(), filter, func(k *model.Key) error {
+				if !first {
+					bw.WriteByte(',')
+				}
+				first = false
+				writeKey(bw, k)
 				return nil
-			})
-			if err != nil {
+			}); err != nil {
 				return err
 			}
-			out.Data = append(out.Data, group{Keys: keys, Module: modules[i]})
-		}
 
-		return writeJSON(w, out)
+			bw.WriteString(`],"module":`)
+			bw.Write(marshalCompact(modules[i]))
+			bw.WriteByte('}')
+		}
+		bw.WriteString(`],"meta":{"elBlockSnapshot":`)
+		bw.Write(marshalCompact(elMeta))
+		bw.WriteString(`}}`)
+		return nil
 	})
 	if err != nil && !writeStoreError(w, err) {
 		writeError(w, http.StatusInternalServerError, err.Error())

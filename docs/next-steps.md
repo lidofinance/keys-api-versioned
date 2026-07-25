@@ -35,7 +35,7 @@ Proven, with numbers in the README and the design notes:
 
 | | |
 |---|---|
-| Total, empty database to published version | **107 s** on the host (repeat run 110 s); **~4 min 15 s** in the container at 1 CPU |
+| Total, empty database to published version | **107 s** on the host (repeat run 110 s); **2 min 28 s – 4 min 15 s** in the container at 1 CPU |
 | Keys written | 511 877 keys and 731 operators across 4 modules (39 / 82 / 609 / 1) |
 | module 1 — 471 732 keys, 39 operators | 47 s |
 | module 2 — 14 205 keys, 82 operators | 8 s |
@@ -44,7 +44,7 @@ Proven, with numbers in the README and the design notes:
 | Result on disk | key table 105 MB, key indexes 97 MB, whole database 211 MB |
 | Quiet cycle, steady state | 0.81 s mean over 9 cycles (header, modules with nonces, one log filter per module, one row update) |
 
-The container figure is the one that matters for a deployment, and the gap between the two is not Postgres: it is one core doing the JSON decoding and ABI unpacking for half a million keys while also running the HTTP server. Module 1 took 2 m 32 s in the container against 47 s on the host, and CSM's 609-operator tail crawled at ~300 keys/s.
+The container figure is the one that matters for a deployment, and the gap between the two is not Postgres: it is one core doing the JSON decoding and ABI unpacking for half a million keys while also running the HTTP server. Its own spread — 2 m 28 s against 4 m 15 s across two runs — is what else the host was doing at the time, mostly the canonical service syncing beside it: module 1 took 1 m 4 s in the quieter run and 2 m 32 s in the busier one. CSM's 609-operator tail crawls at ~300 keys/s either way.
 
 Two things that table says plainly. The sync is **round-trip bound, not key bound**: CSM's 26 000 keys cost more than module 1's 472 000, because its 609 operators are two calls each plus a name lookup, and module 1 has 39 operators. And the index footprint is now nearly the table's own size — five indexes, three of them added for paging and diffs. Trimming that is a measurement worth doing (`kv_from`/`kv_to` are the candidates; the diff predicates may be served well enough by `kv_range`).
 
@@ -130,7 +130,8 @@ Observed on the E6 mainnet sync (throttled to batch 20 / concurrency 2 on purpos
 - The key table's indexes are now nearly the size of the table itself (97 MB against 105 MB on mainnet): five of them, three added for paging and diffs. `kv_from` and `kv_to` are the candidates to drop — the diff predicates may be served well enough by `kv_range`. Measure before removing.
 - An audit rebuild republishes a content-identical version, which costs a version row and a full read. Harmless, but it means the version table gains a row every audit interval whether or not anything happened; retention absorbs it.
 - The canonical service will not boot if `PROVIDERS_URLS` has no TLD in the host — its `isUrl` validation rejects a bare service name like `fakerpc`, and the failure surfaces as a misleading `Cannot find module dist/src/main` from the `start:prod` fallback. Only relevant now if someone points it at an in-cluster name.
-- `/v1/modules/keys` builds the whole grouped response in memory on our side too (it is not streamed, matching canonical's shape). At mainnet scale that is a 28 MiB peak rather than canonical's OOM, but it is the one endpoint here that is not streamed.
+- ~~`/v1/modules/keys` builds the whole grouped response in memory on our side too.~~ Fixed: it streams now, 227 MB out at an 11 MiB peak. Worth recording how it was found, because it is the argument for keeping the stand: a parity run against the canonical service reported `216.7 MiB vs 74.1 MiB` with empty `key` strings on our side. That endpoint marshals with `encoding/json` rather than the streaming encoder, and the binary store fills only the byte fields — so it had been serving keys with `"key": ""`. Filling the strings then made it OOM at 512 MiB, which is what forced the streaming rewrite. Two bugs, one of them mine and invisible to every test, caught by comparing against the thing being replaced.
+- On a live pair this service sits one nonce behind on CSM: that module deposits every minute or two and its rebuild takes ~70 s in a 1-CPU container. Inherent until CSM reads get faster (Multicall3 or event logs, item E9) — and a reason per-module scoping matters, since it rebuilds 26 000 keys rather than 512 000.
 
 ## Bringing the stand up
 

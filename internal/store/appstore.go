@@ -460,8 +460,9 @@ func (s *appSnapshot) KeysByPubkeys(ctx context.Context, moduleAddress string, p
 		if err := rows.Scan(&k.Index, &k.OperatorIndex, &k.PubkeyBin, &k.SignatureBin, &k.Used, &k.Vetted); err != nil {
 			return nil, err
 		}
-		k.Key = model.EncodeHex(k.PubkeyBin)
-		k.DepositSignature = model.EncodeHex(k.SignatureBin)
+		// This result is marshalled with encoding/json rather than streamed, so it
+		// needs the hex form present. One rule, one helper.
+		k.EnsureHex()
 		out = append(out, k)
 	}
 	return out, rows.Err()

@@ -12,6 +12,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"regexp"
 	"sort"
 	"strings"
 	"time"
@@ -59,10 +60,17 @@ func main() {
 			".meta.elBlockSnapshot.timestamp", ".meta.elBlockSnapshot.lastChangedBlockHash",
 			".elBlockSnapshot.blockNumber", ".elBlockSnapshot.blockHash",
 			".elBlockSnapshot.timestamp", ".elBlockSnapshot.lastChangedBlockHash",
+			// A module's own lastChangedBlockHash cannot match, by design rather than by
+			// timing: the canonical service moves it whenever a module is re-read, and
+			// this one moves it only when the module's content changed. That difference
+			// is the point — comparing it would report the fix as a failure.
+			".data[].lastChangedBlockHash", ".data.module.lastChangedBlockHash",
+			".data[].module.lastChangedBlockHash", ".data.lastChangedBlockHash",
 		} {
 			ignored[p] = true
 		}
-		fmt.Println("note: -live is set, the meta block is excluded from comparison")
+		fmt.Println("note: -live is set; the meta block and per-module lastChangedBlockHash " +
+			"are excluded (the latter differs by design, see cmd/diff)")
 	}
 
 	client := &http.Client{Timeout: 30 * time.Minute}
@@ -240,8 +248,21 @@ func compareGeneric(a, b []byte, maxReport int, ignored map[string]bool) ([]stri
 	return diffs, nil
 }
 
+// arrayIndex matches a concrete array index in a path, so an ignore entry can be
+// written once as `.data[].field` rather than once per position.
+var arrayIndex = regexp.MustCompile(`\[\d+\]`)
+
+// isIgnored reports whether a path is excluded, comparing both the concrete path and
+// its index-agnostic form.
+func isIgnored(path string, ignored map[string]bool) bool {
+	if ignored[path] {
+		return true
+	}
+	return ignored[arrayIndex.ReplaceAllString(path, "[]")]
+}
+
 func walk(path string, a, b any, diffs *[]string, maxReport int, ignored map[string]bool) {
-	if len(*diffs) >= maxReport || ignored[path] {
+	if len(*diffs) >= maxReport || isIgnored(path, ignored) {
 		return
 	}
 
@@ -301,7 +322,107 @@ func normalizeKeyArrays(v any) {
 				return keySortKey(tv[i]) < keySortKey(tv[j])
 			})
 		}
+		// Modules and operators need the same treatment for the same reason. The
+		// canonical service returns modules in physical row order — on mainnet that is
+		// 1, 2, 4, 3 — and this service returns them sorted by id. Neither promises an
+		// order, so comparing positionally reports a content mismatch where there is
+		// none: it was reading module 4 against module 3 and calling every field wrong.
+		if looksLikeModules(tv) {
+			sort.SliceStable(tv, func(i, j int) bool {
+				return numberField(tv[i], "id") < numberField(tv[j], "id")
+			})
+		}
+		if looksLikeOperators(tv) {
+			sort.SliceStable(tv, func(i, j int) bool {
+				return operatorSortKey(tv[i]) < operatorSortKey(tv[j])
+			})
+		}
+		// The grouped endpoints wrap each module: `[{keys, module}]` and
+		// `[{operators, module}]`. Same ordering difference, one level deeper, and it
+		// reads even worse — comparing group 3 against group 4 reports "length 0 vs
+		// 25940" as though a module lost its keys.
+		if looksLikeGroups(tv) {
+			sort.SliceStable(tv, func(i, j int) bool {
+				return groupModuleID(tv[i]) < groupModuleID(tv[j])
+			})
+		}
 	}
+}
+
+// looksLikeModules recognises a staking module array by two fields that only
+// modules carry together.
+func looksLikeModules(arr []any) bool {
+	m, ok := firstObject(arr)
+	if !ok {
+		return false
+	}
+	_, hasAddress := m["stakingModuleAddress"]
+	_, hasNonce := m["nonce"]
+	return hasAddress && hasNonce
+}
+
+// looksLikeOperators recognises an operator array. `rewardAddress` with
+// `stakingLimit` is unique to operators across this surface.
+func looksLikeOperators(arr []any) bool {
+	m, ok := firstObject(arr)
+	if !ok {
+		return false
+	}
+	_, hasReward := m["rewardAddress"]
+	_, hasLimit := m["stakingLimit"]
+	return hasReward && hasLimit
+}
+
+// looksLikeGroups recognises an array whose entries wrap a module.
+func looksLikeGroups(arr []any) bool {
+	m, ok := firstObject(arr)
+	if !ok {
+		return false
+	}
+	_, hasModule := m["module"].(map[string]any)
+	return hasModule
+}
+
+// groupModuleID reads the wrapped module's id.
+func groupModuleID(v any) float64 {
+	m, ok := v.(map[string]any)
+	if !ok {
+		return 0
+	}
+	module, ok := m["module"].(map[string]any)
+	if !ok {
+		return 0
+	}
+	id, _ := module["id"].(float64)
+	return id
+}
+
+func firstObject(arr []any) (map[string]any, bool) {
+	if len(arr) == 0 {
+		return nil, false
+	}
+	m, ok := arr[0].(map[string]any)
+	return m, ok
+}
+
+func numberField(v any, field string) float64 {
+	m, ok := v.(map[string]any)
+	if !ok {
+		return 0
+	}
+	f, _ := m[field].(float64)
+	return f
+}
+
+// operatorSortKey orders operators by module and then index, since a grouped
+// response can carry several modules' operators.
+func operatorSortKey(v any) string {
+	m, ok := v.(map[string]any)
+	if !ok {
+		return ""
+	}
+	address, _ := m["moduleAddress"].(string)
+	return fmt.Sprintf("%s|%012.0f", strings.ToLower(address), numberField(v, "index"))
 }
 
 func looksLikeKeys(arr []any) bool {

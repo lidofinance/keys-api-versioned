@@ -35,7 +35,7 @@ Generate load from inside the compose network. Through a published port on Docke
 | `GET /v1/keys/diff?since=` | what changed between two versions |
 | `GET /v1/modules`, `GET /v1/modules/{id}` | module list and one module |
 | `GET /v1/modules/diff?since=` | which modules changed — the cheap poll |
-| `GET /v1/modules/keys` | grouped by module |
+| `GET /v1/modules/keys` | grouped by module, streamed |
 | `GET /v1/modules/{id}/keys`, `POST …/keys/find` | per-module dump and lookup |
 | `GET /v1/operators` | grouped by module; what EVM reads for operator names |
 | `GET /v1/modules/{id}/operators`, `…/operators/{operator_id}` | one module's operators, one operator |
@@ -55,7 +55,20 @@ Not implemented: the validator exit endpoints (they need consensus layer ingest)
 
 `cmd/diff` fetches the same endpoint from both services, sorts key arrays (neither implementation promises an order) and compares. `-live` tolerates the two being at different blocks, which they always are when both follow a chain.
 
-On the mainnet registry, 15 endpoints checked, several byte-identical including the full 216.7 MiB dump, `?used=true`, `/v1/modules` and `/v1/modules/{id}`. Byte-identical covers the framing whitespace and the JSON property order of the canonical DTOs. Where the diff reports "equal ignoring key order", the row order out of Postgres differed between the two queries — neither service sorts, so consumers must not depend on order.
+Latest run, both services following mainnet in the stand, all eight compared endpoints equal:
+
+```
+OK  /v1/status                    OK  /v1/keys?used=true        216.7 MiB vs 216.7 MiB
+OK  /v1/modules                   OK  /v1/keys?operatorIndex=1
+OK  /v1/modules/1                 OK  /v1/modules/1/keys        199.7 MiB vs 199.7 MiB
+OK  /v1/keys  216.7 MiB           OK  /v1/modules/keys          216.7 MiB vs 216.7 MiB
+```
+
+Byte-identical covers the framing whitespace and the JSON property order of the canonical DTOs. Where the diff reports "equal ignoring key order", the row order out of Postgres differed between the two queries — neither service sorts, so consumers must not depend on order.
+
+Two differences are structural rather than accidental, and `-live` accounts for both. **Module order:** the canonical service returns modules in physical row order (1, 2, 4, 3 on mainnet) and this one sorts by id, so the runner sorts module, operator and grouped arrays before comparing — without that it read module 4 against module 3 and called every field wrong. **Per-module `lastChangedBlockHash`:** it cannot match by design, since there it moves on every re-read and here only when the module's content changed.
+
+One thing a live pair does show honestly: a module mid-deposit differs on its counters. CSM deposits every minute or two, its rebuild takes about 70 s in a 1-CPU container, so this service sits one nonce behind on that module — two consecutive runs went `OK` then `FAIL .data[2].nonce: 5213 vs 5212`. That is lag, not disagreement; the key sets matched byte for byte in both runs. Closing it means faster CSM reads (Multicall3, or event logs), which is the ingest-throughput work in [docs/next-steps.md](docs/next-steps.md).
 
 One trailing byte used to separate us from byte-identical on the non-streamed endpoints: `json.Encoder.Encode` appends a newline and Fastify does not.
 
@@ -90,7 +103,7 @@ The language is worth 15×; publishing versions is what removes the degradation 
 
 | | |
 |---|---|
-| Empty database to published version | **107 s** on the host, **~4 min 15 s** in a 1-CPU container; batch 40 / concurrency 6 |
+| Empty database to published version | **107 s** on the host, **2 m 28 s – 4 m 15 s** in a 1-CPU container; batch 40 / concurrency 6 |
 | module 1 — 471 732 keys, 39 operators | 47 s |
 | module 2 — 14 205 keys, 82 operators | 8 s |
 | module 3 (CSM) — 25 940 keys, 609 operators | 51 s |
@@ -124,7 +137,7 @@ Two results I predicted wrong, in both directions. Sequentially the encoding cos
 
 ### Findings worth passing to the canonical service's owners
 
-- **512 MiB is not enough for it on mainnet, in two separate places.** `/v1/modules/keys` is not streamed there — it builds the whole 216.7 MiB response in memory (ours serves that endpoint with a 28 MiB peak). And its *cold sync* does not fit either: in this stand it restart-looped 12 times at 469 MiB before the limit was raised to 1.5 GiB. Ours syncs the same registry inside 512 MiB.
+- **512 MiB is not enough for it on mainnet, in two separate places.** `/v1/modules/keys` is not streamed there — it builds the whole 216.7 MiB response in memory. Ours streams it: 227 MB out at an 11 MiB peak. And its *cold sync* does not fit either: in this stand it restart-looped 12 times at 469 MiB before the limit was raised to 1.5 GiB. Ours syncs the same registry inside 512 MiB.
 - **A Node OOM there looks like a clean restart.** `docker inspect` reports `OOMKilled=false, exit=0`, because PID 1 is `yarn` and it survives its child being killed; the only trace is `Killed` in the log. Anything watching restart reasons in Kubernetes would be misled.
 - **Per-module `lastChangedBlockHash` collapses.** Checked on the live service: all four modules carried the same value as the global one. It moves whenever a module is *re-read*, so a restart, a stall past `MAX_BLOCKS_OVERLAP` or a reorg stamps every module at once, and afterwards you cannot tell "module 2 unchanged" from "everything was stamped at that block". Use `nonce` for skip decisions. Ours derives the stamp from content instead — verified at mainnet scale: a full re-read of every module published a version whose stamp was byte-identical to the previous one.
 
