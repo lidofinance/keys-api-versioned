@@ -1,0 +1,196 @@
+{
+  "chainId": 1,
+  "modules": [
+    {
+      "id": 1,
+      "address": "0x0000000000000000000000000000000000000001",
+      "type": "curated-onchain-v1",
+      "name": "module-1",
+      "nonce": 101,
+      "status": 0,
+      "moduleFee": 500,
+      "treasuryFee": 500,
+      "targetShare": 10000,
+      "operators": [
+        {
+          "index": 0,
+          "name": "operator-1-0",
+          "rewardAddress": "0x0000000000000000000000000000000000000064",
+          "active": true,
+          "stakingLimit": 4,
+          "usedKeys": 2,
+          "keys": [
+            {
+              "key": "0x5d1fee0d654509a1285e38125d46198ce4934b706a7e46beacb7b33092f4ea81"
+            },
+            {
+              "key": "0x26055b62759d1b46509a872e18bc617e9c98e399fc774d1551b065a451f1c953"
+            },
+            {
+              "key": "0xaf9e9ebd4c72d81ab566db1651522e433114422b3cec17eaaa4262579a48a6a2"
+            },
+            {
+              "key": "0x3ad743592d0d882123274ff8ea6421db7e4e37a652b307102267f48aff28f8e1"
+            },
+            {
+              "key": "0x0043631d0300138b920d18186a1f720e74700886c6094ad3221ca005abb4a147"
+            }
+          ]
+        },
+        {
+          "index": 1,
+          "name": "operator-1-1",
+          "rewardAddress": "0x0000000000000000000000000000000000000065",
+          "active": true,
+          "stakingLimit": 4,
+          "usedKeys": 2,
+          "keys": [
+            {
+              "key": "0x26eab58ebc163556b05d60d774a7cf9d726e6ebf3e8e945d9088424a3c255271"
+            },
+            {
+              "key": "0xd793e0c6d5bf864ccb0e64b1aaa6b9bc0fb02b2c64faa5b8aabb97f9f54a5b90"
+            },
+            {
+              "key": "0xbbd84f63326c3e297205da680af2b17c54938693dfaf8af3a5caa175fe49bdda"
+            },
+            {
+              "key": "0xb1303820f7a997de091a4d45f43d0f7eaf0cbcd1c8ced3cd01b88cbc143f84fc"
+            },
+            {
+              "key": "0x50352a955efc8c0bd5db9380de81474f29b130858564107c7e73ebab348d3d7c"
+            }
+          ]
+        },
+        {
+          "index": 2,
+          "name": "operator-1-2",
+          "rewardAddress": "0x0000000000000000000000000000000000000066",
+          "active": true,
+          "stakingLimit": 4,
+          "usedKeys": 2,
+          "keys": [
+            {
+              "key": "0x42ec07e7900f8e8f7e31d0c5f431af45de9210449481aed7471db11536751692"
+            },
+            {
+              "key": "0xe2369b35e07912aa9d42c28baf97ca527ae890aa21f8d413367b44abf3b973d7"
+            },
+            {
+              "key": "0x2070e117e25a8eadba43ffd00a34bc81884f5780109de61252c18a157698858e"
+            },
+            {
+              "key": "0xba101947992ba0aad0d9074451ee3d37a65d881f7dd01e7ad45b6507c471f286"
+            },
+            {
+              "key": "0x44809cdf4a5621d9c1f1b65a988a19b1f0fd69c7f2476c3a45b023e79a398b57"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "address": "0x0000000000000000000000000000000000000002",
+      "type": "curated-onchain-v1",
+      "name": "module-2",
+      "nonce": 107,
+      "status": 0,
+      "moduleFee": 500,
+      "treasuryFee": 500,
+      "targetShare": 10000,
+      "operators": [
+        {
+          "index": 0,
+          "name": "operator-2-0",
+          "rewardAddress": "0x00000000000000000000000000000000000000c8",
+          "active": true,
+          "stakingLimit": 4,
+          "usedKeys": 2,
+          "keys": [
+            {
+              "key": "0xeab2f4f0cb3577575408343eff5588d2b6924cb0f9cef5c58784e73f9212c569"
+            },
+            {
+              "key": "0xe77e3c06bed774eb27906512a90082ea680f7ad5017375edd022e26f85a106e1"
+            },
+            {
+              "key": "0xe81e3d4dd09230ed8b01b1a560e59913aef9a13364dcd6c644439035da5d8e4d"
+            },
+            {
+              "key": "0x4539d30c2f83ad9e2f4233cd349675152898c43ada9facd8bea4a10807cbf550"
+            },
+            {
+              "key": "0x74f32bca85f3795c88a61f923ffb22fcc89d6f5900b27e17ff5a4789428f76af"
+            },
+            {
+              "key": "0xabababababababababababababababababababababababababababababababababababababababababababababababab"
+            },
+            {
+              "key": "0x111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111"
+            },
+            {
+              "key": "0x222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222"
+            }
+          ]
+        },
+        {
+          "index": 1,
+          "name": "operator-2-1",
+          "rewardAddress": "0x00000000000000000000000000000000000000c9",
+          "active": true,
+          "stakingLimit": 4,
+          "usedKeys": 3,
+          "keys": [
+            {
+              "key": "0x440bf1e871d5112d02002d6e2e2d58fe05427d6e2e738d6d6d2e83ff393a7b46"
+            },
+            {
+              "key": "0x576273333f55124ccde55a1e9fef70d887c09fd80f7dd277c79e4398ee838120"
+            },
+            {
+              "key": "0xf600bc452335553c727d7b6570c9b0051209a2e73f5cb9076fe80c577a54949b"
+            },
+            {
+              "key": "0xc00876d4d917a061ad5a377270e059994251eea9818733e6abfef69c6080625b"
+            },
+            {
+              "key": "0x0413f925a98622ab953875baa8ff044cdd7a4e4a0c26258601c44136f39e3649"
+            },
+            {
+              "key": "0xcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd"
+            }
+          ]
+        },
+        {
+          "index": 2,
+          "name": "operator-2-2",
+          "rewardAddress": "0x00000000000000000000000000000000000000ca",
+          "active": true,
+          "stakingLimit": 4,
+          "usedKeys": 2,
+          "keys": [
+            {
+              "key": "0xd51c8dbca8150425a8fcef7a6354444133b06e70f3bdea975438793cdf100314"
+            },
+            {
+              "key": "0xf30195f5485041c53273ffb8e3e2ea4e59856146a3456b864446c7caf94f9c52"
+            },
+            {
+              "key": "0xd60513cba14144a3c5d7643334d06818373f3488e7c4fa33c78665e45a8f1598"
+            },
+            {
+              "key": "0x246fb3546ffbb237f1d8634dee0aa496160f0b4fe342901f01e34973023a0b66"
+            },
+            {
+              "key": "0x541db29dc34cf4f0ec936e67c896cca2af4eb89b1c6ef13bfa2b1a2385e98915"
+            },
+            {
+              "key": "0xefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefef"
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

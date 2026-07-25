@@ -1,0 +1,171 @@
+# The stand: our service and the canonical one, side by side, on the same chain.
+#
+# They no longer share a database — ours owns its schema now — so both sync mainnet
+# themselves. That makes this a comparison of two services rather than of two
+# serving layers over one dataset, which is the comparison that matters once the
+# question is "can this replace it": same nodes, same chain, same limits, and `diff`
+# checks that the responses agree.
+#
+#   PROVIDERS_URLS=http://node-1,http://node-2 docker compose up -d --build
+#   docker compose run --rm tools diff -a http://canonical:3000 -b http://keys-api:3000 -live
+#   docker compose run --rm tools bench -url http://keys-api:3000/v1/keys
+#
+# With no chain at all — up in a second, for a demo or for pointing a consumer at
+# something while its own environment is being sorted out:
+#
+#   docker compose --profile static up -d --build keys-api-static
+#
+# Both get 1 CPU, so the numbers say something about a pod rather than about a
+# 14-core laptop. Memory is 512 MiB for ours and 1.5 GiB for the canonical service,
+# because it cannot finish a mainnet cold sync in 512 MiB — see the note on its
+# service below. Postgres gets its own budget, as it does in production.
+#
+# Run load from inside the network: through a published port on Docker Desktop the
+# host hop caps everything at ~188 MiB/s and every service looks identical.
+
+x-api-limits: &api-limits
+  cpus: "1.0"
+  mem_limit: 512m
+  restart: unless-stopped
+
+services:
+  db:
+    image: postgres:16-alpine
+    command:
+      - postgres
+      - -c
+      - shared_buffers=256MB
+      - -c
+      - work_mem=32MB
+      # The writer bulk-COPYs into staging tables and runs set-based diffs; default
+      # WAL settings turn a cold sync into a checkpoint storm.
+      - -c
+      - max_wal_size=4GB
+      - -c
+      - checkpoint_timeout=15min
+    environment:
+      POSTGRES_DB: keys_api
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      # Creates the second database, so one Postgres serves both services and
+      # neither can see the other's tables.
+      - ./scripts/init-databases.sh:/docker-entrypoint-initdb.d/init-databases.sh:ro
+    cpus: "2.0"
+    mem_limit: 2g
+    ports:
+      - "55433:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d keys_api"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  keys-api:
+    build: .
+    command: ["keys-api"]
+    <<: *api-limits
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgres://postgres:postgres@db:5432/keys_api_app?sslmode=disable
+      # Not `:?required` on purpose: that makes every `docker compose ps`, `logs` and
+      # `down` fail too when the variable is not exported, which is most of the time.
+      # Both services already refuse to start with a clear message if it is empty.
+      PROVIDERS_URLS: ${PROVIDERS_URLS:-}
+      CHAIN_ID: ${CHAIN_ID:-1}
+      PORT: "3000"
+      UPDATE_KEYS_INTERVAL_MS: ${UPDATE_KEYS_INTERVAL_MS:-12000}
+      RETAIN_VERSIONS: ${RETAIN_VERSIONS:-20}
+      # Below default on purpose: these are shared nodes. The cold sync is round-trip
+      # bound, so raising these is the first thing to try if it needs to be faster.
+      PROVIDER_JSON_RPC_MAX_BATCH_SIZE: ${PROVIDER_JSON_RPC_MAX_BATCH_SIZE:-40}
+      PROVIDER_CONCURRENT_REQUESTS: ${PROVIDER_CONCURRENT_REQUESTS:-6}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+    ports:
+      - "3010:3000"
+    healthcheck:
+      # Liveness, not readiness: the first mainnet sync takes minutes and the
+      # container must not be killed while it is doing it.
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:3000/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 30s
+
+  canonical:
+    build:
+      context: ../lido-keys-api
+    <<: *api-limits
+    # It cannot complete a mainnet cold sync at 512 MiB: measured here, 12 restart
+    # loops at 469 MiB before this was raised. The serving numbers in the README were
+    # taken at an equal 512 MiB against an already-synced database, which is the
+    # comparison that was meant to be equal; the sync needs more and gets it, because
+    # a stand where one side never becomes ready measures nothing.
+    #
+    # Worth knowing how this failure looks: `docker inspect` reports
+    # `OOMKilled=false, exit=0`, because PID 1 is yarn and it survives its child being
+    # killed. The only trace is `Killed` in the log.
+    mem_limit: 1500m
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      PORT: 3000
+      CHAIN_ID: ${CHAIN_ID:-1}
+      DB_HOST: db
+      DB_PORT: 5432
+      DB_NAME: keys_api
+      DB_USER: postgres
+      DB_PASSWORD: postgres
+      PROVIDERS_URLS: ${PROVIDERS_URLS:-}
+      CL_API_URLS: ${CL_API_URLS:-http://localhost:5052}
+      VALIDATOR_REGISTRY_ENABLE: "false"
+      LOG_LEVEL: warning
+      LOG_FORMAT: simple
+      GLOBAL_THROTTLE_TTL: 5
+      GLOBAL_THROTTLE_LIMIT: 1000000
+      GLOBAL_CACHE_TTL: 1
+      # Its default is 60 s, which kills a slow dump mid-stream. Raised so the
+      # comparison measures serving rather than that timeout.
+      STREAM_TIMEOUT: 1800000
+      PROVIDER_JSON_RPC_MAX_BATCH_SIZE: ${PROVIDER_JSON_RPC_MAX_BATCH_SIZE:-40}
+      PROVIDER_CONCURRENT_REQUESTS: ${PROVIDER_CONCURRENT_REQUESTS:-6}
+      CORS_WHITELIST_REGEXP: "^https?://localhost"
+    ports:
+      - "3000:3000"
+
+  # Our service with no chain: the registry comes from a file.
+  keys-api-static:
+    profiles: ["static"]
+    build: .
+    command: ["keys-api"]
+    <<: *api-limits
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgres://postgres:postgres@db:5432/keys_api_app?sslmode=disable
+      KEYS_API_SOURCE: static
+      KEYS_API_STATIC_FILE: /app/registry.json
+      PORT: "3000"
+      UPDATE_KEYS_INTERVAL_MS: "2000"
+    volumes:
+      - ./testdata/registry.json:/app/registry.json:ro
+    ports:
+      - "3011:3000"
+
+  # One-shot tools: diff for parity, bench for latency and memory, ingest for
+  # probing a node. Unlimited on CPU because they are the measuring instrument, and
+  # a throttled generator measures itself.
+  tools:
+    build: .
+    profiles: ["tools"]
+    environment:
+      DATABASE_URL: postgres://postgres:postgres@db:5432/keys_api_app?sslmode=disable
+    entrypoint: []
+
+volumes:
+  pgdata:

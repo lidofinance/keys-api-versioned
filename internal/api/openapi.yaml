@@ -1,0 +1,814 @@
+openapi: 3.0.3
+
+info:
+  title: Lido Keys API (versioned)
+  version: 0.1.0-poc
+  description: |
+    The keys-api surface, served from published versions of the registry.
+
+    Responses are byte-identical to the canonical `lido-keys-api` on the endpoints
+    both implement, framing whitespace and JSON property order included, so a
+    consumer can be pointed here with a URL change.
+
+    **Versions.** Every response is served from one published version and never from a
+    table being written. Without `snapshot`, a request gets `latest` — the newest
+    published version — which is the behaviour a consumer already expects. With it, a
+    request gets exactly the version named, so several requests can be made against
+    one consistent state.
+
+    A version that has gone away answers definitively rather than with different data:
+    `409` if a reorg took it off the chain, with the head to jump to, and `410` if it
+    fell out of the retention window.
+
+    **Staleness.** `X-Snapshot-Stale: true` on a response means the version being
+    served is known not to reflect the chain while a rebuild is in flight. The body is
+    unchanged, so a consumer that ignores the header behaves exactly as before.
+
+    **Two additions the canonical service cannot offer**, because they need rows that
+    do not move: `limit`/`cursor` paging, and `since=` diffs that return only what
+    changed between two versions.
+
+servers:
+  # Relative, so "Try it out" hits whichever instance is serving this page rather
+  # than a hard-coded port.
+  - url: /
+    description: this instance
+
+tags:
+  - name: keys
+  - name: modules
+  - name: operators
+  - name: status
+
+paths:
+  /v1/keys:
+    get:
+      tags: [keys]
+      summary: Every key of every module
+      description: |
+        Streamed. With `limit` or `cursor` the response carries one page and a
+        `pagination` object after the data array; without them it is the full dump and
+        byte-identical to the canonical service.
+
+        The cursor names the version it came from, so a walk started now stays on that
+        version even as new ones are published.
+      parameters:
+        - $ref: '#/components/parameters/Used'
+        - $ref: '#/components/parameters/OperatorIndex'
+        - $ref: '#/components/parameters/ModuleAddresses'
+        - $ref: '#/components/parameters/Snapshot'
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: Keys, with pagination present only when asked for
+          headers:
+            X-Snapshot-Stale:
+              $ref: '#/components/headers/SnapshotStale'
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [meta, data]
+                properties:
+                  meta: { $ref: '#/components/schemas/ELMeta' }
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/Key' }
+                  pagination: { $ref: '#/components/schemas/Pagination' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '409': { $ref: '#/components/responses/Superseded' }
+        '410': { $ref: '#/components/responses/Pruned' }
+        '425': { $ref: '#/components/responses/TooEarly' }
+
+  /v1/keys/diff:
+    get:
+      tags: [keys]
+      summary: What changed between two versions
+      description: |
+        The endpoint that lets a consumer stop re-downloading the whole registry to
+        stay current: on mainnet a diff answers in single-digit milliseconds and a few
+        hundred bytes where the dump is 227 MB.
+
+        A key whose value changed appears on both sides — the old row was closed and a
+        new one opened. Apply `removed` then `added` by key identity, which is
+        (`moduleAddress`, `operatorIndex`, `index`), and the result equals a fresh dump
+        at `to`.
+
+        `since` must still be inside the retention window; if it is not the answer is
+        `410`, because a diff computed against a version whose closed rows were deleted
+        would silently miss removals.
+      parameters:
+        - $ref: '#/components/parameters/Since'
+        - $ref: '#/components/parameters/To'
+        - $ref: '#/components/parameters/ModuleFilter'
+      responses:
+        '200':
+          description: Removals and additions between the two versions
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/KeysDiff' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Superseded' }
+        '410': { $ref: '#/components/responses/Pruned' }
+        '501': { $ref: '#/components/responses/NotImplemented' }
+
+  /v1/keys/{pubkey}:
+    get:
+      tags: [keys]
+      summary: One key by public key, across modules
+      parameters:
+        - name: pubkey
+          in: path
+          required: true
+          schema: { type: string, pattern: '^0x[a-fA-F0-9]{96}$' }
+        - $ref: '#/components/parameters/Snapshot'
+      responses:
+        '200':
+          description: Matching keys
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/KeyList' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '425': { $ref: '#/components/responses/TooEarly' }
+
+  /v1/keys/find:
+    post:
+      tags: [keys]
+      summary: Keys matching a list of public keys, across modules
+      parameters:
+        - $ref: '#/components/parameters/Snapshot'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [pubkeys]
+              properties:
+                pubkeys:
+                  type: array
+                  items: { type: string, pattern: '^0x[a-fA-F0-9]{96}$' }
+      responses:
+        '200':
+          description: Matching keys
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/KeyList' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '425': { $ref: '#/components/responses/TooEarly' }
+
+  /v1/modules:
+    get:
+      tags: [modules]
+      summary: Staking modules
+      description: |
+        A kilobyte-sized response, and the right thing to poll. `nonce` is the
+        per-module change counter: it moves when that module's keys or operators move
+        and not otherwise, so a consumer compares nonces and fetches only the modules
+        that changed.
+
+        Note the envelope: `elBlockSnapshot` sits at the top level here, not under
+        `meta`. That is the canonical shape and is kept as it is.
+      parameters:
+        - $ref: '#/components/parameters/Snapshot'
+      responses:
+        '200':
+          description: Modules
+          headers:
+            X-Snapshot-Stale:
+              $ref: '#/components/headers/SnapshotStale'
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data, elBlockSnapshot]
+                properties:
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/StakingModule' }
+                  elBlockSnapshot: { $ref: '#/components/schemas/ELBlockSnapshot' }
+        '425': { $ref: '#/components/responses/TooEarly' }
+
+  /v1/modules/diff:
+    get:
+      tags: [modules]
+      summary: Which modules changed between two versions
+      description: |
+        The cheap poll to do before asking for a key diff. It is trustworthy here in a
+        way the canonical per-module `lastChangedBlockHash` is not: the writer moves
+        that stamp from content rather than from the act of re-reading, so a module
+        that was re-read and found unchanged keeps its stamp.
+      parameters:
+        - $ref: '#/components/parameters/Since'
+        - $ref: '#/components/parameters/To'
+      responses:
+        '200':
+          description: Module ids whose content moved
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    type: object
+                    required: [changedModules]
+                    properties:
+                      changedModules:
+                        type: array
+                        items: { type: integer }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '410': { $ref: '#/components/responses/Pruned' }
+        '501': { $ref: '#/components/responses/NotImplemented' }
+
+  /v1/modules/keys:
+    get:
+      tags: [keys]
+      summary: Keys grouped by module
+      description: |
+        Not streamed, matching the canonical shape: the whole response is built in
+        memory. At mainnet scale that is a ~28 MiB peak here; it is the one endpoint in
+        this service that is not streamed.
+      parameters:
+        - $ref: '#/components/parameters/Used'
+        - $ref: '#/components/parameters/OperatorIndex'
+        - $ref: '#/components/parameters/Snapshot'
+      responses:
+        '200':
+          description: Keys per module
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data, meta]
+                properties:
+                  data:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        keys:
+                          type: array
+                          items: { $ref: '#/components/schemas/Key' }
+                        module: { $ref: '#/components/schemas/StakingModule' }
+                  meta: { $ref: '#/components/schemas/ELMeta' }
+        '425': { $ref: '#/components/responses/TooEarly' }
+
+  /v1/modules/{module_id}:
+    get:
+      tags: [modules]
+      summary: One module
+      parameters:
+        - $ref: '#/components/parameters/ModuleID'
+        - $ref: '#/components/parameters/Snapshot'
+      responses:
+        '200':
+          description: The module
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data, elBlockSnapshot]
+                properties:
+                  data: { $ref: '#/components/schemas/StakingModule' }
+                  elBlockSnapshot: { $ref: '#/components/schemas/ELBlockSnapshot' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '425': { $ref: '#/components/responses/TooEarly' }
+
+  /v1/modules/{module_id}/keys:
+    get:
+      tags: [keys]
+      summary: Keys of one module
+      description: Streamed.
+      parameters:
+        - $ref: '#/components/parameters/ModuleID'
+        - $ref: '#/components/parameters/Used'
+        - $ref: '#/components/parameters/OperatorIndex'
+        - $ref: '#/components/parameters/Snapshot'
+      responses:
+        '200':
+          description: Module and its keys
+          headers:
+            X-Snapshot-Stale:
+              $ref: '#/components/headers/SnapshotStale'
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [meta, data]
+                properties:
+                  meta: { $ref: '#/components/schemas/ELMeta' }
+                  data:
+                    type: object
+                    properties:
+                      module: { $ref: '#/components/schemas/StakingModule' }
+                      keys:
+                        type: array
+                        items: { $ref: '#/components/schemas/Key' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '425': { $ref: '#/components/responses/TooEarly' }
+
+  /v1/modules/{module_id}/keys/diff:
+    get:
+      tags: [keys]
+      summary: What changed in one module between two versions
+      description: The same answer as `/v1/keys/diff?module=…`, addressed by path.
+      parameters:
+        - $ref: '#/components/parameters/ModuleID'
+        - $ref: '#/components/parameters/Since'
+        - $ref: '#/components/parameters/To'
+      responses:
+        '200':
+          description: Removals and additions for this module
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/KeysDiff' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '410': { $ref: '#/components/responses/Pruned' }
+        '501': { $ref: '#/components/responses/NotImplemented' }
+
+  /v1/modules/{module_id}/keys/find:
+    post:
+      tags: [keys]
+      summary: Keys of one module matching a list of public keys
+      parameters:
+        - $ref: '#/components/parameters/ModuleID'
+        - $ref: '#/components/parameters/Snapshot'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [pubkeys]
+              properties:
+                pubkeys:
+                  type: array
+                  items: { type: string }
+      responses:
+        '200':
+          description: Module and the matching keys
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data, meta]
+                properties:
+                  data:
+                    type: object
+                    properties:
+                      keys:
+                        type: array
+                        items: { $ref: '#/components/schemas/Key' }
+                      module: { $ref: '#/components/schemas/StakingModule' }
+                  meta: { $ref: '#/components/schemas/ELMeta' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '425': { $ref: '#/components/responses/TooEarly' }
+
+  /v1/operators:
+    get:
+      tags: [operators]
+      summary: Operators of every module, grouped by module
+      description: |
+        What `ethereum-validators-monitoring` reads for the names it labels validators
+        with, paired with `/v1/keys?used=true`.
+      parameters:
+        - $ref: '#/components/parameters/Snapshot'
+      responses:
+        '200':
+          description: Operators per module
+          headers:
+            X-Snapshot-Stale:
+              $ref: '#/components/headers/SnapshotStale'
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data, meta]
+                properties:
+                  data:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        operators:
+                          type: array
+                          items: { $ref: '#/components/schemas/Operator' }
+                        module: { $ref: '#/components/schemas/StakingModule' }
+                  meta: { $ref: '#/components/schemas/ELMeta' }
+        '425': { $ref: '#/components/responses/TooEarly' }
+        '501': { $ref: '#/components/responses/NotImplemented' }
+
+  /v1/modules/{module_id}/operators:
+    get:
+      tags: [operators]
+      summary: Operators of one module
+      parameters:
+        - $ref: '#/components/parameters/ModuleID'
+        - $ref: '#/components/parameters/Snapshot'
+      responses:
+        '200':
+          description: Module and its operators
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data, meta]
+                properties:
+                  data:
+                    type: object
+                    properties:
+                      operators:
+                        type: array
+                        items: { $ref: '#/components/schemas/Operator' }
+                      module: { $ref: '#/components/schemas/StakingModule' }
+                  meta: { $ref: '#/components/schemas/ELMeta' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '425': { $ref: '#/components/responses/TooEarly' }
+
+  /v1/modules/{module_id}/operators/{operator_id}:
+    get:
+      tags: [operators]
+      summary: One operator of one module
+      parameters:
+        - $ref: '#/components/parameters/ModuleID'
+        - name: operator_id
+          in: path
+          required: true
+          schema: { type: integer, minimum: 0 }
+        - $ref: '#/components/parameters/Snapshot'
+      responses:
+        '200':
+          description: Module and the operator
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data, meta]
+                properties:
+                  data:
+                    type: object
+                    properties:
+                      operator: { $ref: '#/components/schemas/Operator' }
+                      module: { $ref: '#/components/schemas/StakingModule' }
+                  meta: { $ref: '#/components/schemas/ELMeta' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '425': { $ref: '#/components/responses/TooEarly' }
+
+  /v1/modules/{module_id}/operators/keys:
+    get:
+      tags: [operators]
+      summary: One module with its operators and keys
+      description: Streamed, keys last.
+      parameters:
+        - $ref: '#/components/parameters/ModuleID'
+        - $ref: '#/components/parameters/Used'
+        - $ref: '#/components/parameters/OperatorIndex'
+        - $ref: '#/components/parameters/Snapshot'
+      responses:
+        '200':
+          description: Module, operators and keys
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [meta, data]
+                properties:
+                  meta: { $ref: '#/components/schemas/ELMeta' }
+                  data:
+                    type: object
+                    properties:
+                      module: { $ref: '#/components/schemas/StakingModule' }
+                      operators:
+                        type: array
+                        items: { $ref: '#/components/schemas/Operator' }
+                      keys:
+                        type: array
+                        items: { $ref: '#/components/schemas/Key' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '425': { $ref: '#/components/responses/TooEarly' }
+
+  /v2/modules/operators/keys:
+    get:
+      tags: [operators]
+      summary: Every module, operator and key in one stream
+      description: |
+        What `lido-mev-monitoring` reads, and a deliberately odd shape kept exactly as
+        the canonical service produces it: a flat array of records, each with three of
+        its four fields null. Per module, first a record carrying the module (and the
+        meta, once), then one record per key, then one per operator.
+      parameters:
+        - $ref: '#/components/parameters/Snapshot'
+      responses:
+        '200':
+          description: A flat stream of records
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/StreamRecord' }
+        '425': { $ref: '#/components/responses/TooEarly' }
+
+  /v1/status:
+    get:
+      tags: [status]
+      summary: Version, chain and the block the data is from
+      description: |
+        `elBlockSnapshot.blockNumber` is the block this version was last confirmed
+        current at, which advances on a quiet cycle. The block its data was read at —
+        the version's identity, and what a pin names — is what `pagination.snapshot`
+        and the diff `from`/`to` report. `clBlockSnapshot` is always null: this service
+        does not ingest validators.
+      responses:
+        '200':
+          description: Status
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  appVersion: { type: string }
+                  chainId: { type: integer }
+                  elBlockSnapshot:
+                    allOf: [{ $ref: '#/components/schemas/ELBlockSnapshot' }]
+                    nullable: true
+                  clBlockSnapshot: { type: object, nullable: true }
+
+  /openapi.yaml:
+    get:
+      tags: [status]
+      summary: This document
+      responses:
+        '200':
+          description: The OpenAPI document
+          content:
+            application/yaml: {}
+
+  /docs:
+    get:
+      tags: [status]
+      summary: A page that renders this document
+      responses:
+        '200':
+          description: HTML
+          content:
+            text/html: {}
+
+components:
+  parameters:
+    ModuleID:
+      name: module_id
+      in: path
+      required: true
+      description: Numeric module id or contract address.
+      schema: { type: string }
+    Used:
+      name: used
+      in: query
+      description: Keep only deposited (`true`) or not yet deposited (`false`) keys.
+      schema: { type: boolean }
+    OperatorIndex:
+      name: operatorIndex
+      in: query
+      schema: { type: integer, minimum: 0 }
+    ModuleAddresses:
+      name: moduleAddresses
+      in: query
+      description: Repeatable. Restrict to these module addresses.
+      schema:
+        type: array
+        items: { type: string }
+    Snapshot:
+      name: snapshot
+      in: query
+      description: |
+        Which version to serve from: `latest` (the default), `safe`, a block number, or
+        a block hash. A version that is gone answers 409 or 410 rather than serving
+        different data.
+      schema: { type: string }
+      example: latest
+    Limit:
+      name: limit
+      in: query
+      description: Page size. Its presence is what turns a dump into a page.
+      schema: { type: integer, minimum: 1, maximum: 100000 }
+    Cursor:
+      name: cursor
+      in: query
+      description: |
+        Continue a walk. Returned as `pagination.cursor`, and it names the version, so
+        later pages come from the version page one came from. Null cursor means the
+        walk is finished.
+      schema: { type: string }
+      example: 25609646.1.0.9999
+    Since:
+      name: since
+      in: query
+      required: true
+      description: The version to diff from — a block number, a block hash, or `safe`.
+      schema: { type: string }
+    To:
+      name: to
+      in: query
+      description: The version to diff to. Defaults to `latest`.
+      schema: { type: string }
+    ModuleFilter:
+      name: module
+      in: query
+      description: Restrict the diff to one module, by id or address.
+      schema: { type: string }
+
+  headers:
+    SnapshotStale:
+      description: |
+        Present and `true` when the served version is known not to reflect the chain
+        while a rebuild is in flight. The body is unaffected.
+      schema: { type: boolean }
+
+  responses:
+    BadRequest:
+      description: Malformed parameter
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    NotFound:
+      description: No such module, operator or key
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    Superseded:
+      description: |
+        The pinned version was taken off the chain by a reorg. The body carries the
+        head to jump to, so a consumer does not have to poll to discover it.
+      content:
+        application/json:
+          schema:
+            allOf:
+              - $ref: '#/components/schemas/Error'
+              - type: object
+                properties:
+                  headBlockNumber: { type: integer }
+                  headLastChangedBlockHash: { type: string }
+    Pruned:
+      description: The pinned version fell out of the retention window.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    TooEarly:
+      description: Nothing published yet — the first sync has not finished.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    NotImplemented:
+      description: This backend does not serve that part of the surface.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+
+  schemas:
+    Key:
+      type: object
+      required: [key, depositSignature, operatorIndex, used, moduleAddress, index, vetted]
+      properties:
+        key: { type: string, description: BLS public key, 48 bytes as 0x hex }
+        depositSignature: { type: string, description: 96 bytes as 0x hex }
+        operatorIndex: { type: integer }
+        used: { type: boolean, description: The key has been deposited. }
+        moduleAddress: { type: string, description: EIP-55 checksummed }
+        index: { type: integer, description: Index within the operator. }
+        vetted: { type: boolean, description: Within the operator's vetted count. }
+
+    Operator:
+      type: object
+      properties:
+        name: { type: string }
+        rewardAddress: { type: string }
+        stakingLimit: { type: integer }
+        stoppedValidators: { type: integer }
+        totalSigningKeys: { type: integer }
+        usedSigningKeys: { type: integer }
+        index: { type: integer }
+        active: { type: boolean }
+        moduleAddress: { type: string }
+        depositableValidatorsCount: { type: integer }
+
+    StakingModule:
+      type: object
+      properties:
+        nonce:
+          type: integer
+          description: |
+            The per-module change counter. It moves when this module's keys or
+            operators move and not otherwise, which is what makes it a reliable skip
+            signal — unlike `lastChangedBlockHash` on the canonical service.
+        type: { type: string, example: curated-onchain-v1 }
+        id: { type: integer }
+        stakingModuleAddress: { type: string }
+        moduleFee: { type: integer }
+        treasuryFee: { type: integer }
+        targetShare: { type: integer }
+        status: { type: integer }
+        name: { type: string }
+        lastDepositAt: { type: integer }
+        lastDepositBlock: { type: integer }
+        exitedValidatorsCount: { type: integer }
+        active: { type: boolean }
+        withdrawalCredentialsType: { type: integer }
+        lastChangedBlockHash:
+          type: string
+          description: |
+            The block at which this module's content last changed. Derived from a
+            comparison of content, so a re-read that found nothing leaves it alone.
+
+    ELBlockSnapshot:
+      type: object
+      properties:
+        blockNumber: { type: integer }
+        blockHash: { type: string }
+        timestamp: { type: integer }
+        lastChangedBlockHash:
+          type: string
+          description: Changes when any module's content changed. The refresh signal.
+
+    ELMeta:
+      type: object
+      properties:
+        elBlockSnapshot: { $ref: '#/components/schemas/ELBlockSnapshot' }
+
+    KeyList:
+      type: object
+      required: [data, meta]
+      properties:
+        data:
+          type: array
+          items: { $ref: '#/components/schemas/Key' }
+        meta: { $ref: '#/components/schemas/ELMeta' }
+
+    Pagination:
+      type: object
+      description: Present only when `limit` or `cursor` was given.
+      properties:
+        limit: { type: integer }
+        returned: { type: integer }
+        snapshot:
+          type: integer
+          description: The version this page came from, by its own block number.
+        cursor:
+          type: string
+          nullable: true
+          description: Pass as `cursor` for the next page. Null means the walk is done.
+
+    KeysDiff:
+      type: object
+      required: [meta, data]
+      properties:
+        meta:
+          type: object
+          properties:
+            from: { $ref: '#/components/schemas/ELBlockSnapshot' }
+            to: { $ref: '#/components/schemas/ELBlockSnapshot' }
+            removed: { type: integer }
+            added: { type: integer }
+        data:
+          type: object
+          properties:
+            removed:
+              type: array
+              items: { $ref: '#/components/schemas/Key' }
+            added:
+              type: array
+              items: { $ref: '#/components/schemas/Key' }
+
+    StreamRecord:
+      type: object
+      description: Three of the four fields are null in any given record.
+      properties:
+        stakingModule:
+          allOf: [{ $ref: '#/components/schemas/StakingModule' }]
+          nullable: true
+        meta:
+          allOf: [{ $ref: '#/components/schemas/ELMeta' }]
+          nullable: true
+        key:
+          allOf: [{ $ref: '#/components/schemas/Key' }]
+          nullable: true
+        operator:
+          allOf: [{ $ref: '#/components/schemas/Operator' }]
+          nullable: true
+
+    Error:
+      type: object
+      properties:
+        statusCode: { type: integer }
+        message:
+          oneOf:
+            - type: string
+            - type: array
+              items: { type: string }
+        error: { type: string }
