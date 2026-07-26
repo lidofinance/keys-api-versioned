@@ -56,7 +56,11 @@ type DB struct {
 	DSN    string
 	Writer *ingest.PGStore
 
-	base    int64
+	base int64
+	// ddl is on the plain DSN, because it creates and drops the schema the rest works
+	// in; admin is scoped to that schema, because a test writing raw SQL means the
+	// test's own tables.
+	ddl     *pgxpool.Pool
 	admin   *pgxpool.Pool
 	readers []*pgxpool.Pool
 }
@@ -96,15 +100,15 @@ func New(tb testing.TB, opts ...Option) *DB {
 	base := DSN(tb)
 	n := schemaCount.Add(1)
 
-	admin, err := pgxpool.New(ctx, base)
+	ddl, err := pgxpool.New(ctx, base)
 	if err != nil {
 		tb.Fatalf("connect to %s: %v", redact(base), err)
 	}
 	schema := schemaName(tb.Name(), n)
-	if _, err := admin.Exec(ctx, `drop schema if exists `+schema+` cascade`); err != nil {
+	if _, err := ddl.Exec(ctx, `drop schema if exists `+schema+` cascade`); err != nil {
 		tb.Fatalf("drop schema %s: %v", schema, err)
 	}
-	if _, err := admin.Exec(ctx, `create schema `+schema); err != nil {
+	if _, err := ddl.Exec(ctx, `create schema `+schema); err != nil {
 		tb.Fatalf("create schema %s: %v", schema, err)
 	}
 
@@ -112,7 +116,12 @@ func New(tb testing.TB, opts ...Option) *DB {
 		Schema: schema,
 		DSN:    withSearchPath(base, schema),
 		base:   n * 1_000_000,
-		admin:  admin,
+		ddl:    ddl,
+	}
+
+	db.admin, err = pgxpool.New(ctx, db.DSN)
+	if err != nil {
+		tb.Fatalf("connect to schema %s: %v", schema, err)
 	}
 
 	db.Writer, err = ingest.NewPGStore(ctx, db.DSN, ingest.PGOptions{
@@ -135,10 +144,13 @@ func New(tb testing.TB, opts ...Option) *DB {
 			pool.Close()
 		}
 		db.Writer.Close()
-		if _, err := admin.Exec(context.Background(), `drop schema if exists `+schema+` cascade`); err != nil {
+		db.admin.Close()
+		// Dropped last: every session that had this schema in its search_path is gone by
+		// now, so the drop cannot block on one of them.
+		if _, err := ddl.Exec(context.Background(), `drop schema if exists `+schema+` cascade`); err != nil {
 			tb.Logf("drop schema %s: %v", schema, err)
 		}
-		admin.Close()
+		ddl.Close()
 	})
 	return db
 }
@@ -172,7 +184,7 @@ func (db *DB) Reader(tb testing.TB, pin string, maxConns int32) *store.App {
 	return store.NewAppWithPool(db.ReaderPool(tb, maxConns), pin)
 }
 
-// Admin is a connection pool for raw SQL and for reading the lease set.
+// Admin is a connection pool for a test's own SQL, scoped to this test's schema.
 func (db *DB) Admin() *pgxpool.Pool { return db.admin }
 
 // Leases is the version blocks readers are currently holding.

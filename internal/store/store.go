@@ -76,6 +76,22 @@ type ErrNotImplemented struct{ What string }
 
 func (e ErrNotImplemented) Error() string { return e.What + " is not implemented by this backend" }
 
+// ErrBadRequest is returned for a reference the store cannot interpret at all: a pin
+// that is neither a block, a hash nor a label, or a module reference that is neither an
+// id nor an address.
+//
+// It is separate from ErrNotFound because the consumer's correct reaction differs — one
+// says "ask for something that exists", the other "ask properly" — and because without
+// it these landed on the wrong statuses: a malformed pin fell through to 500, and a
+// malformed module id answered 404 where the canonical service answers 400. Neither
+// showed up in parity runs, since cmd/diff compares successful responses.
+type ErrBadRequest struct {
+	What string
+	Ref  string
+}
+
+func (e ErrBadRequest) Error() string { return e.What }
+
 // ErrNotFound is returned when a module reference does not resolve.
 type ErrNotFound struct{ Ref string }
 

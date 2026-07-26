@@ -258,6 +258,14 @@ func writeStoreError(w http.ResponseWriter, err error) bool {
 		return true
 	}
 
+	// Input the store could not interpret at all. Without this case a malformed pin fell
+	// through to 500, which tells a consumer to retry something that will never work.
+	var badRequest store.ErrBadRequest
+	if errors.As(err, &badRequest) {
+		writeError(w, http.StatusBadRequest, []string{badRequest.Error()})
+		return true
+	}
+
 	// A backend that does not hold part of the surface says so, rather than
 	// answering with an empty list a consumer would read as "there are none".
 	if asNotImplemented(err) {

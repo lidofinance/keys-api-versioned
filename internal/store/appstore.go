@@ -156,7 +156,10 @@ func resolveAppPin(ctx context.Context, conn pinReader, pin string) (*model.ELBl
 	default:
 		n, err := strconv.ParseInt(pin, 10, 64)
 		if err != nil {
-			return nil, 0, "", fmt.Errorf("bad pin %q", pin)
+			return nil, 0, "", ErrBadRequest{
+				What: "snapshot must be latest, safe, a block number or a block hash",
+				Ref:  pin,
+			}
 		}
 		q = `select ` + appVersionCols + ` from versions where block_number = $1
 		     order by (status = '` + StatusPublished + `') desc, id desc limit 1`
@@ -220,7 +223,10 @@ func classifyMissingAppPin(ctx context.Context, conn pinReader, pin string) erro
 
 	n, err := strconv.ParseInt(pin, 10, 64)
 	if err != nil {
-		return fmt.Errorf("bad pin %q", pin)
+		return ErrBadRequest{
+			What: "snapshot must be latest, safe, a block number or a block hash",
+			Ref:  pin,
+		}
 	}
 	if oldest > 0 && n < oldest {
 		return ErrPruned{Ref: pin}
@@ -394,13 +400,23 @@ func (s *appSnapshot) ModuleByRef(ctx context.Context, ref string) (*model.Staki
 		return nil, err
 	}
 
-	if id, err := strconv.Atoi(ref); err == nil {
+	if id, err := strconv.Atoi(ref); err == nil && id >= 0 {
 		for i := range s.modules {
 			if int(s.modules[i].ID) == id {
 				return &s.modules[i], nil
 			}
 		}
 		return nil, ErrNotFound{Ref: ref}
+	}
+
+	// A reference that is neither an id nor an address is a malformed request, not a
+	// module that happens to be missing — the same distinction the canonical service
+	// makes, and it answers 400 for it.
+	if !looksLikeAddress(ref) {
+		return nil, ErrBadRequest{
+			What: "module_id must be a contract address or numeric value",
+			Ref:  ref,
+		}
 	}
 
 	lower := strings.ToLower(ref)
@@ -410,6 +426,22 @@ func (s *appSnapshot) ModuleByRef(ctx context.Context, ref string) (*model.Staki
 		}
 	}
 	return nil, ErrNotFound{Ref: ref}
+}
+
+// looksLikeAddress reports whether a reference has the shape of an address: 0x and forty
+// hex digits. Only the shape — whether such a module exists is the caller's question.
+func looksLikeAddress(ref string) bool {
+	if len(ref) != 42 || !strings.HasPrefix(strings.ToLower(ref), "0x") {
+		return false
+	}
+	for _, c := range ref[2:] {
+		switch {
+		case c >= '0' && c <= '9', c >= 'a' && c <= 'f', c >= 'A' && c <= 'F':
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 // moduleID maps a lowercase address to the id the key and operator rows carry.

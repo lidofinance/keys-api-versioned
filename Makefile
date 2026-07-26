@@ -40,9 +40,15 @@ bench: build
 	./bin/bench -url $(TARGET) -requests 8 -concurrency 4 -warmup 0 $(if $(PID),-rss-pid $(PID),)
 
 # The writer's integration test needs a database it may drop tables in.
+# Unit and component tests need nothing; the rest need a database they may create and
+# drop schemas in, and no chain — the writer is driven directly, so the whole suite is
+# hermetic.
 test:
 	go test ./...
-	TEST_DATABASE_URL="$(subst keys_api_app,keys_api_test,$(DSN))" go test ./internal/ingest/ -run TestWriter -v
+	TEST_DATABASE_URL="$(subst keys_api_app,keys_api_test,$(DSN))" go test ./internal/ingest/ ./internal/e2e/ -count=1
+
+test-e2e:
+	TEST_DATABASE_URL="$(subst keys_api_app,keys_api_test,$(DSN))" go test ./internal/e2e/ -count=1 -v
 
 vet:
 	go vet ./...

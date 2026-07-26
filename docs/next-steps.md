@@ -147,6 +147,16 @@ What the runs did not settle:
 
 Items 4 and 5 above are untouched, and they are the ones that would make the incremental path cheap rather than the initial load fast.
 
+## Found by the end-to-end suite
+
+`internal/e2e` drives the writer, the store and the HTTP surface against a real Postgres, with the writer called directly so no chain is involved (`make test-e2e`). It exists because the two defects before it — retention deleting rows under a reader, and a diff silently losing removals — were both found by reading code rather than by a test, which is not a method that scales. Three things came out of writing it.
+
+**Concurrent builds over one module corrupt each other, silently.** Two builds rewriting the same module at the same time both report success, and each published version then serves the other's content: the version staged at one generation read back as another, and the second read back as the generation before both. No error anywhere. The cause is the close-then-open pair in `pgModuleKeys.Commit` running under concurrent snapshots — each build asks "is there an open row for this key" against its own snapshot, so both close what they saw and neither inserts. A transaction-scoped advisory lock per module id around that pair would make the outcome either correct or a wait. Latent today, because a deployment runs one ingest; not latent for **E5** ("two writers, one store"), which is exactly this question. The reproduction is `TestTwoConcurrentBuildsOverOneModuleFailRatherThanCorrupt`, skipped rather than deleted — remove the skip to see it fail.
+
+**A malformed request answered the wrong way, twice, and parity runs could not see it.** `?snapshot=<garbage>` fell through to 500, and a module id that is neither a number nor an address answered 404 where the canonical service answers 400 with `module_id must be a contract address or numeric value`. Both are now `store.ErrBadRequest` → 400. Worth noting how they hid: `cmd/diff` compares successful responses, so the error surface has never been part of the parity claim.
+
+**The rejected read predicate is worse than "sometimes stitched".** The first attempt at a control test interleaved a publish between two naive reads and expected them to disagree; they agreed, because rows do not arrive at publication time — a build inserts them as it goes and `Publish` only flips a status. So "the rows with no `to_block`" exposes a version that is still being written. `TestTheNaivePredicateAnswersFromTwoVersionsAtOnce` now demonstrates that directly, and it is what makes the pinned-dump tests meaningful rather than vacuous.
+
 ## Rough edges to fix while passing by
 
 - The key table's indexes are now nearly the size of the table itself (97 MB against 105 MB on mainnet): five of them, three added for paging and diffs. `kv_from` and `kv_to` are the candidates to drop — the diff predicates may be served well enough by `kv_range`. Measure before removing.
