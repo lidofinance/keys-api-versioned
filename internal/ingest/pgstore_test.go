@@ -3,67 +3,56 @@ package ingest_test
 import (
 	"context"
 	"fmt"
-	"os"
 	"testing"
 
 	"github.com/lidofinance/keys-api-versioned/internal/ingest"
 	"github.com/lidofinance/keys-api-versioned/internal/model"
 	"github.com/lidofinance/keys-api-versioned/internal/store"
+	"github.com/lidofinance/keys-api-versioned/internal/testpg"
+	"github.com/lidofinance/keys-api-versioned/internal/testreg"
 )
 
-// This test exercises the writer and the reader against a real Postgres, because
-// what it checks cannot be checked against a fake: that a second version writes only
-// what moved, that a read pinned at the first version still sees the old value, and
-// that the diff between them reconstructs the second from the first.
+// These tests exercise the writer and the reader against a real Postgres, because what
+// they check cannot be checked against a fake: that a second version writes only what
+// moved, that a read pinned at the first version still sees the old value, that the
+// diff between them reconstructs the second from the first, and that retention cannot
+// delete rows from under a reader.
 //
-// It is skipped unless TEST_DATABASE_URL points at a database it may drop tables in:
+// They are skipped unless TEST_DATABASE_URL points at a database the tests may create
+// and drop schemas in:
 //
 //	TEST_DATABASE_URL=postgres://postgres:postgres@localhost:5432/keys_api_test go test ./internal/ingest/
 
 func TestWriterVersionsAndDiff(t *testing.T) {
-	dsn := os.Getenv("TEST_DATABASE_URL")
-	if dsn == "" {
-		t.Skip("set TEST_DATABASE_URL to run the writer integration test")
-	}
-
+	db := testpg.New(t)
 	ctx := context.Background()
-	pg, err := ingest.NewPGStore(ctx, dsn, ingest.PGOptions{Source: "test"})
-	if err != nil {
-		t.Fatalf("connect: %v", err)
-	}
-	t.Cleanup(pg.Close)
 
-	for _, table := range []string{"key_version", "operator_version", "module_version", "versions"} {
-		if _, err := pg.Pool().Exec(ctx, "drop table if exists "+table); err != nil {
-			t.Fatalf("drop %s: %v", table, err)
-		}
-	}
-	if err := pg.Migrate(ctx); err != nil {
-		t.Fatalf("migrate: %v", err)
-	}
+	// Two modules, one operator each, three keys each — the smallest shape that has a
+	// module boundary and a key that can move on its own.
+	spec := testreg.Spec{Modules: 2, OperatorsPerModule: 1, KeysPerOperator: 3}
 
-	modules := []model.StakingModule{testModule(1, 100), testModule(2, 200)}
+	v1 := testreg.At(db.Block(0))
+	spec.Publish(ctx, t, db.Writer, v1)
 
-	// First version: two modules, three keys each.
-	v1 := model.ELBlockSnapshot{BlockNumber: 1000, BlockHash: hashAt(1000), Timestamp: 12000}
-	writeVersion(ctx, t, pg, v1, modules, func(moduleID int32, i int) model.Key {
-		return testKey(moduleID, i, false)
-	}, 3)
+	// Second version: module 2's key 1 is now deposited. Nothing else moved. Driven by
+	// hand rather than through testreg.Publish because what is under test is the diff
+	// one module's commit reports.
+	deposited := spec.WithUsed(func(module, operator, index int) bool {
+		return module == 2 && index == 1
+	})
+	v2 := testreg.At(db.Block(1))
 
-	// Second version: module 2's key 1 is now deposited. Nothing else moved.
-	v2 := model.ELBlockSnapshot{BlockNumber: 1001, BlockHash: hashAt(1001), Timestamp: 12012}
-	modules[1].Nonce++
-	build, err := pg.Begin(ctx, v2)
+	build, err := db.Writer.Begin(ctx, v2)
 	if err != nil {
 		t.Fatalf("begin v2: %v", err)
 	}
-	keys, err := build.Keys(ctx, modules[1])
+	module2 := deposited.Module(2)
+	keys, err := build.Keys(ctx, module2)
 	if err != nil {
 		t.Fatalf("open keys: %v", err)
 	}
-	for i := 0; i < 3; i++ {
-		k := testKey(modules[1].ID, i, i == 1)
-		if err := keys.Add(ctx, k); err != nil {
+	for i := 0; i < spec.KeysPerOperator; i++ {
+		if err := keys.Add(ctx, deposited.Key(2, 0, i)); err != nil {
 			t.Fatalf("add key: %v", err)
 		}
 	}
@@ -81,8 +70,11 @@ func TestWriterVersionsAndDiff(t *testing.T) {
 		t.Errorf("second version left %d rows alone, want 2", diff.Unchanged)
 	}
 
-	for i := range modules {
-		if err := build.Module(ctx, modules[i], i == 1); err != nil {
+	// A deposit moves the module's nonce on chain, so the module row moves with it.
+	module2.Nonce++
+	for _, module := range []model.StakingModule{deposited.Module(1), module2} {
+		changed := module.ID == 2
+		if err := build.Module(ctx, module, changed); err != nil {
 			t.Fatalf("module row: %v", err)
 		}
 	}
@@ -91,7 +83,7 @@ func TestWriterVersionsAndDiff(t *testing.T) {
 	}
 
 	var rows int
-	if err := pg.Pool().QueryRow(ctx, "select count(*) from key_version").Scan(&rows); err != nil {
+	if err := db.Writer.Pool().QueryRow(ctx, "select count(*) from key_version").Scan(&rows); err != nil {
 		t.Fatalf("count rows: %v", err)
 	}
 	if rows != 7 {
@@ -99,22 +91,20 @@ func TestWriterVersionsAndDiff(t *testing.T) {
 	}
 
 	// A read pinned at the first version must still see the old value.
-	reader := store.NewAppWithPool(pg.Pool(), fmt.Sprint(v1.BlockNumber))
-	usedAtV1 := readUsed(ctx, t, reader, modules[1], 1)
-	if usedAtV1 {
+	pinned := db.Reader(t, fmt.Sprint(v1.BlockNumber), 2)
+	if readUsed(ctx, t, pinned, module2, 1) {
 		t.Error("the first version reports the key as deposited; it was not")
 	}
 
-	reader = store.NewAppWithPool(pg.Pool(), "latest")
-	if !readUsed(ctx, t, reader, modules[1], 1) {
+	latest := db.Reader(t, "latest", 2)
+	if !readUsed(ctx, t, latest, module2, 1) {
 		t.Error("the latest version does not report the key as deposited")
 	}
 
 	// The diff between them has to describe exactly that change, on both sides:
 	// a deposit closes the old row and opens a new one.
-	app := store.NewAppWithPool(pg.Pool(), "latest")
 	var removed, added []model.Key
-	meta, err := app.DiffKeys(ctx, fmt.Sprint(v1.BlockNumber), "latest", "",
+	meta, err := latest.DiffKeys(ctx, fmt.Sprint(v1.BlockNumber), "latest", "",
 		func(kind store.DiffKind, k *model.Key) error {
 			copied := *k
 			if kind == store.DiffRemoved {
@@ -139,7 +129,7 @@ func TestWriterVersionsAndDiff(t *testing.T) {
 	}
 
 	// Retention keeps the newest version and drops what only the older one needed.
-	pruned, err := pg.Prune(ctx, 1)
+	pruned, err := db.Writer.Prune(ctx, 1)
 	if err != nil {
 		t.Fatalf("prune: %v", err)
 	}
@@ -152,7 +142,7 @@ func TestWriterVersionsAndDiff(t *testing.T) {
 	if pruned.Rows != 2 {
 		t.Errorf("prune dropped %d rows, want 2 (the closed key row and the closed module row)", pruned.Rows)
 	}
-	if err := pg.Pool().QueryRow(ctx, "select count(*) from key_version").Scan(&rows); err != nil {
+	if err := db.Writer.Pool().QueryRow(ctx, "select count(*) from key_version").Scan(&rows); err != nil {
 		t.Fatalf("count rows: %v", err)
 	}
 	if rows != 6 {
@@ -160,48 +150,97 @@ func TestWriterVersionsAndDiff(t *testing.T) {
 	}
 }
 
-// writeVersion writes a full version of every module and publishes it.
-func writeVersion(ctx context.Context, t *testing.T, pg *ingest.PGStore, at model.ELBlockSnapshot,
-	modules []model.StakingModule, key func(moduleID int32, i int) model.Key, perModule int) {
-	t.Helper()
+// TestRetentionWaitsForAReaderStreamingAnOldVersion covers the one way a concurrent
+// writer can still corrupt a response in this schema. A publish cannot: the reader
+// selects by validity range at a pinned block, so a row closed at a later block is
+// still visible and a row opened at a later block is not, whatever the writer is
+// doing. A delete can, because a row that is gone matches no predicate — and
+// retention deletes exactly the rows of versions falling out of the window, which is
+// where a slow consumer streaming 211 MiB ends up.
+//
+// The control half matters as much as the check: without the lease the same prune
+// must take the rows away. Otherwise the test would pass on a retention that simply
+// had nothing to delete.
+func TestRetentionWaitsForAReaderStreamingAnOldVersion(t *testing.T) {
+	testpg.Exclusive(t)
 
-	build, err := pg.Begin(ctx, at)
-	if err != nil {
-		t.Fatalf("begin %d: %v", at.BlockNumber, err)
-	}
-	for _, m := range modules {
-		keys, err := build.Keys(ctx, m)
-		if err != nil {
-			t.Fatalf("open keys: %v", err)
+	db := testpg.New(t)
+	ctx := context.Background()
+
+	spec := testreg.Spec{Modules: 1, OperatorsPerModule: 1, KeysPerOperator: 1}
+	module := spec.Module(1)
+
+	// A version, then a second that changes the one key, so the first version's row is
+	// closed and becomes retention's candidate.
+	old := testreg.At(db.Block(0))
+	spec.Publish(ctx, t, db.Writer, old)
+
+	deposited := spec.WithUsed(func(int, int, int) bool { return true })
+	deposited.Publish(ctx, t, db.Writer, testreg.At(db.Block(1)))
+
+	// A reader pinned to the older version, mid-stream: the pin is held open for the
+	// duration of the callback, which is what a slow dump looks like.
+	reader := db.Reader(t, fmt.Sprint(old.BlockNumber), 2)
+
+	var (
+		pruned  ingest.Pruned
+		seen    int
+		pruneEr error
+	)
+	err := reader.Snapshot(ctx, func(snap store.Snapshot) error {
+		// Retention runs while this reader is inside its snapshot, keeping one version.
+		pruned, pruneEr = db.Writer.Prune(ctx, 1)
+		if pruneEr != nil {
+			return pruneEr
 		}
-		for i := 0; i < perModule; i++ {
-			if err := keys.Add(ctx, key(m.ID, i)); err != nil {
-				t.Fatalf("add key: %v", err)
+		return snap.StreamKeys(ctx, module.RawAddress(), model.KeysFilter{}, func(k *model.Key) error {
+			seen++
+			if k.Used {
+				t.Errorf("key at the pinned version reads used=true, want the value from block %d", old.BlockNumber)
 			}
-		}
-		if _, err := keys.Commit(ctx); err != nil {
-			t.Fatalf("commit keys: %v", err)
-		}
-		if _, err := build.Operators(ctx, m, []model.Operator{{
-			Name: "operator-0", RewardAddress: fmt.Sprintf("0x%040x", m.ID), Index: 0, Active: true,
-		}}); err != nil {
-			t.Fatalf("operators: %v", err)
-		}
-		if err := build.Module(ctx, m, true); err != nil {
-			t.Fatalf("module row: %v", err)
-		}
+			return nil
+		})
+	})
+	if err != nil {
+		t.Fatalf("read while pruning: %v", err)
 	}
-	if err := build.Publish(ctx, "latest"); err != nil {
-		t.Fatalf("publish %d: %v", at.BlockNumber, err)
+	if seen != 1 {
+		t.Errorf("streamed %d keys at the pinned version, want 1 — retention took the rows", seen)
+	}
+	if pruned.HeldAt != old.BlockNumber {
+		t.Errorf("Pruned.HeldAt = %d, want %d: retention should report what held it back",
+			pruned.HeldAt, old.BlockNumber)
+	}
+
+	// Control: with no reader holding the version, the same prune must remove it.
+	// Without this the check above would also pass on a retention that had nothing to
+	// delete in the first place.
+	pruned, err = db.Writer.Prune(ctx, 1)
+	if err != nil {
+		t.Fatalf("prune after the reader left: %v", err)
+	}
+	if pruned.HeldAt != 0 {
+		t.Errorf("Pruned.HeldAt = %d after the reader left, want 0", pruned.HeldAt)
+	}
+	if pruned.Rows == 0 && pruned.Versions == 0 {
+		t.Fatal("nothing was pruned once the lease was gone, so the check above proved nothing")
+	}
+
+	var versions int
+	if err := db.Writer.Pool().QueryRow(ctx,
+		`select count(*) from versions where block_number = $1`, old.BlockNumber).Scan(&versions); err != nil {
+		t.Fatalf("count versions: %v", err)
+	}
+	if versions != 0 {
+		t.Errorf("version %d is still stored after an unheld prune", old.BlockNumber)
 	}
 }
 
-// readUsed returns the `used` flag of one key at the store's pin.
+// readUsed reads one key's deposited flag at whatever version the reader is pinned to.
 func readUsed(ctx context.Context, t *testing.T, s *store.App, m model.StakingModule, index int32) bool {
 	t.Helper()
 
-	found := false
-	used := false
+	var found, used bool
 	err := s.Snapshot(ctx, func(snap store.Snapshot) error {
 		return snap.StreamKeys(ctx, m.RawAddress(), model.KeysFilter{}, func(k *model.Key) error {
 			if k.Index == index {
@@ -217,133 +256,4 @@ func readUsed(ctx context.Context, t *testing.T, s *store.App, m model.StakingMo
 		t.Fatalf("key %d of module %d is missing at this pin", index, m.ID)
 	}
 	return used
-}
-
-func testModule(id int32, nonce int32) model.StakingModule {
-	m := model.StakingModule{
-		ID: id, Nonce: nonce, Type: "curated-onchain-v1",
-		Name: fmt.Sprintf("module-%d", id), Active: true, WithdrawalCredentialsType: 1,
-	}
-	m.SetRawAddress(fmt.Sprintf("0x%040x", id))
-	return m
-}
-
-func testKey(moduleID int32, i int, used bool) model.Key {
-	pubkey := make([]byte, 48)
-	pubkey[0], pubkey[1] = byte(moduleID), byte(i)
-	signature := make([]byte, 96)
-	signature[0] = byte(i)
-
-	return model.Key{
-		PubkeyBin: pubkey, SignatureBin: signature,
-		OperatorIndex: 0, Index: int32(i), Used: used, Vetted: true,
-		ModuleAddress: fmt.Sprintf("0x%040x", moduleID),
-	}
-}
-
-func hashAt(block int64) string { return fmt.Sprintf("0x%064x", block) }
-
-// TestRetentionWaitsForAReaderStreamingAnOldVersion covers the one way a concurrent
-// writer can still corrupt a response in this schema. A publish cannot: the reader
-// selects by validity range at a pinned block, so a row closed at a later block is
-// still visible and a row opened at a later block is not, whatever the writer is
-// doing. A delete can, because a row that is gone matches no predicate — and
-// retention deletes exactly the rows of versions falling out of the window, which is
-// where a slow consumer streaming 211 MiB ends up.
-//
-// The control half matters as much as the check: without the lease the same prune
-// must take the rows away. Otherwise the test would pass on a retention that simply
-// had nothing to delete.
-func TestRetentionWaitsForAReaderStreamingAnOldVersion(t *testing.T) {
-	dsn := os.Getenv("TEST_DATABASE_URL")
-	if dsn == "" {
-		t.Skip("set TEST_DATABASE_URL to run the retention lease test")
-	}
-
-	ctx := context.Background()
-	pg, err := ingest.NewPGStore(ctx, dsn, ingest.PGOptions{Source: "test"})
-	if err != nil {
-		t.Fatalf("connect: %v", err)
-	}
-	t.Cleanup(pg.Close)
-
-	for _, table := range []string{"key_version", "operator_version", "module_version", "versions"} {
-		if _, err := pg.Pool().Exec(ctx, "drop table if exists "+table); err != nil {
-			t.Fatalf("drop %s: %v", table, err)
-		}
-	}
-	if err := pg.Migrate(ctx); err != nil {
-		t.Fatalf("migrate: %v", err)
-	}
-
-	modules := []model.StakingModule{testModule(1, 100)}
-
-	// Version at 2000, then a second at 2001 that changes the one key, so the first
-	// version's row is closed and becomes retention's candidate.
-	v1 := model.ELBlockSnapshot{BlockNumber: 2000, BlockHash: hashAt(2000), Timestamp: 24000}
-	writeVersion(ctx, t, pg, v1, modules, func(moduleID int32, i int) model.Key {
-		return testKey(moduleID, i, false)
-	}, 1)
-
-	modules[0].Nonce++
-	v2 := model.ELBlockSnapshot{BlockNumber: 2001, BlockHash: hashAt(2001), Timestamp: 24012}
-	writeVersion(ctx, t, pg, v2, modules, func(moduleID int32, i int) model.Key {
-		return testKey(moduleID, i, true)
-	}, 1)
-
-	// A reader pinned to the older version, mid-stream: the pin is held open for the
-	// duration of the callback, which is what a slow dump looks like.
-	reader := store.NewAppWithPool(pg.Pool(), "2000")
-
-	var (
-		pruned  ingest.Pruned
-		seen    int
-		pruneEr error
-	)
-	err = reader.Snapshot(ctx, func(snap store.Snapshot) error {
-		// Retention runs while this reader is inside its snapshot, keeping one version.
-		pruned, pruneEr = pg.Prune(ctx, 1)
-		if pruneEr != nil {
-			return pruneEr
-		}
-		return snap.StreamKeys(ctx, modules[0].RawAddress(), model.KeysFilter{}, func(k *model.Key) error {
-			seen++
-			if k.Used {
-				t.Errorf("key at the pinned version reads used=true, want the value from block 2000")
-			}
-			return nil
-		})
-	})
-	if err != nil {
-		t.Fatalf("read while pruning: %v", err)
-	}
-	if seen != 1 {
-		t.Errorf("streamed %d keys at the pinned version, want 1 — retention took the rows", seen)
-	}
-	if pruned.HeldAt != 2000 {
-		t.Errorf("Pruned.HeldAt = %d, want 2000: retention should report what held it back", pruned.HeldAt)
-	}
-
-	// Control: with no reader holding the version, the same prune must remove it.
-	// Without this the check above would also pass on a retention that had nothing to
-	// delete in the first place.
-	pruned, err = pg.Prune(ctx, 1)
-	if err != nil {
-		t.Fatalf("prune after the reader left: %v", err)
-	}
-	if pruned.HeldAt != 0 {
-		t.Errorf("Pruned.HeldAt = %d after the reader left, want 0", pruned.HeldAt)
-	}
-	if pruned.Rows == 0 && pruned.Versions == 0 {
-		t.Fatal("nothing was pruned once the lease was gone, so the check above proved nothing")
-	}
-
-	var versions int
-	if err := pg.Pool().QueryRow(ctx,
-		`select count(*) from versions where block_number = 2000`).Scan(&versions); err != nil {
-		t.Fatalf("count versions: %v", err)
-	}
-	if versions != 0 {
-		t.Errorf("version 2000 is still stored after an unheld prune")
-	}
 }
