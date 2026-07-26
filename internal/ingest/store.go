@@ -165,6 +165,11 @@ type Pruned struct {
 	OldestKept int64
 	Versions   int64
 	Rows       int64
+	// HeldAt is the version block a reader's lease held retention back to, 0 when
+	// nothing was held. It is reported rather than hidden because a lease that never
+	// goes away — a leaked one — looks exactly like healthy back-pressure otherwise,
+	// and the difference is whether storage keeps growing.
+	HeldAt int64
 }
 
 // ErrVersionExists is returned by Begin when a version with that block identity is

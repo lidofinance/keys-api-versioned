@@ -242,3 +242,108 @@ func testKey(moduleID int32, i int, used bool) model.Key {
 }
 
 func hashAt(block int64) string { return fmt.Sprintf("0x%064x", block) }
+
+// TestRetentionWaitsForAReaderStreamingAnOldVersion covers the one way a concurrent
+// writer can still corrupt a response in this schema. A publish cannot: the reader
+// selects by validity range at a pinned block, so a row closed at a later block is
+// still visible and a row opened at a later block is not, whatever the writer is
+// doing. A delete can, because a row that is gone matches no predicate — and
+// retention deletes exactly the rows of versions falling out of the window, which is
+// where a slow consumer streaming 211 MiB ends up.
+//
+// The control half matters as much as the check: without the lease the same prune
+// must take the rows away. Otherwise the test would pass on a retention that simply
+// had nothing to delete.
+func TestRetentionWaitsForAReaderStreamingAnOldVersion(t *testing.T) {
+	dsn := os.Getenv("TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("set TEST_DATABASE_URL to run the retention lease test")
+	}
+
+	ctx := context.Background()
+	pg, err := ingest.NewPGStore(ctx, dsn, ingest.PGOptions{Source: "test"})
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	t.Cleanup(pg.Close)
+
+	for _, table := range []string{"key_version", "operator_version", "module_version", "versions"} {
+		if _, err := pg.Pool().Exec(ctx, "drop table if exists "+table); err != nil {
+			t.Fatalf("drop %s: %v", table, err)
+		}
+	}
+	if err := pg.Migrate(ctx); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+
+	modules := []model.StakingModule{testModule(1, 100)}
+
+	// Version at 2000, then a second at 2001 that changes the one key, so the first
+	// version's row is closed and becomes retention's candidate.
+	v1 := model.ELBlockSnapshot{BlockNumber: 2000, BlockHash: hashAt(2000), Timestamp: 24000}
+	writeVersion(ctx, t, pg, v1, modules, func(moduleID int32, i int) model.Key {
+		return testKey(moduleID, i, false)
+	}, 1)
+
+	modules[0].Nonce++
+	v2 := model.ELBlockSnapshot{BlockNumber: 2001, BlockHash: hashAt(2001), Timestamp: 24012}
+	writeVersion(ctx, t, pg, v2, modules, func(moduleID int32, i int) model.Key {
+		return testKey(moduleID, i, true)
+	}, 1)
+
+	// A reader pinned to the older version, mid-stream: the pin is held open for the
+	// duration of the callback, which is what a slow dump looks like.
+	reader := store.NewAppWithPool(pg.Pool(), "2000")
+
+	var (
+		pruned  ingest.Pruned
+		seen    int
+		pruneEr error
+	)
+	err = reader.Snapshot(ctx, func(snap store.Snapshot) error {
+		// Retention runs while this reader is inside its snapshot, keeping one version.
+		pruned, pruneEr = pg.Prune(ctx, 1)
+		if pruneEr != nil {
+			return pruneEr
+		}
+		return snap.StreamKeys(ctx, modules[0].RawAddress(), model.KeysFilter{}, func(k *model.Key) error {
+			seen++
+			if k.Used {
+				t.Errorf("key at the pinned version reads used=true, want the value from block 2000")
+			}
+			return nil
+		})
+	})
+	if err != nil {
+		t.Fatalf("read while pruning: %v", err)
+	}
+	if seen != 1 {
+		t.Errorf("streamed %d keys at the pinned version, want 1 — retention took the rows", seen)
+	}
+	if pruned.HeldAt != 2000 {
+		t.Errorf("Pruned.HeldAt = %d, want 2000: retention should report what held it back", pruned.HeldAt)
+	}
+
+	// Control: with no reader holding the version, the same prune must remove it.
+	// Without this the check above would also pass on a retention that had nothing to
+	// delete in the first place.
+	pruned, err = pg.Prune(ctx, 1)
+	if err != nil {
+		t.Fatalf("prune after the reader left: %v", err)
+	}
+	if pruned.HeldAt != 0 {
+		t.Errorf("Pruned.HeldAt = %d after the reader left, want 0", pruned.HeldAt)
+	}
+	if pruned.Rows == 0 && pruned.Versions == 0 {
+		t.Fatal("nothing was pruned once the lease was gone, so the check above proved nothing")
+	}
+
+	var versions int
+	if err := pg.Pool().QueryRow(ctx,
+		`select count(*) from versions where block_number = 2000`).Scan(&versions); err != nil {
+		t.Fatalf("count versions: %v", err)
+	}
+	if versions != 0 {
+		t.Errorf("version 2000 is still stored after an unheld prune")
+	}
+}

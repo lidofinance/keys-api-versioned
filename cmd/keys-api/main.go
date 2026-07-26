@@ -328,7 +328,7 @@ func observeCycle(m *metrics.Metrics, r ingest.CycleResult) {
 	if r.Rebuilt {
 		m.RebuildsTotal.Inc()
 	}
-	if r.Action == ingest.ActionSupersede {
+	if r.ReorgFrom > 0 || r.Action == ingest.ActionSupersede {
 		m.ReorgsTotal.Inc()
 	}
 

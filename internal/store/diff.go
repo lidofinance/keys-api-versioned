@@ -66,6 +66,17 @@ func (a *App) DiffKeys(ctx context.Context, since, to string, moduleRef string, 
 	if fromBlock == 0 {
 		return nil, ErrNotFound{Ref: since}
 	}
+	// Lease the older end for the duration. Resolving it proves it was still held a
+	// moment ago; the lease is what keeps retention from deleting its closed rows
+	// between the two side queries, which is the case that would silently drop
+	// removals rather than fail. Leasing the older end is enough: the rows a diff
+	// needs are closed above it, and those are exactly what a lease at that block
+	// protects.
+	releaseFrom, err := leaseVersion(ctx, conn, fromBlock)
+	if err != nil {
+		return nil, err
+	}
+	defer releaseFrom()
 
 	toPin := to
 	if toPin == "" {
@@ -151,6 +162,13 @@ const diffCols = `select module_id, operator_index, key_index, pubkey, signature
 	from key_version where `
 
 func (s *appSnapshot) streamDiffSide(ctx context.Context, kind DiffKind, fromBlock, toBlock int64, moduleID *int16, fn func(DiffKind, *model.Key) error) (int64, error) {
+	// A diff is two queries, so a reorg landing between them would drop one side of
+	// it whole — and a diff missing its removals is worse than one that fails, because
+	// applying it leaves the consumer with keys the chain no longer has.
+	if err := s.stillOnChain(ctx); err != nil {
+		return 0, err
+	}
+
 	var (
 		q    string
 		args []any
@@ -214,6 +232,13 @@ func (a *App) ModuleDiff(ctx context.Context, since, to string) (map[int32]bool,
 	_, fromBlock, _, err := resolveAppPin(ctx, conn, since)
 	if err != nil {
 		return nil, err
+	}
+	if fromBlock > 0 {
+		release, err := leaseVersion(ctx, conn, fromBlock)
+		if err != nil {
+			return nil, err
+		}
+		defer release()
 	}
 	toPin := to
 	if toPin == "" {

@@ -214,11 +214,17 @@ func tooEarly(w http.ResponseWriter) {
 // explicit pin can land on a version that is no longer on the chain, and that
 // is what the 409 below reports — together with the head to jump to.
 func writeStoreError(w http.ResponseWriter, err error) bool {
-	// Once bytes are on the wire the status is fixed; all that is left is to
-	// record that the client got a truncated body.
+	// Once bytes are on the wire the status is fixed, so the only honest thing left is
+	// to make sure the client cannot mistake what it received for a complete answer.
+	// Recording the failure covers this side; aborting the connection covers the
+	// client's, and it is the part that matters — a handler that simply returns leaves
+	// net/http to terminate the chunked body normally, so a truncated dump arrives as
+	// a well-formed response and only a consumer that validates the JSON notices.
+	// http.ErrAbortHandler is the sentinel that drops the connection without a stack
+	// trace; withLogging logs from a defer so the record above survives the unwind.
 	if headerSent(w) {
 		streamFailed(w, err)
-		return true
+		panic(http.ErrAbortHandler)
 	}
 
 	var superseded store.ErrSuperseded

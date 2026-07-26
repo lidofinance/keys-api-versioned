@@ -51,44 +51,55 @@ func withLogging(next http.Handler, log *slog.Logger, observe ObserveFunc) http.
 		started := time.Now()
 		rec := &recorder{ResponseWriter: w}
 
+		// Deferred, not sequential, because a truncated stream is reported to the
+		// client by aborting the connection — a panic with http.ErrAbortHandler — and
+		// this line is the only server-side record that it happened. Running during the
+		// unwind keeps the record; no recover, so the panic still reaches net/http,
+		// which drops the connection without printing a stack for that sentinel.
+		defer func() {
+			logRequest(r, rec, log, observe, time.Since(started))
+		}()
 		next.ServeHTTP(rec, r)
-
-		took := time.Since(started)
-		if observe != nil {
-			// Labelled by pattern rather than by path, so a pubkey or a module id
-			// cannot turn one metric into thousands of series.
-			observe(routeLabel(r), rec.status, rec.written, took)
-		}
-		attrs := []any{
-			"method", r.Method,
-			"path", r.URL.Path,
-			"status", rec.status,
-			"bytes", rec.written,
-			"took", took.Round(time.Millisecond).String(),
-		}
-		if q := r.URL.RawQuery; q != "" {
-			attrs = append(attrs, "query", q)
-		}
-		if rec.written > 0 && took > 0 {
-			attrs = append(attrs, "MiB/s", int64(float64(rec.written)/(1<<20)/took.Seconds()))
-		}
-
-		if rec.failed != nil {
-			// The client received a truncated body: the status said 200 and then
-			// the stream stopped. This is the only record of it.
-			log.Error("request failed mid-response", append(attrs, "err", rec.failed)...)
-			return
-		}
-		if rec.status >= 500 {
-			log.Error("request failed", attrs...)
-			return
-		}
-		if rec.status >= 400 {
-			log.Warn("request rejected", attrs...)
-			return
-		}
-		log.Info("request served", attrs...)
 	})
+}
+
+// logRequest emits the one line per request, and the observation behind it. It is a
+// function rather than inline code because it has to run from a defer.
+func logRequest(r *http.Request, rec *recorder, log *slog.Logger, observe ObserveFunc, took time.Duration) {
+	if observe != nil {
+		// Labelled by pattern rather than by path, so a pubkey or a module id
+		// cannot turn one metric into thousands of series.
+		observe(routeLabel(r), rec.status, rec.written, took)
+	}
+	attrs := []any{
+		"method", r.Method,
+		"path", r.URL.Path,
+		"status", rec.status,
+		"bytes", rec.written,
+		"took", took.Round(time.Millisecond).String(),
+	}
+	if q := r.URL.RawQuery; q != "" {
+		attrs = append(attrs, "query", q)
+	}
+	if rec.written > 0 && took > 0 {
+		attrs = append(attrs, "MiB/s", int64(float64(rec.written)/(1<<20)/took.Seconds()))
+	}
+
+	if rec.failed != nil {
+		// The client got a truncated body: the status said 200 and then the stream
+		// stopped. This is the only record of it on this side.
+		log.Error("request failed mid-response", append(attrs, "err", rec.failed)...)
+		return
+	}
+	if rec.status >= 500 {
+		log.Error("request failed", attrs...)
+		return
+	}
+	if rec.status >= 400 {
+		log.Warn("request rejected", attrs...)
+		return
+	}
+	log.Info("request served", attrs...)
 }
 
 // ObserveFunc receives one served request. The API takes it as a function so this

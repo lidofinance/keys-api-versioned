@@ -63,8 +63,13 @@ type CycleResult struct {
 	Rebuilt       bool
 	KeysStaged    int64
 	KeysChanged   int64
-	Duration      time.Duration
-	Err           error
+	// ReorgFrom is the block a reorg rolled versions back to, 0 when there was none.
+	// It is separate from Action because a reorg does not imply a rebuild: after the
+	// rollback the cycle runs the ordinary incremental check, and on mainnet the usual
+	// answer is that nothing inside the reorged range changed.
+	ReorgFrom int64
+	Duration  time.Duration
+	Err       error
 }
 
 // NewSyncer builds a syncer.
@@ -174,9 +179,6 @@ func (s *Syncer) Cycle(ctx context.Context) (result CycleResult) {
 		return result
 	}
 	if reorged {
-		result.Action = ActionSupersede
-		result.Reason = fmt.Sprintf("reorg: rolling back to block %d", forkPoint)
-
 		rolled, err := s.store.SupersedeFrom(ctx, forkPoint)
 		if err != nil {
 			result.Err = err
@@ -185,15 +187,34 @@ func (s *Syncer) Cycle(ctx context.Context) (result CycleResult) {
 		s.log.Warn("reorg rollback",
 			"fork_point", forkPoint, "versions", rolled.Versions,
 			"rows_dropped", rolled.Dropped, "rows_reopened", rolled.Reopened)
+		result.ReorgFrom = forkPoint
 
-		// Then the ordinary path: rebuild at the new head. Only modules whose
-		// state actually differs get their keys re-read, because the diff decides
-		// that, not the fact that a reorg happened.
-		if err := s.rebuild(ctx, head, nil, &result); err != nil {
+		// What survived the rollback becomes the version this cycle decides against,
+		// which is the whole point of holding versions: a reorg costs a rollback plus
+		// the ordinary incremental check, and a fork that changed nothing costs no key
+		// reads at all. Rebuilding unconditionally here — which is what this did — cost
+		// a full 512 000-key read on mainnet for a one-block fork that changed nothing.
+		survivor, err := s.store.Latest(ctx)
+		if err != nil {
 			result.Err = err
+			return result
 		}
-		s.prune(ctx)
-		return result
+		if survivor == nil {
+			// Nothing left below the fork: the one case that does force a full
+			// rebuild, and the reason the retention window should not be narrow.
+			result.Action = ActionSupersede
+			result.Reason = fmt.Sprintf("reorg below the whole retained window (fork at %d): rebuilding from scratch", forkPoint)
+			s.log.Warn("reorg left no version to build on, rebuilding from scratch", "fork_point", forkPoint)
+			if err := s.rebuild(ctx, head, nil, &result); err != nil {
+				result.Err = err
+			} else {
+				result.VersionBlock = head.BlockNumber
+				result.VersionTimestamp = head.Timestamp
+			}
+			s.prune(ctx)
+			return result
+		}
+		latest = survivor
 	}
 
 	// The cheap read: modules with their nonces. No keys.
@@ -224,6 +245,13 @@ func (s *Syncer) Cycle(ctx context.Context) (result CycleResult) {
 	result.Action = decision.Action
 	result.Reason = decision.Reason
 	result.ChangedModules = decision.ChangedModules
+	if result.ReorgFrom > 0 {
+		// The action stays whatever the incremental check decided, because that is what
+		// the cycle did. A reorg that ends in "extend" is the expected outcome on
+		// mainnet, where forks are one or two blocks and Lido keys rarely change inside
+		// them; ReorgFrom is what tells the metrics a reorg happened.
+		result.Reason = fmt.Sprintf("reorg rollback to %d, then %s", result.ReorgFrom, decision.Reason)
+	}
 
 	switch decision.Action {
 	case ActionExtend:
@@ -484,6 +512,14 @@ func (s *Syncer) prune(ctx context.Context) {
 	if err != nil {
 		s.log.Warn("prune failed", "err", err)
 		return
+	}
+	if pruned.HeldAt > 0 {
+		// Warn, not debug: the healthy case (a slow consumer streaming an ageing
+		// version) and the unhealthy one (a leaked lease holding retention open
+		// forever) look the same for one cycle and differ only in whether this keeps
+		// appearing.
+		s.log.Warn("retention held back by a reader still streaming an older version",
+			"held_at_block", pruned.HeldAt, "oldest_kept_block", pruned.OldestKept)
 	}
 	if pruned.Versions == 0 && pruned.Rows == 0 {
 		s.log.Debug("retention: nothing to drop", "keeping", s.cfg.RetainVersions,

@@ -91,6 +91,18 @@ func (a *App) Snapshot(ctx context.Context, fn func(Snapshot) error) error {
 		return err
 	}
 	if meta != nil {
+		// Hold a lease on the version for as long as the response takes. A concurrent
+		// publish is already harmless — the range predicate below decides what this
+		// request sees, whatever the writer does — but retention *deletes*, and a dump
+		// of 211 MiB to a slow consumer can outlive the retention window. Without this
+		// the rows would go while the stream was still using them.
+		release, err := leaseVersion(ctx, conn, block)
+		if err != nil {
+			return err
+		}
+		defer release()
+	}
+	if meta != nil {
 		a.logger().Debug("snapshot resolved", "pin", a.pin, "version_block", block,
 			"confirmed_at", meta.BlockNumber, "status", status,
 			"last_changed", meta.LastChangedBlockHash)
@@ -268,6 +280,47 @@ func (s *appSnapshot) ELMeta(context.Context) (*model.ELBlockSnapshot, error) {
 	return s.meta, nil
 }
 
+// stillOnChain re-checks the pinned version before a query that continues a response
+// already in progress.
+//
+// It exists because of an asymmetry between the two ways rows disappear. Retention is
+// held off by the lease this snapshot took, so it cannot delete underneath a reader. A
+// reorg rollback must delete: the losing branch's rows have to stop being current, or
+// the next version would inherit its keys. And a response is not one query — a dump
+// runs one per module, each in its own implicit transaction with its own snapshot. So
+// a rollback committing between two of them leaves the remaining modules returning
+// nothing, and without this check the handler would finish the JSON and hand the
+// consumer a complete-looking answer assembled from a branch that no longer exists.
+// That is the exact failure this design is meant to rule out, so the cost — one
+// single-row select per module, four on a mainnet dump — is worth paying.
+func (s *appSnapshot) stillOnChain(ctx context.Context) error {
+	var status string
+	err := s.conn.QueryRow(ctx,
+		`select status from versions where block_number = $1`, s.block).Scan(&status)
+	if errors.Is(err, pgx.ErrNoRows) {
+		// Gone entirely. The lease should have prevented retention from doing this, so
+		// reaching here means the version was dropped some other way; either way the
+		// honest answer is that what the consumer pinned is no longer available.
+		return ErrPruned{Ref: strconv.FormatInt(s.block, 10)}
+	}
+	if err != nil {
+		return fmt.Errorf("re-check version %d: %w", s.block, err)
+	}
+	if status != StatusSuperseded {
+		return nil
+	}
+
+	head, lastChanged, err := appHead(ctx, s.conn)
+	if err != nil {
+		return fmt.Errorf("head after a reorg: %w", err)
+	}
+	return ErrSuperseded{
+		Ref:                  strconv.FormatInt(s.block, 10),
+		HeadBlockNumber:      head,
+		HeadLastChangedBlock: lastChanged,
+	}
+}
+
 const appModuleCols = `module_id, address, type, name, nonce, module_fee, treasury_fee, target_share,
 	status, last_deposit_at, last_deposit_block, exited_validators_count, active,
 	withdrawal_credentials_type, last_changed_block_hash`
@@ -386,6 +439,9 @@ const keysAtPin = `select key_index, operator_index, pubkey, signature, used, ve
 func (s *appSnapshot) StreamKeys(ctx context.Context, moduleAddress string, f model.KeysFilter, fn func(*model.Key) error) error {
 	id, ok, err := s.moduleID(ctx, moduleAddress)
 	if err != nil || !ok {
+		return err
+	}
+	if err := s.stillOnChain(ctx); err != nil {
 		return err
 	}
 

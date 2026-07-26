@@ -23,8 +23,11 @@
 # Run load from inside the network: through a published port on Docker Desktop the
 # host hop caps everything at ~188 MiB/s and every service looks identical.
 
+# One CPU by default, because that is what the published numbers are taken at.
+# API_CPUS=2 (or 4) re-runs the same measurement with more, which is the only way to
+# tell "waiting on the node" from "short of CPU".
 x-api-limits: &api-limits
-  cpus: "1.0"
+  cpus: "${API_CPUS:-1.0}"
   mem_limit: 512m
   restart: unless-stopped
 

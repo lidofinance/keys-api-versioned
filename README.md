@@ -72,6 +72,18 @@ One thing a live pair does show honestly: a module mid-deposit differs on its co
 
 One trailing byte used to separate us from byte-identical on the non-streamed endpoints: `json.Encoder.Encode` appends a newline and Fastify does not.
 
+**Re-run on Hoodi after the read path was rewritten**, both services following the same chain: all eight endpoints equal, 37.1 MiB of `/v1/keys` on both sides. Hoodi is the better chain for this check — five modules against mainnet's four, and two of them exercise code mainnet cannot reach (Sandbox, and `curated-onchain-v2` holding keys). Operators are outside `cmd/diff`, so module 5's were compared by hand: 74 operators, every field equal, names included — which is the `META_REGISTRY` lookup agreeing with the canonical service's own.
+
+**A found defect: retention could delete rows under a reader.** A concurrent *write* cannot disturb a response here, and not by timing luck — a reader selects by validity range at a pinned block, so a row closed at a later block still matches the predicate and a row opened at a later block does not, whether or not the writer's transaction has committed. Rewriting a whole module mid-dump is a non-event. A *delete* is the opposite case: a row that is gone matches no predicate, and retention deletes the rows of versions falling out of the window — which is where a slow consumer streaming 211 MiB ends up.
+
+Demonstrated rather than argued: with retention running inside a reader's snapshot, the reader streamed **0 keys instead of 1**. The fix is a lease — a shared Postgres advisory lock on the version's block, held for the request — and retention lowers its own boundary to the oldest leased version instead of waiting or skipping. Advisory locks rather than a lease table because they are visible across processes (the reader may be a separate replica from the writer that prunes, which is the point of `KEYS_API_MODE=server`) and are released when the holder's connection drops, so there is no expiry to tune and no sweeper to write. A lease that never goes away is reported: `retention held back by a reader still streaming an older version`.
+
+Deliberately not covered by a lease: a reorg. When a version leaves the chain its rows must stop being current, or the next version would inherit keys from the losing branch, so the rollback deletes them. **Telling the reader is a separate mechanism, and it was missing.** A response is not one query — a dump runs one per module — so the rollback landed between two of them and the remaining modules came back empty while the handler finished the JSON: a valid, complete-looking answer assembled from a branch that no longer existed. Exactly the failure this design is against, found by writing down what the tests would have to assert.
+
+The fix re-checks the pinned version's status at the start of every query that continues a response — one single-row select, four per mainnet dump. Before the first flush the reader gets a 409 naming the new head; after it, the connection is aborted (`http.ErrAbortHandler`), because a handler that merely returns leaves net/http to close the chunked body cleanly and the truncation arrives as a well-formed response. What the check is not is instant: it runs per query, so a rollback during module 1's stream — 92 % of a mainnet dump — is noticed when module 2 starts. That is a latency, not a correctness gap; rows already streaming come from a portal opened before the delete, so what reached the client is the pinned version's own content.
+
+**Pubkeys are not unique, and both services say so.** Hoodi's CSM holds 9 pubkeys that appear more than once, 11 rows in excess of the distinct count, six of them shared *between different operators* with different `used` flags — one deposited, the others not. Our read reproduces the canonical service exactly here, so this is the chain's content rather than anyone's bug. Worth knowing before writing a consumer that keys the response by pubkey.
+
 ## Measurements
 
 All on the real mainnet registry: 511 877 keys, 731 operators, 4 modules, 216.7 MiB per dump.
@@ -118,6 +130,10 @@ Latest, with reads packed across operators. Same 1-CPU container and the same de
 
 Worth stating because subtracting across runs led the wrong way once already: 37 s of chain reads against a 58 s sync looked like Postgres had become the bottleneck, when most of the gap was the throttling the read-only run had not used.
 
+**One CPU is enough, and wall clock cannot prove it.** Cold syncs at 2 and 4 CPU came back 210 s, 72 s and 165 s, the last being a 1-CPU control taken minutes later — the shared node drifted 3–4× over one afternoon, with module 1's read landing anywhere between 40.5 s and 193 s on identical code. The container's own CPU accounting settles it instead: a full cold sync at a 1-CPU limit used **9.95 CPU-seconds and was throttled zero times** across 769 scheduling periods, which means nothing ever waited for a core. Average utilisation is about 6 %, peaks 0.3 of a core, so more cores have nothing to give.
+
+Which is also the warning for anyone comparing numbers taken from this stand at different times: only measurements from the same afternoon are comparable, and where a claim depends on the difference between two runs, the run that is not the claim needs repeating.
+
 Round-trip bound, not key bound: CSM's 26 000 keys cost more wall clock than module 1's 472 000, because CSM has 609 operators and module 1 has 39. That is what the next section fixes.
 
 ### Ingest: packing reads into requests
@@ -142,6 +158,15 @@ Aggregation earns its place exactly where a batch cannot carry the group. At the
 | Multicall3 | 2.50 s, 18 requests, 10.7 calls per request |
 
 So the two mechanisms are not redundant: batching wins where we run the node, aggregation wins where someone else does and meters it.
+
+**Hoodi, and the batch cap isolated.** The same code against Hoodi reads all five modules — 87 717 keys, 41 + 5 + 4 + 467 + 74 operators — in 13.6 s, and the stand publishes a version from an empty database in **14 s**. Multicall3 is deployed there too, so the aggregation path is the one exercised. Hoodi is also the only chain where two module shapes are covered at all: Sandbox (a third curated registry) and `curated-onchain-v2` with actual keys, whose operator names resolve through the module's `META_REGISTRY` — 74 real names, none of them the generated fallback. On mainnet CMv2 is empty, so none of that code ran there.
+
+Hoodi also gives the cleanest measurement of what aggregation is for, because the only variable is the batch cap. Same node, same module, CSM's 1386 calls:
+
+| batch cap | aggregated | plain |
+|---|---|---|
+| 100 | 2.6 s, 14 requests | 3.0 s, 18 requests |
+| 3, as a metered provider imposes | 2.4 s, 17 requests | 33.5 s, 467 requests |
 
 **The ceiling that shaped the design.** An aggregate's inner calls share one `eth_call` gas budget while separate calls in a JSON-RPC batch each get their own. Two reads of 1100 curated keys in one aggregate come back `out of gas` from mainnet geth; 200 reads of one key each are fine. So aggregates are bounded by *keys returned* rather than by call count (`Call.Cost`), and a read too expensive to share goes out plainly. The first version bounded them by count, which cost nothing on the CSM tail and quietly wrecked module 1 — it bisected on every group, then dragged a permanently lowered call cap into the modules after it, turning CSM's 22 requests into 908. Worth recording because both halves of the mistake were invisible in a per-module run: the failure showed up only in a full sync, in the module that had not failed.
 

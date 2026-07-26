@@ -3,6 +3,7 @@ package ingest
 import (
 	"context"
 	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/lidofinance/keys-api-versioned/internal/model"
@@ -123,6 +124,128 @@ func TestCycleReorgRollsBackToForkPoint(t *testing.T) {
 	}
 }
 
+// A reorg is a rollback plus the ordinary incremental check, so a fork that changed
+// nothing must cost no key reads at all. This is the threshold the design claimed
+// and the code did not meet: it used to rebuild every module after any rollback,
+// which on mainnet is a 512 000-key read for a one-block fork.
+func TestCycleReorgWithNoChangeReadsNoKeys(t *testing.T) {
+	src := newFakeSource(3)
+	store := newFakeStore()
+	s := NewSyncer(src, store, SyncConfig{}, nil)
+
+	if result := s.Cycle(context.Background()); result.Err != nil {
+		t.Fatalf("cold start: %v", result.Err)
+	}
+	// A second version, so the rollback has something to land on.
+	src.advance()
+	src.bumpNonce(1)
+	if result := s.Cycle(context.Background()); result.Err != nil {
+		t.Fatalf("second version: %v", result.Err)
+	}
+	survivor := store.published[0].BlockNumber
+	reorged := store.latest.BlockNumber
+	keyWritesBefore := store.keyWrites
+
+	// The chain replaces the block the newest version was built on, and the nonce bump
+	// that block carried is not on the new branch — the transaction was dropped. So
+	// the chain now matches what the surviving version recorded.
+	src.advance()
+	src.forkAt(reorged)
+	src.dropNonce(1)
+
+	result := s.Cycle(context.Background())
+	if result.Err != nil {
+		t.Fatalf("cycle: %v", result.Err)
+	}
+	if result.ReorgFrom != reorged {
+		t.Errorf("ReorgFrom %d, want %d", result.ReorgFrom, reorged)
+	}
+	if store.supersededFrom != reorged {
+		t.Errorf("rolled back from %d, want %d", store.supersededFrom, reorged)
+	}
+	if store.latest == nil || store.latest.BlockNumber != survivor {
+		t.Fatalf("latest version is %v, want the survivor at %d", store.latest, survivor)
+	}
+	if got := store.keyWrites - keyWritesBefore; got != 0 {
+		t.Errorf("re-read keys of %d modules after a reorg that changed nothing, want 0", got)
+	}
+	if result.Action != ActionExtend {
+		t.Errorf("action %q, want extend: %s", result.Action, result.Reason)
+	}
+	if !strings.Contains(result.Reason, "reorg rollback") {
+		t.Errorf("reason does not mention the rollback: %s", result.Reason)
+	}
+}
+
+// The other half: a reorg that did change one module re-reads that module and only
+// that one, so the incremental path is what decides rather than the rollback.
+func TestCycleReorgWithOneChangedModuleScopesTheRebuild(t *testing.T) {
+	src := newFakeSource(3)
+	store := newFakeStore()
+	s := NewSyncer(src, store, SyncConfig{}, nil)
+
+	if result := s.Cycle(context.Background()); result.Err != nil {
+		t.Fatalf("cold start: %v", result.Err)
+	}
+	src.advance()
+	src.bumpNonce(1)
+	if result := s.Cycle(context.Background()); result.Err != nil {
+		t.Fatalf("second version: %v", result.Err)
+	}
+	reorged := store.latest.BlockNumber
+	store.keyWriteModules = nil
+
+	// On the new branch module 1's bump is gone with its block, and module 2 moved
+	// instead. Only module 2 differs from what the surviving version recorded.
+	src.advance()
+	src.forkAt(reorged)
+	src.dropNonce(1)
+	src.bumpNonce(2)
+
+	result := s.Cycle(context.Background())
+	if result.Err != nil {
+		t.Fatalf("cycle: %v", result.Err)
+	}
+	if !result.Rebuilt {
+		t.Fatal("a changed module should have been rebuilt")
+	}
+	if len(store.keyWriteModules) != 1 || store.keyWriteModules[0] != 2 {
+		t.Errorf("re-read keys of modules %v, want only module 2", store.keyWriteModules)
+	}
+}
+
+// When the fork is below everything held, there is nothing to build on. That is the
+// one case E2 says does force a full rebuild, and it has to be a defined answer
+// rather than an error.
+func TestCycleReorgBelowRetainedWindowRebuildsFromScratch(t *testing.T) {
+	src := newFakeSource(2)
+	store := newFakeStore()
+	s := NewSyncer(src, store, SyncConfig{}, nil)
+
+	if result := s.Cycle(context.Background()); result.Err != nil {
+		t.Fatalf("cold start: %v", result.Err)
+	}
+	only := store.latest.BlockNumber
+
+	src.advance()
+	src.forkAt(only)
+
+	result := s.Cycle(context.Background())
+	if result.Err != nil {
+		t.Fatalf("cycle returned an error instead of rebuilding: %v", result.Err)
+	}
+	if result.Action != ActionSupersede || !result.Rebuilt {
+		t.Fatalf("action %q rebuilt=%t, want supersede with a rebuild: %s",
+			result.Action, result.Rebuilt, result.Reason)
+	}
+	if len(store.keyWriteModules) < 2 {
+		t.Errorf("rebuilt modules %v, want every module", store.keyWriteModules)
+	}
+	if store.latest == nil || store.latest.BlockNumber != src.block {
+		t.Errorf("latest version is %v, want one at the new head %d", store.latest, src.block)
+	}
+}
+
 func TestCycleBlockGapForcesRebuild(t *testing.T) {
 	src := newFakeSource(1)
 	store := newFakeStore()
@@ -175,6 +298,16 @@ func (f *fakeSource) bumpNonce(id int32) {
 	for i := range f.modules {
 		if f.modules[i].ID == id {
 			f.modules[i].Nonce++
+		}
+	}
+}
+
+// dropNonce undoes a bump, which is what a reorg does to the transaction that caused
+// it: the key addition was in the orphaned block and is not on the new branch.
+func (f *fakeSource) dropNonce(id int32) {
+	for i := range f.modules {
+		if f.modules[i].ID == id {
+			f.modules[i].Nonce--
 		}
 	}
 }
@@ -264,11 +397,21 @@ func (s *fakeStore) Begin(_ context.Context, at model.ELBlockSnapshot) (Build, e
 	return &fakeBuild{store: s, id: s.nextID, at: at}, nil
 }
 
+// Extend moves only the confirmed-at fields, like the real store: a version's own
+// block is its identity and never moves. Modelling it the other way made the reorg
+// walk probe the head instead of the version's own height, which is the difference
+// between finding the fork point and not.
 func (s *fakeStore) Extend(_ context.Context, v StoredVersion, at model.ELBlockSnapshot, nonces map[string]int64) error {
 	s.extends++
-	v.BlockNumber = at.BlockNumber
-	v.BlockHash = at.BlockHash
+	v.HeadBlockNumber = at.BlockNumber
+	v.HeadBlockHash = at.BlockHash
+	v.HeadTimestamp = at.Timestamp
 	v.ModuleNonces = nonces
+	for i := range s.published {
+		if s.published[i].ID == v.ID {
+			s.published[i] = v
+		}
+	}
 	s.latest = &v
 	return nil
 }
@@ -278,9 +421,26 @@ func (s *fakeStore) MarkStale(_ context.Context, v StoredVersion) error {
 	return nil
 }
 
+// SupersedeFrom drops every version at or above the block and leaves the newest
+// survivor as the latest, which is what the reorg path then decides against.
 func (s *fakeStore) SupersedeFrom(_ context.Context, block int64) (Superseded, error) {
 	s.supersededFrom = block
-	return Superseded{Versions: 1}, nil
+
+	kept := make([]StoredVersion, 0, len(s.published))
+	for _, v := range s.published {
+		if v.BlockNumber < block {
+			kept = append(kept, v)
+		}
+	}
+	dropped := len(s.published) - len(kept)
+	s.published = kept
+	if len(kept) == 0 {
+		s.latest = nil
+	} else {
+		newest := kept[len(kept)-1]
+		s.latest = &newest
+	}
+	return Superseded{Versions: int64(dropped)}, nil
 }
 
 func (s *fakeStore) Prune(context.Context, int) (Pruned, error) { return Pruned{}, nil }

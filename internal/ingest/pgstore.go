@@ -12,6 +12,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/lidofinance/keys-api-versioned/internal/model"
+	"github.com/lidofinance/keys-api-versioned/internal/store"
 )
 
 //go:embed schema.sql
@@ -260,19 +261,38 @@ func (s *PGStore) Prune(ctx context.Context, keep int) (Pruned, error) {
 		return out, nil
 	}
 
-	// Only rows already closed before the window are dropped. A row that is still
+	// A reader streaming a version that is about to fall out of the window holds a
+	// lease on it, and deleting its rows mid-stream is the one way a concurrent write
+	// can corrupt a response here — see internal/store/lease.go for why writes cannot
+	// and deletes can. So the boundary drops to the oldest leased version and the rest
+	// waits for the next cycle; nothing is skipped permanently.
+	boundary := out.OldestKept
+	leased, err := store.LeasedVersions(ctx, s.pool)
+	if err != nil {
+		// Not fatal, but it must not silently fall back to deleting: a failed read of
+		// the lease set means we do not know what is in use.
+		return out, fmt.Errorf("prune held back, lease set unreadable: %w", err)
+	}
+	for _, block := range leased {
+		if block < boundary {
+			boundary = block
+			out.HeldAt = block
+		}
+	}
+
+	// Only rows already closed before the boundary are dropped. A row that is still
 	// open belongs to the current version whatever its age, so an open row opened
 	// long before the window is normal and stays.
 	for _, table := range versionedTables {
 		tag, err := s.pool.Exec(ctx, `delete from `+table+`
-			where to_block is not null and to_block <= $1`, out.OldestKept)
+			where to_block is not null and to_block <= $1`, boundary)
 		if err != nil {
 			return out, fmt.Errorf("prune %s: %w", table, err)
 		}
 		out.Rows += tag.RowsAffected()
 	}
 
-	tag, err := s.pool.Exec(ctx, `delete from versions where block_number < $1`, out.OldestKept)
+	tag, err := s.pool.Exec(ctx, `delete from versions where block_number < $1`, boundary)
 	if err != nil {
 		return out, fmt.Errorf("prune versions: %w", err)
 	}

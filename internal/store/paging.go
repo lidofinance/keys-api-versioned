@@ -94,6 +94,12 @@ func (s *appSnapshot) StreamKeysPage(ctx context.Context, f model.KeysFilter, pa
 	if err := s.loadModules(ctx); err != nil {
 		return nil, err
 	}
+	// A page that comes back empty because a reorg deleted the version's rows would
+	// read as "the walk is finished" — a silent short answer in the one place a
+	// consumer is least likely to check.
+	if err := s.stillOnChain(ctx); err != nil {
+		return nil, err
+	}
 	if page.Limit <= 0 {
 		return nil, fmt.Errorf("page limit must be positive")
 	}
