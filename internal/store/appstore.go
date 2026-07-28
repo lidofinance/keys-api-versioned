@@ -86,7 +86,7 @@ func (a *App) Snapshot(ctx context.Context, fn func(Snapshot) error) error {
 	}
 	defer conn.Release()
 
-	meta, block, status, err := resolveAppPin(ctx, conn, a.pin)
+	meta, versionID, block, status, err := resolveAppPin(ctx, conn, a.pin)
 	if err != nil {
 		return err
 	}
@@ -107,7 +107,8 @@ func (a *App) Snapshot(ctx context.Context, fn func(Snapshot) error) error {
 			"confirmed_at", meta.BlockNumber, "status", status,
 			"last_changed", meta.LastChangedBlockHash)
 	}
-	return fn(&appSnapshot{conn: conn, meta: meta, block: block, stale: status == StatusStale, log: a.logger()})
+	return fn(&appSnapshot{conn: conn, meta: meta, versionID: versionID, block: block,
+		stale: status == StatusStale, log: a.logger()})
 }
 
 // PinnedSnapshot serves one request at an explicit pin, which is what a
@@ -119,7 +120,7 @@ func (a *App) PinnedSnapshot(ctx context.Context, pin string, fn func(Snapshot) 
 // The pin resolves on block_number — the version's immutable identity — while the
 // meta a consumer sees carries the observed head, which is what the canonical
 // contract reports and what advances on a quiet cycle.
-const appVersionCols = `block_number, coalesce(nullif(head_block_number, 0), block_number),
+const appVersionCols = `id, block_number, coalesce(nullif(head_block_number, 0), block_number),
 	coalesce(nullif(head_block_hash, ''), block_hash),
 	coalesce(nullif(head_timestamp, 0), timestamp),
 	last_changed_block_hash, status`
@@ -130,7 +131,7 @@ const appVersionCols = `block_number, coalesce(nullif(head_block_number, 0), blo
 // A miss has to be distinguishable: taken off the chain by a reorg (superseded),
 // or fallen out of the retention window (pruned). Labels always resolve to the
 // newest version, so they hit neither.
-func resolveAppPin(ctx context.Context, conn pinReader, pin string) (*model.ELBlockSnapshot, int64, string, error) {
+func resolveAppPin(ctx context.Context, conn pinReader, pin string) (*model.ELBlockSnapshot, int64, int64, string, error) {
 	var (
 		q   string
 		arg []any
@@ -156,7 +157,7 @@ func resolveAppPin(ctx context.Context, conn pinReader, pin string) (*model.ELBl
 	default:
 		n, err := strconv.ParseInt(pin, 10, 64)
 		if err != nil {
-			return nil, 0, "", ErrBadRequest{
+			return nil, 0, 0, "", ErrBadRequest{
 				What: "snapshot must be latest, safe, a block number or a block hash",
 				Ref:  pin,
 			}
@@ -167,21 +168,22 @@ func resolveAppPin(ctx context.Context, conn pinReader, pin string) (*model.ELBl
 	}
 
 	var (
-		m        model.ELBlockSnapshot
-		pinBlock int64
-		status   string
+		m         model.ELBlockSnapshot
+		versionID int64
+		pinBlock  int64
+		status    string
 	)
-	err := conn.QueryRow(ctx, q, arg...).Scan(&pinBlock, &m.BlockNumber, &m.BlockHash, &m.Timestamp,
-		&m.LastChangedBlockHash, &status)
+	err := conn.QueryRow(ctx, q, arg...).Scan(&versionID, &pinBlock, &m.BlockNumber, &m.BlockHash,
+		&m.Timestamp, &m.LastChangedBlockHash, &status)
 	if errors.Is(err, pgx.ErrNoRows) {
 		if pin == "latest" || pin == "safe" {
 			// Nothing published yet: the canonical 425 case.
-			return nil, 0, "", nil
+			return nil, 0, 0, "", nil
 		}
-		return nil, 0, "", classifyMissingAppPin(ctx, conn, pin)
+		return nil, 0, 0, "", classifyMissingAppPin(ctx, conn, pin)
 	}
 	if err != nil {
-		return nil, 0, "", fmt.Errorf("resolve pin: %w", err)
+		return nil, 0, 0, "", fmt.Errorf("resolve pin: %w", err)
 	}
 
 	switch status {
@@ -189,16 +191,16 @@ func resolveAppPin(ctx context.Context, conn pinReader, pin string) (*model.ELBl
 	case StatusBuilding:
 		// The writer is still filling this version: not late, not gone, simply not
 		// a version yet.
-		return nil, 0, "", nil
+		return nil, 0, 0, "", nil
 	default:
 		head, lastChanged, err := appHead(ctx, conn)
 		if err != nil {
-			return nil, 0, "", err
+			return nil, 0, 0, "", err
 		}
-		return nil, 0, "", ErrSuperseded{Ref: pin, HeadBlockNumber: head, HeadLastChangedBlock: lastChanged}
+		return nil, 0, 0, "", ErrSuperseded{Ref: pin, HeadBlockNumber: head, HeadLastChangedBlock: lastChanged}
 	}
 
-	return &m, pinBlock, status, nil
+	return &m, versionID, pinBlock, status, nil
 }
 
 func classifyMissingAppPin(ctx context.Context, conn pinReader, pin string) error {
@@ -218,7 +220,7 @@ func classifyMissingAppPin(ctx context.Context, conn pinReader, pin string) erro
 		if oldest > 0 {
 			return ErrPruned{Ref: pin}
 		}
-		return ErrNotFound{Ref: pin}
+		return ErrNotFound{Ref: pin, What: "snapshot"}
 	}
 
 	n, err := strconv.ParseInt(pin, 10, 64)
@@ -231,7 +233,7 @@ func classifyMissingAppPin(ctx context.Context, conn pinReader, pin string) erro
 	if oldest > 0 && n < oldest {
 		return ErrPruned{Ref: pin}
 	}
-	return ErrNotFound{Ref: pin}
+	return ErrNotFound{Ref: pin, What: "snapshot"}
 }
 
 func appHead(ctx context.Context, conn pinReader) (int64, string, error) {
@@ -257,7 +259,13 @@ type appSnapshot struct {
 	// block is the version's own block number — its identity, not the observed head.
 	// Every row predicate uses it, and it is what a cursor names.
 	block int64
-	stale bool
+	// versionID names the version row itself, which the status re-check needs and the
+	// row predicates do not. A block number is not unique across a reorg: the version
+	// the losing branch published and the one the winning branch publishes after the
+	// rollback sit at the same height, and telling them apart by height alone reads a
+	// perfectly current version as superseded — or, worse, the other way round.
+	versionID int64
+	stale     bool
 
 	// modules is the version's module set, read once: four rows that every other
 	// query needs, for the address-to-id mapping among other things.
@@ -300,9 +308,13 @@ func (s *appSnapshot) ELMeta(context.Context) (*model.ELBlockSnapshot, error) {
 // That is the exact failure this design is meant to rule out, so the cost — one
 // single-row select per module, four on a mainnet dump — is worth paying.
 func (s *appSnapshot) stillOnChain(ctx context.Context) error {
+	// By id, not by block number. Two versions share a height whenever a reorg is
+	// followed by a rebuild — the superseded one from the losing branch and the new one
+	// from the winning branch — and a lookup by height then picks between them
+	// arbitrarily.
 	var status string
 	err := s.conn.QueryRow(ctx,
-		`select status from versions where block_number = $1`, s.block).Scan(&status)
+		`select status from versions where id = $1`, s.versionID).Scan(&status)
 	if errors.Is(err, pgx.ErrNoRows) {
 		// Gone entirely. The lease should have prevented retention from doing this, so
 		// reaching here means the version was dropped some other way; either way the

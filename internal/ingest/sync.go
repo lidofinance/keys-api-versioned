@@ -151,6 +151,12 @@ func (s *Syncer) Cycle(ctx context.Context) (result CycleResult) {
 		s.log.Info("cold start: no published version, reading every module", "head", head.BlockNumber)
 		if err := s.rebuild(ctx, head, nil, &result); err != nil {
 			result.Err = err
+		} else {
+			// Same as the ordinary rebuild path below. Without it a cold start
+			// reports VersionBlock 0, so published_version_block and
+			// blocks_behind_head stay unset for a cycle after the longest build the
+			// service ever does.
+			result.VersionBlock = head.BlockNumber
 		}
 		s.prune(ctx)
 		return result

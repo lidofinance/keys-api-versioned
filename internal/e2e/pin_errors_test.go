@@ -2,8 +2,10 @@ package e2e
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
+	"strings"
 	"testing"
 
 	"github.com/lidofinance/keys-api-versioned/internal/testpg"
@@ -123,6 +125,137 @@ func TestAnUnknownHashRecordsTodaysBehaviour(t *testing.T) {
 	badOnDiff.Body.Close()
 	if badOnDiff.StatusCode != http.StatusBadRequest {
 		t.Errorf("a malformed pin on /v1/keys/diff: status %d, want 400", badOnDiff.StatusCode)
+	}
+}
+
+// TestADiffFromAPrunedVersionAnswers410 covers the answer a consumer that fell behind
+// actually gets, which until now was only covered through `?snapshot=` on /v1/keys.
+//
+// It matters more on this endpoint than on that one. A pinned dump of a version that is
+// gone can only fail; a diff from it could plausibly be computed, and the result would
+// apply cleanly and be wrong. Retention deletes closed rows, so the `removed` side —
+// and only that side — comes back short: the consumer would keep keys the chain no
+// longer has, with nothing in the response saying so. TestADiffWhoseOlderEndWasDeleted-
+// ComesBackShort demonstrates that at the store level; this one holds the HTTP contract
+// that refuses instead.
+//
+// The 200 before the prune is what stops this from being vacuous: without it, a diff
+// endpoint that answered 410 to everything would pass.
+func TestADiffFromAPrunedVersionAnswers410(t *testing.T) {
+	testpg.Exclusive(t)
+
+	db := testpg.New(t)
+	ctx := context.Background()
+
+	spec := testreg.Spec{Modules: 2, OperatorsPerModule: 2, KeysPerOperator: 10}
+	from := testreg.At(db.Block(0))
+	spec.Publish(ctx, t, db.Writer, from)
+
+	// One module rewritten, so the diff has a substantial removed side — the side
+	// retention is able to delete.
+	next := spec.WithSalt(spec.Salt + 1)
+	next.PublishModules(ctx, t, db.Writer, testreg.At(db.Block(1)), 1)
+
+	srv := testpg.NewServer(t, db.Reader(t, "latest", 3))
+	path := fmt.Sprintf("/v1/keys/diff?since=%d", from.BlockNumber)
+
+	before := srv.Get(t, path)
+	body := readBody(t, before)
+	if before.StatusCode != http.StatusOK {
+		t.Fatalf("a diff from a held version: status %d, want 200 — body %s", before.StatusCode, body)
+	}
+	var answered struct {
+		Meta struct {
+			Removed int `json:"removed"`
+			Added   int `json:"added"`
+		} `json:"meta"`
+	}
+	if err := json.Unmarshal([]byte(body), &answered); err != nil {
+		t.Fatalf("decode the diff: %v — body %s", err, body)
+	}
+	if answered.Meta.Removed == 0 {
+		t.Fatalf("the diff reported no removals, so the side retention would delete is empty "+
+			"and the 410 below proves nothing — body %s", body)
+	}
+
+	// The version the consumer holds leaves the retention window while it is away.
+	pruned, err := db.Writer.Prune(ctx, 1)
+	if err != nil {
+		t.Fatalf("prune: %v", err)
+	}
+	if pruned.Versions == 0 {
+		t.Fatal("nothing was pruned, so the diff below is not resuming from a version that is gone")
+	}
+
+	gone := srv.Get(t, path)
+	goneBody := readBody(t, gone)
+	if gone.StatusCode != http.StatusGone {
+		t.Errorf("a diff whose `since` left the retention window: status %d, want 410 — body %s",
+			gone.StatusCode, goneBody)
+	}
+}
+
+// TestANumericPinTellsAPrunedVersionApartFromOneThatNeverExisted pins the distinction
+// that decides what a consumer does next: 410 means "you are too far behind, resync",
+// 404 means "that is not a version, fix your request".
+//
+// It is worth holding in place because the two answers come from one branch of
+// classifyMissingAppPin whose condition is a comparison against min(block_number) — a
+// value that moves every time retention runs. And because the equivalent distinction for
+// *hash* pins does not work at all: see TestAnUnknownHashRecordsTodaysBehaviour and
+// backlog item 5.
+//
+// Both endpoints that resolve a pin are checked, since a consumer meets this on either.
+func TestANumericPinTellsAPrunedVersionApartFromOneThatNeverExisted(t *testing.T) {
+	testpg.Exclusive(t)
+
+	db := testpg.New(t)
+	ctx := context.Background()
+
+	spec := testreg.Spec{Modules: 1, OperatorsPerModule: 1, KeysPerOperator: 5}
+	dropped := testreg.At(db.Block(10))
+	spec.Publish(ctx, t, db.Writer, dropped)
+
+	kept := testreg.At(db.Block(12))
+	spec.WithSalt(1).Publish(ctx, t, db.Writer, kept)
+
+	if _, err := db.Writer.Prune(ctx, 1); err != nil {
+		t.Fatalf("prune: %v", err)
+	}
+
+	srv := testpg.NewServer(t, db.Reader(t, "latest", 3))
+
+	// Above the oldest version still held, and never published: a block number the
+	// consumer could only have invented — or, more likely, read out of
+	// meta.elBlockSnapshot, which carries the head rather than the version's identity.
+	invented := db.Block(13)
+
+	for _, c := range []struct {
+		name string
+		path string
+		want int
+	}{
+		{"a pruned version by block", fmt.Sprintf("/v1/keys?snapshot=%d", dropped.BlockNumber), http.StatusGone},
+		{"a block that was never a version", fmt.Sprintf("/v1/keys?snapshot=%d", invented), http.StatusNotFound},
+		{"a diff from a pruned version", fmt.Sprintf("/v1/keys/diff?since=%d", dropped.BlockNumber), http.StatusGone},
+		{"a diff from a block that was never a version", fmt.Sprintf("/v1/keys/diff?since=%d", invented), http.StatusNotFound},
+		// The version that survived retention still serves, which is what makes the two
+		// answers above statements about those pins rather than about the store.
+		{"the version that was kept", fmt.Sprintf("/v1/keys?snapshot=%d", kept.BlockNumber), http.StatusOK},
+	} {
+		resp := srv.Get(t, c.path)
+		body := readBody(t, resp)
+		if resp.StatusCode != c.want {
+			t.Errorf("%s (GET %s): status %d, want %d — body %s",
+				c.name, c.path, resp.StatusCode, c.want, body)
+			continue
+		}
+		// A 404 about a pin must not talk about modules. It used to: ErrNotFound is
+		// shared with the module lookup and hardcoded that wording, so a consumer
+		// asking for a version that never existed was told its module was unsupported.
+		if c.want == http.StatusNotFound && strings.Contains(body, "module") {
+			t.Errorf("%s: the 404 body blames a module for a pin problem — %s", c.name, body)
+		}
 	}
 }
 

@@ -175,5 +175,31 @@ services:
       DATABASE_URL: postgres://postgres:postgres@db:5432/keys_api_app?sslmode=disable
     entrypoint: []
 
+  # A fork of Hoodi at the block the fork suite pins, for driving the stand by hand —
+  # above all for the one thing the Go suite does not do, running the canonical service
+  # beside ours on the same scripted chain and comparing with `diff`.
+  #
+  # The Go tests do not use this: they start their own anvil on a free port, so a
+  # scenario cannot collide with a stand someone left running. See docs/fork-tests.md.
+  #
+  # Two things to know before pointing the canonical service at it. Its isUrl validation
+  # rejects a host with no TLD, so it needs an IP rather than `anvil` — and the failure
+  # surfaces as a misleading "Cannot find module dist/src/main". And automine is off
+  # here, as it is in the suite, because a stand that mines on a timer cannot hold still
+  # long enough for two services to be compared at the same block: mine explicitly with
+  # `cast rpc anvil_mine`.
+  anvil:
+    image: ghcr.io/foundry-rs/foundry:latest
+    profiles: ["fork"]
+    entrypoint: ["anvil"]
+    command:
+      - --fork-url=${FORK_UPSTREAM_RPC:-}
+      - --fork-block-number=${FORK_BLOCK:-3290000}
+      - --auto-impersonate
+      - --no-mining
+      - --host=0.0.0.0
+    ports:
+      - "8545:8545"
+
 volumes:
   pgdata:

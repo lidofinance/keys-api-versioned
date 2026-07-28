@@ -59,12 +59,12 @@ func (a *App) DiffKeys(ctx context.Context, since, to string, moduleRef string, 
 	}
 	defer conn.Release()
 
-	_, fromBlock, _, err := resolveAppPin(ctx, conn, since)
+	_, _, fromBlock, _, err := resolveAppPin(ctx, conn, since)
 	if err != nil {
 		return nil, err
 	}
 	if fromBlock == 0 {
-		return nil, ErrNotFound{Ref: since}
+		return nil, ErrNotFound{Ref: since, What: "snapshot"}
 	}
 	// Lease the older end for the duration. Resolving it proves it was still held a
 	// moment ago; the lease is what keeps retention from deleting its closed rows
@@ -82,12 +82,12 @@ func (a *App) DiffKeys(ctx context.Context, since, to string, moduleRef string, 
 	if toPin == "" {
 		toPin = "latest"
 	}
-	head, toBlock, _, err := resolveAppPin(ctx, conn, toPin)
+	head, toVersionID, toBlock, _, err := resolveAppPin(ctx, conn, toPin)
 	if err != nil {
 		return nil, err
 	}
 	if head == nil {
-		return nil, ErrNotFound{Ref: toPin}
+		return nil, ErrNotFound{Ref: toPin, What: "snapshot"}
 	}
 
 	// The two ends are named by version identity, not by the head each version was
@@ -105,7 +105,9 @@ func (a *App) DiffKeys(ctx context.Context, since, to string, moduleRef string, 
 		return nil, fmt.Errorf("since (%d) is newer than to (%d)", fromBlock, toBlock)
 	}
 
-	snap := &appSnapshot{conn: conn, meta: toMeta, block: toBlock}
+	// versionID matters as much as the block here: the status re-check names the
+	// version row, and two versions share a height after a reorg.
+	snap := &appSnapshot{conn: conn, meta: toMeta, versionID: toVersionID, block: toBlock}
 	if err := snap.loadModules(ctx); err != nil {
 		return nil, err
 	}
@@ -229,7 +231,7 @@ func (a *App) ModuleDiff(ctx context.Context, since, to string) (map[int32]bool,
 	}
 	defer conn.Release()
 
-	_, fromBlock, _, err := resolveAppPin(ctx, conn, since)
+	_, _, fromBlock, _, err := resolveAppPin(ctx, conn, since)
 	if err != nil {
 		return nil, err
 	}
@@ -244,7 +246,7 @@ func (a *App) ModuleDiff(ctx context.Context, since, to string) (map[int32]bool,
 	if toPin == "" {
 		toPin = "latest"
 	}
-	_, toBlock, _, err := resolveAppPin(ctx, conn, toPin)
+	_, _, toBlock, _, err := resolveAppPin(ctx, conn, toPin)
 	if err != nil {
 		return nil, err
 	}

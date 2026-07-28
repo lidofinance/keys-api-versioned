@@ -92,10 +92,26 @@ type ErrBadRequest struct {
 
 func (e ErrBadRequest) Error() string { return e.What }
 
-// ErrNotFound is returned when a module reference does not resolve.
-type ErrNotFound struct{ Ref string }
+// ErrNotFound is returned when a reference does not resolve: a module that does not
+// exist, or a pin naming a version that was never published.
+//
+// The two need different words. A pin that never existed used to answer "module
+// <block> is not supported", which points a consumer at a module problem it does not
+// have — and the pin case is the one a lagging consumer meets, since a block number it
+// took from meta.elBlockSnapshot is the head rather than a version's identity.
+type ErrNotFound struct {
+	Ref string
+	// What names the kind of reference. Empty means a staking module, which is the
+	// canonical service's own 404 and therefore the wording that has to stay put.
+	What string
+}
 
-func (e ErrNotFound) Error() string { return "module " + e.Ref + " is not supported" }
+func (e ErrNotFound) Error() string {
+	if e.What == "" {
+		return "module " + e.Ref + " is not supported"
+	}
+	return e.What + " " + e.Ref + " is not a published version"
+}
 
 // ErrSuperseded is returned for a pinned read on a version that a reorg took
 // off the canonical chain. The head fields let the consumer jump straight to

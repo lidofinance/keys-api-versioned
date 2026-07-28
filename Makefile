@@ -7,12 +7,18 @@ INTERVAL_MS ?= 12000
 KEEP ?= 20
 STATIC_FILE ?= testdata/registry.json
 
+# The fork suite. FORK_BLOCK is pinned rather than tracking head: anvil caches the
+# forked state on disk per block, and every scenario asserts preconditions that only
+# hold at this one. docs/fork-tests.md says what re-pinning costs.
+FORK_UPSTREAM_RPC ?=
+FORK_BLOCK ?= 3290000
+
 CANONICAL ?= http://127.0.0.1:3000
 POC ?= http://127.0.0.1:$(PORT)
 TARGET ?= $(POC)/v1/keys
 PID ?=
 
-.PHONY: build run run-static diff bench test vet clean
+.PHONY: build run run-static diff bench test test-e2e test-fork vet clean
 
 build:
 	go build -o bin/keys-api ./cmd/keys-api
@@ -49,6 +55,20 @@ test:
 
 test-e2e:
 	TEST_DATABASE_URL="$(subst keys_api_app,keys_api_test,$(DSN))" go test ./internal/e2e/ -count=1 -v
+
+# The fork suite: the real chain reader, the real loop, an anvil fork of Hoodi at a
+# pinned block. Behind a build tag, so `go test ./...` neither runs it nor needs anvil.
+#
+# Its own database, because it writes versions at the real block numbers of the chain
+# it forks and leases are keyed by block number across the whole database.
+#
+# The first run is slow and leans on the upstream node: anvil serves a cold read by
+# pulling storage a slot at a time. After that it comes out of ~/.foundry/cache/rpc and
+# a scenario costs a couple of seconds.
+test-fork:
+	FORK_UPSTREAM_RPC="$(FORK_UPSTREAM_RPC)" FORK_BLOCK="$(FORK_BLOCK)" \
+	TEST_DATABASE_URL="$(subst keys_api_app,keys_api_fork,$(DSN))" \
+	go test -tags fork ./internal/fork/ -count=1 -v
 
 vet:
 	go vet ./...
