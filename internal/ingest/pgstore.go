@@ -28,9 +28,43 @@ var schemaSQL string
 type PGStore struct {
 	pool   *pgxpool.Pool
 	source string
+	// schema is the schema this store lives in, empty when the DSN decides. Migrate
+	// creates it; every statement after that is unqualified and lands there through
+	// the search_path.
+	schema string
 	// keyStageBatch bounds how many staged keys are held before a COPY, so memory
 	// does not scale with a module's size.
 	keyStageBatch int
+}
+
+// One schema per chain, and it is a safety property rather than tidiness.
+//
+// A database filled from one chain and opened with a node on another is silent today:
+// the loop probes the stored version's height on the new chain, finds a different hash,
+// correctly concludes the branch is gone, finds nothing that survived, and rebuilds from
+// scratch. Nothing above `reorg deeper than the retained window` is logged, the data is
+// gone, and the service looks healthy. The people most likely to point a mainnet node at
+// a Hoodi database are the ones least equipped to work out what happened.
+//
+// Deriving the schema from the chain id makes that mistake impossible instead of
+// detectable. A mainnet run does not find the Hoodi rows because they are not in its
+// schema, so it cannot roll them back; it cold-syncs into an empty one and the Hoodi data
+// sits untouched. Fix the variable and the data is there again.
+//
+// It does not replace the chain-id check against the node, which catches the other
+// direction, and it cannot catch a devnet reusing chain id 1 — for that, see the
+// disjoint-module guard in sync.go.
+//
+// A DSN that already carries a search_path wins: that is how internal/testpg puts each
+// test in its own schema, and it doubles as the escape hatch for a deployment that wants
+// the layout it already has.
+func chainSchema(chainID int64) string {
+	return fmt.Sprintf("chain_%d", chainID)
+}
+
+// dsnHasSearchPath reports whether the caller already chose a schema.
+func dsnHasSearchPath(dsn string) bool {
+	return strings.Contains(dsn, "search_path=")
 }
 
 // PGOptions configure the store.
@@ -39,12 +73,29 @@ type PGOptions struct {
 	// Source is recorded on every version, so a store fed by two providers stays
 	// legible.
 	Source string
+	// ChainID puts the store in a schema of its own, `chain_<id>`, so two chains
+	// cannot share one. Zero leaves the schema to the DSN, and so does a DSN that
+	// already carries a search_path. See chainSchema for why this exists.
+	ChainID int64
 	// KeyStageBatch is the COPY batch size; 0 means 20 000.
 	KeyStageBatch int
 }
 
 // NewPGStore connects to Postgres.
 func NewPGStore(ctx context.Context, dsn string, o PGOptions) (*PGStore, error) {
+	schema := ""
+	if o.ChainID != 0 && !dsnHasSearchPath(dsn) {
+		schema = chainSchema(o.ChainID)
+		separator := "?"
+		if strings.Contains(dsn, "?") {
+			separator = "&"
+		}
+		// pgx passes connection-string keys it does not recognise to the server as
+		// runtime parameters, which is exactly what is wanted. Migrate verifies the
+		// effect rather than trusting it.
+		dsn += separator + "search_path=" + schema
+	}
+
 	cfg, err := pgxpool.ParseConfig(dsn)
 	if err != nil {
 		return nil, fmt.Errorf("parse dsn: %w", err)
@@ -65,7 +116,7 @@ func NewPGStore(ctx context.Context, dsn string, o PGOptions) (*PGStore, error) 
 	if batch <= 0 {
 		batch = 20_000
 	}
-	return &PGStore{pool: pool, source: o.Source, keyStageBatch: batch}, nil
+	return &PGStore{pool: pool, source: o.Source, schema: schema, keyStageBatch: batch}, nil
 }
 
 func (s *PGStore) Close() { s.pool.Close() }
@@ -73,12 +124,43 @@ func (s *PGStore) Close() { s.pool.Close() }
 // Pool exposes the connection pool so the app can share it with the read side.
 func (s *PGStore) Pool() *pgxpool.Pool { return s.pool }
 
-// Migrate applies the embedded schema.
+// Migrate creates the schema if it is ours to create, then applies the tables.
+//
+// The schema.sql statements are unqualified, so they land wherever the search_path points
+// — which is the whole mechanism. It is verified rather than trusted: a search_path that
+// did not take effect would show up much later as an inexplicably empty store.
 func (s *PGStore) Migrate(ctx context.Context) error {
+	if s.schema != "" {
+		if _, err := s.pool.Exec(ctx, `create schema if not exists `+pgIdentifier(s.schema)); err != nil {
+			return fmt.Errorf("create schema %s: %w", s.schema, err)
+		}
+	}
 	if _, err := s.pool.Exec(ctx, schemaSQL); err != nil {
 		return fmt.Errorf("apply schema: %w", err)
 	}
+	if s.schema != "" {
+		var landed string
+		err := s.pool.QueryRow(ctx, `select n.nspname from pg_class c
+			join pg_namespace n on n.oid = c.relnamespace
+			where c.oid = to_regclass('versions')`).Scan(&landed)
+		if err != nil {
+			return fmt.Errorf("verify the schema: %w", err)
+		}
+		if landed != s.schema {
+			return fmt.Errorf("the schema landed in %q, want %q: the search_path in the DSN "+
+				"is not taking effect", landed, s.schema)
+		}
+	}
 	return nil
+}
+
+// Schema is the schema this store writes to, empty when the DSN decided.
+func (s *PGStore) Schema() string { return s.schema }
+
+// pgIdentifier quotes a schema name. The only names reaching it are `chain_<digits>`,
+// but an unquoted identifier built by concatenation is a habit worth not having.
+func pgIdentifier(name string) string {
+	return `"` + strings.ReplaceAll(name, `"`, `""`) + `"`
 }
 
 const versionColumns = `id, block_number, block_hash, timestamp,

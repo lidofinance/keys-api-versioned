@@ -79,6 +79,10 @@ services:
       # Both services already refuse to start with a clear message if it is empty.
       PROVIDERS_URLS: ${PROVIDERS_URLS:-}
       CHAIN_ID: ${CHAIN_ID:-1}
+      # No per-chain default in the binary, deliberately: an address compiled in needs a
+      # redeploy to correct. The well-known values are in .env.example — copy it to .env
+      # and the stand is one command again.
+      LIDO_LOCATOR: ${LIDO_LOCATOR:-}
       PORT: "3000"
       UPDATE_KEYS_INTERVAL_MS: ${UPDATE_KEYS_INTERVAL_MS:-12000}
       RETAIN_VERSIONS: ${RETAIN_VERSIONS:-20}

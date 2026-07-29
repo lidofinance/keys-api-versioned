@@ -69,16 +69,16 @@ func TestPinAndErrorMatrix(t *testing.T) {
 		want int
 	}{
 		{"the current version", "/v1/keys", http.StatusOK},
-		{"an explicit block that is held", fmt.Sprintf("/v1/keys?snapshot=%d", kept.BlockNumber), http.StatusOK},
-		{"an explicit hash that is held", "/v1/keys?snapshot=" + testreg.HashAt(kept.BlockNumber), http.StatusOK},
-		{"a version a reorg took off the chain", "/v1/keys?snapshot=" + testreg.HashAt(orphan.BlockNumber), http.StatusConflict},
+		{"an explicit block that is held", fmt.Sprintf("/ext/v1/keys?snapshot=%d", kept.BlockNumber), http.StatusOK},
+		{"an explicit hash that is held", "/ext/v1/keys?snapshot=" + testreg.HashAt(kept.BlockNumber), http.StatusOK},
+		{"a version a reorg took off the chain", "/ext/v1/keys?snapshot=" + testreg.HashAt(orphan.BlockNumber), http.StatusConflict},
 		{"an unknown module id", "/v1/modules/99/keys", http.StatusNotFound},
 		{"a module id that is neither an id nor an address", "/v1/modules/abc/keys", http.StatusBadRequest},
-		{"a malformed pin", "/v1/keys?snapshot=not-a-pin", http.StatusBadRequest},
-		{"a limit above the maximum", "/v1/keys?limit=200001", http.StatusBadRequest},
-		{"a limit that is not a number", "/v1/keys?limit=ten", http.StatusBadRequest},
-		{"a diff without since", "/v1/keys/diff", http.StatusBadRequest},
-		{"a cursor that is not a cursor", "/v1/keys?cursor=nonsense", http.StatusBadRequest},
+		{"a malformed pin", "/ext/v1/keys?snapshot=not-a-pin", http.StatusBadRequest},
+		{"a limit above the maximum", "/ext/v1/keys?limit=200001", http.StatusBadRequest},
+		{"a limit that is not a number", "/ext/v1/keys?limit=ten", http.StatusBadRequest},
+		{"a diff without since", "/ext/v1/keys/diff", http.StatusBadRequest},
+		{"a cursor that is not a cursor", "/ext/v1/keys?cursor=nonsense", http.StatusBadRequest},
 	} {
 		resp := srv.Get(t, c.path)
 		body := readBody(t, resp)
@@ -93,7 +93,7 @@ func TestPinAndErrorMatrix(t *testing.T) {
 	if _, err := db.Writer.Prune(ctx, 1); err != nil {
 		t.Fatalf("prune: %v", err)
 	}
-	gone := srv.Get(t, fmt.Sprintf("/v1/keys?snapshot=%d", kept.BlockNumber))
+	gone := srv.Get(t, fmt.Sprintf("/ext/v1/keys?snapshot=%d", kept.BlockNumber))
 	gone.Body.Close()
 	if gone.StatusCode != http.StatusGone {
 		t.Errorf("a pruned version: status %d, want 410", gone.StatusCode)
@@ -114,22 +114,22 @@ func TestAnUnknownHashRecordsTodaysBehaviour(t *testing.T) {
 
 	srv := testpg.NewServer(t, db.Reader(t, "latest", 2))
 
-	unknown := srv.Get(t, "/v1/keys?snapshot="+testreg.HashAt(999999))
+	unknown := srv.Get(t, "/ext/v1/keys?snapshot="+testreg.HashAt(999999))
 	unknown.Body.Close()
 	if unknown.StatusCode != http.StatusGone {
 		t.Errorf("a hash that was never published: status %d, today's answer is 410 "+
 			"(see backlog item 5 — it should become 404)", unknown.StatusCode)
 	}
 
-	badOnDiff := srv.Get(t, "/v1/keys/diff?since=not-a-pin")
+	badOnDiff := srv.Get(t, "/ext/v1/keys/diff?since=not-a-pin")
 	badOnDiff.Body.Close()
 	if badOnDiff.StatusCode != http.StatusBadRequest {
-		t.Errorf("a malformed pin on /v1/keys/diff: status %d, want 400", badOnDiff.StatusCode)
+		t.Errorf("a malformed pin on the diff endpoint: status %d, want 400", badOnDiff.StatusCode)
 	}
 }
 
 // TestADiffFromAPrunedVersionAnswers410 covers the answer a consumer that fell behind
-// actually gets, which until now was only covered through `?snapshot=` on /v1/keys.
+// actually gets, which until now was only covered through `?snapshot=` on the dump.
 //
 // It matters more on this endpoint than on that one. A pinned dump of a version that is
 // gone can only fail; a diff from it could plausibly be computed, and the result would
@@ -157,7 +157,7 @@ func TestADiffFromAPrunedVersionAnswers410(t *testing.T) {
 	next.PublishModules(ctx, t, db.Writer, testreg.At(db.Block(1)), 1)
 
 	srv := testpg.NewServer(t, db.Reader(t, "latest", 3))
-	path := fmt.Sprintf("/v1/keys/diff?since=%d", from.BlockNumber)
+	path := fmt.Sprintf("/ext/v1/keys/diff?since=%d", from.BlockNumber)
 
 	before := srv.Get(t, path)
 	body := readBody(t, before)
@@ -235,13 +235,13 @@ func TestANumericPinTellsAPrunedVersionApartFromOneThatNeverExisted(t *testing.T
 		path string
 		want int
 	}{
-		{"a pruned version by block", fmt.Sprintf("/v1/keys?snapshot=%d", dropped.BlockNumber), http.StatusGone},
-		{"a block that was never a version", fmt.Sprintf("/v1/keys?snapshot=%d", invented), http.StatusNotFound},
-		{"a diff from a pruned version", fmt.Sprintf("/v1/keys/diff?since=%d", dropped.BlockNumber), http.StatusGone},
-		{"a diff from a block that was never a version", fmt.Sprintf("/v1/keys/diff?since=%d", invented), http.StatusNotFound},
+		{"a pruned version by block", fmt.Sprintf("/ext/v1/keys?snapshot=%d", dropped.BlockNumber), http.StatusGone},
+		{"a block that was never a version", fmt.Sprintf("/ext/v1/keys?snapshot=%d", invented), http.StatusNotFound},
+		{"a diff from a pruned version", fmt.Sprintf("/ext/v1/keys/diff?since=%d", dropped.BlockNumber), http.StatusGone},
+		{"a diff from a block that was never a version", fmt.Sprintf("/ext/v1/keys/diff?since=%d", invented), http.StatusNotFound},
 		// The version that survived retention still serves, which is what makes the two
 		// answers above statements about those pins rather than about the store.
-		{"the version that was kept", fmt.Sprintf("/v1/keys?snapshot=%d", kept.BlockNumber), http.StatusOK},
+		{"the version that was kept", fmt.Sprintf("/ext/v1/keys?snapshot=%d", kept.BlockNumber), http.StatusOK},
 	} {
 		resp := srv.Get(t, c.path)
 		body := readBody(t, resp)

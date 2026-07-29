@@ -18,7 +18,7 @@ POC ?= http://127.0.0.1:$(PORT)
 TARGET ?= $(POC)/v1/keys
 PID ?=
 
-.PHONY: build run run-static diff bench test test-e2e test-fork vet clean
+.PHONY: build run run-static diff diff-errors bench test test-e2e test-fork vet clean
 
 build:
 	go build -o bin/keys-api ./cmd/keys-api
@@ -40,6 +40,11 @@ run-static: build
 # being at different blocks, which they always are when both follow a chain.
 diff: build
 	./bin/diff -a $(CANONICAL) -b $(POC) -live
+
+# The other half of parity: what the two do with requests neither can serve. Needs both
+# services up and synced on the same chain; it compares status codes, not message text.
+diff-errors: build
+	./bin/diff -errors -a $(CANONICAL) -b $(POC)
 
 bench: build
 	./bin/bench -url $(TARGET) -requests 5 -concurrency 1 -warmup 1 $(if $(PID),-rss-pid $(PID),)

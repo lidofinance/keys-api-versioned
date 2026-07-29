@@ -76,7 +76,7 @@ Both exist because a version's rows do not move; both are why the canonical serv
 
 The version's identity is the block its data was read at, and it never moves. The block the version was last confirmed current at is separate, and that is what `meta.elBlockSnapshot` reports — the same split the canonical service has between its advancing meta and its data. Without that split a quiet cycle would renumber the version and a cursor would 410 mid-walk, which is exactly what an earlier iteration of this did.
 
-**Diffs.** `GET /v1/keys/diff?since=<version>[&to=…][&module=…]` returns what changed:
+**Diffs.** `GET /ext/v1/keys/diff?since=<version>[&to=…][&module=…]` returns what changed:
 
 ```json
 { "meta": { "from": {…}, "to": {…}, "removed": 1, "added": 2 },
@@ -85,7 +85,7 @@ The version's identity is the block its data was read at, and it never moves. Th
 
 Over block ranges this is two predicates rather than a comparison of two dumps: `added` is rows that became visible in the interval and are still visible at the far end, `removed` is rows that were visible at the near end and are not at the far end. A key whose value changed appears on both sides, because that is what the storage did — the old row was closed and a new one opened. Apply removals then additions by key identity and the result equals a fresh dump; that invariant is checked against real responses, including the case that matters most, a deposit flipping `used` on an existing key.
 
-`GET /v1/modules/diff?since=…` is the cheap poll to do first: a kilobyte naming the modules that moved. It is trustworthy here in a way the canonical per-module `lastChangedBlockHash` is not, because the writer moves that stamp from content rather than from the act of re-reading.
+`GET /ext/v1/modules/diff?since=…` is the cheap poll to do first: a kilobyte naming the modules that moved. It is trustworthy here in a way the canonical per-module `lastChangedBlockHash` is not, because the writer moves that stamp from content rather than from the act of re-reading.
 
 `since` must still be inside the retention window. If it is not, the answer is 410 rather than a diff computed against a version whose closed rows have been deleted — that diff would silently miss removals.
 
@@ -107,7 +107,7 @@ KEYS_API_URL=http://keys-api:3000
 Response framing is byte-identical to the canonical service, whitespace and stream separators included, so this is a URL change and nothing else. Two additions a consumer can ignore or use:
 
 - `?snapshot=<latest|safe|block|hash>` serves one request from a specific version. Several requests against one version get consistent answers, and a version that has gone away answers 409 (reorged, with the head to jump to) or 410 (pruned) instead of quietly different data. Without it every request gets `latest` — the newest published version — which is the behaviour a consumer already expects.
-- `?limit` and `?cursor` page a dump; `/v1/keys/diff?since=` and `/v1/modules/diff?since=` say what changed. Both are additive: a request without them is byte-identical to canonical.
+- `?limit` and `?cursor` page a dump; `/ext/v1/keys/diff?since=` and `/ext/v1/modules/diff?since=` say what changed. All of it lives under `/ext/v1` — see below.
 - `X-Snapshot-Stale: true` says the version being served is known not to reflect the chain while a rebuild is in flight. The body is unchanged, so a consumer that ignores the header behaves exactly as before.
 
 ## Running it
@@ -129,6 +129,8 @@ Environment variables are listed at the top of `cmd/keys-api/main.go`; the names
 The API document is at `/openapi.yaml`, rendered at `/docs`. It is hand-written and embedded, and a test checks it against the router in both directions — a route without a spec entry, or a spec path that is no longer routed, fails the build. Descriptions can still go stale; the surface cannot.
 
 ## Watching it work
+
+Every line carries `chain_id` and `schema`, the two attributes that answer "which chain was this?" from any line rather than from the startup one. That question is cheap to answer when you think to ask it and expensive when you do not: a node on the wrong chain produces a log that looks entirely healthy.
 
 `LOG_LEVEL=debug` is worth knowing about, because at info level a cold sync says nothing for tens of seconds at a time and a slow node is indistinguishable from a hang. Debug adds:
 

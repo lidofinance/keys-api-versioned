@@ -503,3 +503,75 @@ var _ Store = (*fakeStore)(nil)
 // would be a cycle. Keeping it here also documents that the loop only ever writes
 // two of the four statuses; the others are the store's business.
 const StatusPublished = "published"
+
+// TestCycleRefusesToRollBackAForeignModuleSet is the guard against the most destructive
+// thing this loop can do for the least interesting reason.
+//
+// Every stored hash disagreeing with the chain is what a reorg looks like — and it is
+// also what somebody's mainnet node pointed at a Hoodi database looks like. The
+// responses are opposite: a reorg wants the rollback, a different chain wants a refusal,
+// because those rows are not stale, they belong to another network. Without this the
+// store was superseded and cold-rebuilt with nothing logged above "reorg deeper than the
+// retained window".
+//
+// Schemas named after the chain make the common form of this impossible, but they cannot
+// help when the chain id is the same and the deployment is not — a devnet reusing chain
+// id 1, which happens here. The module set is what tells those apart, and it costs no
+// query: the version row's nonces are keyed by module address.
+func TestCycleRefusesToRollBackAForeignModuleSet(t *testing.T) {
+	src := newFakeSource(2)
+	store := newFakeStore()
+	s := NewSyncer(src, store, SyncConfig{}, nil)
+
+	if result := s.Cycle(context.Background()); result.Err != nil {
+		t.Fatalf("cold start: %v", result.Err)
+	}
+	published := store.latest.BlockNumber
+
+	// A different deployment: same chain id, same heights, entirely different contracts.
+	for i := range src.modules {
+		src.modules[i].SetRawAddress(fmt.Sprintf("0x%040x", 900+i))
+	}
+	src.advance()
+	src.forkAt(published)
+
+	result := s.Cycle(context.Background())
+	if result.Err == nil {
+		t.Fatal("the cycle rolled back a store belonging to another deployment instead of refusing")
+	}
+	if store.supersededFrom != 0 {
+		t.Errorf("SupersedeFrom was called with %d; the rows must not be touched", store.supersededFrom)
+	}
+	if result.Rebuilt {
+		t.Error("the cycle rebuilt over another deployment's store")
+	}
+	for _, want := range []string{"different chain", "PROVIDERS_URLS"} {
+		if !strings.Contains(result.Err.Error(), want) {
+			t.Errorf("the error does not mention %q, so an operator cannot act on it: %v", want, result.Err)
+		}
+	}
+}
+
+// The control: the same fork with the module set unchanged still rolls back. Without it,
+// the guard above would pass on a loop that had simply stopped handling reorgs.
+func TestCycleStillRollsBackWhenTheModuleSetIsTheSame(t *testing.T) {
+	src := newFakeSource(2)
+	store := newFakeStore()
+	s := NewSyncer(src, store, SyncConfig{}, nil)
+
+	if result := s.Cycle(context.Background()); result.Err != nil {
+		t.Fatalf("cold start: %v", result.Err)
+	}
+	published := store.latest.BlockNumber
+
+	src.advance()
+	src.forkAt(published)
+
+	result := s.Cycle(context.Background())
+	if result.Err != nil {
+		t.Fatalf("cycle: %v", result.Err)
+	}
+	if store.supersededFrom != published {
+		t.Errorf("rolled back from %d, want %d", store.supersededFrom, published)
+	}
+}

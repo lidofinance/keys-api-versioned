@@ -42,8 +42,21 @@ func main() {
 		ignore    = flag.String("ignore", ".appVersion", "comma separated JSON paths expected to differ")
 		live      = flag.Bool("live", false, "the services follow a live chain: also ignore the meta block, "+
 			"which legitimately advances between two sequential fetches")
+		errors = flag.Bool("errors", false, "compare the error surface — status codes for requests "+
+			"neither service can serve — instead of successful responses. See errors.go for why "+
+			"this is a separate mode and what it deliberately does not compare")
+		errorModule = flag.String("error-module", "1", "a module id that exists on both services, "+
+			"for the error cases that need a real one")
 	)
 	flag.Parse()
+
+	if *errors {
+		client := &http.Client{Timeout: 2 * time.Minute}
+		if runErrorMatrix(client, *a, *b, *errorModule) {
+			os.Exit(1)
+		}
+		return
+	}
 
 	ignored := map[string]bool{}
 	for _, p := range strings.Split(*ignore, ",") {

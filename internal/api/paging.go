@@ -31,7 +31,15 @@ type pageRequest struct {
 }
 
 // parsePage reads `limit` and `cursor`.
+//
+// Both are extensions, so on the canonical surface they are not read at all and the
+// answer is the full dump — which is what the canonical service does with a parameter
+// it does not declare. The request carries the header from extsurface.go saying so.
 func parsePage(r *http.Request) (pageRequest, error) {
+	if !onExtSurface(r) {
+		return pageRequest{}, nil
+	}
+
 	q := r.URL.Query()
 	var p pageRequest
 

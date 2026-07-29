@@ -11,13 +11,14 @@
 // service are reused, so an existing deployment's variables mostly carry over:
 //
 //	PROVIDERS_URLS                    comma-separated execution endpoints
-//	CHAIN_ID                          reported in /v1/status; verified against the node
+//	CHAIN_ID                          reported in /v1/status; verified against the node,
+//	                                  and names the schema the store lives in
 //	DATABASE_URL                      Postgres DSN
 //	PORT                              listen port (default 3000)
 //	KEYS_API_MODE                     all (default) | server | ingest
 //	KEYS_API_SOURCE                   lido-core (default) | static
 //	KEYS_API_STATIC_FILE              registry JSON, for KEYS_API_SOURCE=static
-//	LIDO_LOCATOR                      locator address; defaults per chain id
+//	LIDO_LOCATOR                      Lido Locator address; required for lido-core
 //	UPDATE_KEYS_INTERVAL_MS           cycle interval (default 5000)
 //	MAX_BLOCKS_OVERLAP                full audit re-read when this far behind (default 1000)
 //	RETAIN_VERSIONS                   retention window in versions (default 20)
@@ -42,6 +43,12 @@
 // aggregation off for the process. PROVIDER_MULTICALL=false is the manual escape
 // hatch, and with it off the ingest behaves as it did before aggregation existed.
 //
+// Every line carries chain_id and the schema the store lives in, because an
+// investigation reads arbitrary lines rather than the startup one — and "which chain was
+// this?" is the question a misconfigured deployment makes expensive to answer. The
+// endpoint hosts are logged once at startup, without paths: a hosted provider's URL
+// carries its API key there.
+//
 // LOG_LEVEL=debug is worth knowing about: it adds one line per JSON-RPC request, a
 // staging heartbeat every five seconds during a long module read, the freshness
 // decision with the nonces it was made from, and the resolved pin plus row counts
@@ -55,6 +62,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"strconv"
@@ -75,15 +83,6 @@ import (
 // appVersion is reported in /v1/status. Consumers read it, so it stays a plain
 // semantic version rather than a build hash.
 const appVersion = "0.1.0-poc"
-
-// locatorByChain holds the Lido Locator per chain — the one address everything
-// else is resolved from. These are the two the canonical service carries; any other
-// chain, devnets included, sets LIDO_LOCATOR explicitly rather than getting a
-// guess.
-var locatorByChain = map[int64]string{
-	1:      "0xc1d0b3de6792bf6b4b37eccdcc24e45978cfd2eb", // mainnet
-	560048: "0xe2ef9536daaaebff5b1c130957ab3e80056b06d8", // hoodi
-}
 
 func main() {
 	log := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: logLevel()}))
@@ -110,14 +109,40 @@ func run(log *slog.Logger) error {
 
 	m := metrics.New("keys_api")
 
+	chainID := int64(envInt("CHAIN_ID", 1))
+
+	// The store lives in a schema named after the chain, so a database filled from one
+	// chain cannot be opened as another. Without it, that mistake is silent and
+	// destructive: the loop reads the stored version's height on the new chain, finds a
+	// different hash, calls it a reorg deeper than the whole window, and rebuilds from
+	// scratch. See chainSchema in internal/ingest for the full argument.
 	pgStore, err := ingest.NewPGStore(ctx, dsn, ingest.PGOptions{
 		MaxConns: int32(envInt("DATABASE_MAX_CONNS", 10)),
 		Source:   envOr("KEYS_API_SOURCE", "lido-core"),
+		ChainID:  chainID,
 	})
 	if err != nil {
 		return err
 	}
 	defer pgStore.Close()
+
+	// Which chain and which schema, on every line from here on.
+	//
+	// An investigation reads arbitrary lines — a cycle decision, an RPC failure, a reorg
+	// warning — and correlating each one back to a startup line is the step that gets
+	// skipped. Two attributes on the base logger cost nothing and make "which chain was
+	// this?" answerable from any line, which is the question that took the longest to
+	// answer the one time this went wrong: a mainnet node against a Hoodi store looks
+	// entirely healthy in the log.
+	schema := pgStore.Schema()
+	if schema == "" {
+		schema = "from-dsn"
+	}
+	log = log.With("chain_id", chainID, "schema", schema)
+
+	log.Info("keys-api starting",
+		"mode", mode, "source", envOr("KEYS_API_SOURCE", "lido-core"),
+		"app_version", appVersion, "providers", redactedProviders())
 
 	// The schema is applied by whoever writes. A read-only replica does not create
 	// tables — if they are missing, that is a deployment order problem and it should
@@ -128,8 +153,6 @@ func run(log *slog.Logger) error {
 		}
 		log.Info("schema applied")
 	}
-
-	chainID := int64(envInt("CHAIN_ID", 1))
 
 	var syncer *ingest.Syncer
 	if mode != "server" {
@@ -231,9 +254,15 @@ func buildSource(ctx context.Context, chainID int64, log *slog.Logger) (source.P
 			return nil, errors.New("PROVIDERS_URLS is required for KEYS_API_SOURCE=lido-core")
 		}
 
-		locator := envOr("LIDO_LOCATOR", locatorByChain[chainID])
+		// No per-chain defaults in the binary. An address compiled in means a redeploy
+		// to correct a wrong one, and a map of two chains quietly asserts that those are
+		// the only chains this service runs on — which is false: devnets are the case it
+		// is used on most. It comes from the environment, or the service refuses to start.
+		locator := envOr("LIDO_LOCATOR", "")
 		if locator == "" {
-			return nil, fmt.Errorf("no known locator for chain %d: set LIDO_LOCATOR", chainID)
+			return nil, fmt.Errorf("LIDO_LOCATOR is required for KEYS_API_SOURCE=lido-core "+
+				"(chain %d): the Lido Locator address is what everything else is resolved from, "+
+				"and the deployed-contracts page at docs.lido.fi is the reference", chainID)
 		}
 
 		client := eth.NewClient(urls, eth.Options{
@@ -339,6 +368,32 @@ func observeCycle(m *metrics.Metrics, r ingest.CycleResult) {
 		stale = 1
 	}
 	m.VersionStale.Set(stale)
+}
+
+// redactedProviders lists the endpoint hosts, without paths.
+//
+// Which node the service is talking to is the other half of "which chain" during an
+// investigation, and it is the half that catches a variable picked out of the wrong
+// place — a .env file, say. Hosts only, because a hosted provider's URL carries its API
+// key in the path and a log line is the wrong place for it. Same reduction the JSON-RPC
+// client already does for its own per-request lines.
+func redactedProviders() string {
+	var hosts []string
+	for _, raw := range strings.Split(envOr("PROVIDERS_URLS", ""), ",") {
+		raw = strings.TrimSpace(raw)
+		if raw == "" {
+			continue
+		}
+		host := raw
+		if parsed, err := url.Parse(raw); err == nil && parsed.Host != "" {
+			host = parsed.Host
+		}
+		hosts = append(hosts, host)
+	}
+	if len(hosts) == 0 {
+		return "none"
+	}
+	return strings.Join(hosts, ",")
 }
 
 func envOr(key, def string) string {

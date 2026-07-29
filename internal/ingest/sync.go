@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"sort"
+	"strings"
 	"time"
 
 	"github.com/lidofinance/keys-api-versioned/internal/model"
@@ -177,6 +179,16 @@ func (s *Syncer) Cycle(ctx context.Context) (result CycleResult) {
 		return result
 	}
 
+	// The cheap read: modules with their nonces. No keys.
+	//
+	// Read before the reorg check rather than after, because a rollback deletes rows and
+	// the module set is what says whether a rollback is the right thing to do at all.
+	modules, err := s.source.Modules(ctx, source.Ref{BlockHash: head.BlockHash, BlockNumber: head.BlockNumber})
+	if err != nil {
+		result.Err = fmt.Errorf("read modules: %w", err)
+		return result
+	}
+
 	// Is the version still on the chain? A hash mismatch at its own height means
 	// the branch it was built on is gone.
 	reorged, forkPoint, err := s.detectReorg(ctx, *latest)
@@ -185,6 +197,25 @@ func (s *Syncer) Cycle(ctx context.Context) (result CycleResult) {
 		return result
 	}
 	if reorged {
+		// Every hash in the store disagreeing with the chain is what a reorg looks like,
+		// and it is also what a *different chain* looks like — and the two want opposite
+		// responses. A reorg wants the rollback below; a different chain wants a refusal,
+		// because the rollback deletes rows that are not stale, they are someone else's.
+		//
+		// The module set tells them apart for nothing: a reorg cannot change which
+		// contracts exist, so a stored module set with no address in common with head's is
+		// not a fork of the same chain. `chain_<id>` schemas make the common form of this
+		// mistake impossible, but a devnet reusing chain id 1 — which happens here — lands
+		// in the same schema as mainnet with entirely different addresses, and this is what
+		// catches that.
+		if foreign, stored, current := foreignModuleSet(latest.ModuleNonces, modules); foreign {
+			result.Err = fmt.Errorf("refusing to roll back: the store holds modules %v and the "+
+				"chain reports %v, which share nothing — this is a different chain or deployment, "+
+				"not a reorg. Check PROVIDERS_URLS and CHAIN_ID; the data is untouched",
+				stored, current)
+			return result
+		}
+
 		rolled, err := s.store.SupersedeFrom(ctx, forkPoint)
 		if err != nil {
 			result.Err = err
@@ -221,13 +252,6 @@ func (s *Syncer) Cycle(ctx context.Context) (result CycleResult) {
 			return result
 		}
 		latest = survivor
-	}
-
-	// The cheap read: modules with their nonces. No keys.
-	modules, err := s.source.Modules(ctx, source.Ref{BlockHash: head.BlockHash, BlockNumber: head.BlockNumber})
-	if err != nil {
-		result.Err = fmt.Errorf("read modules: %w", err)
-		return result
 	}
 
 	state := HeadState{
@@ -486,6 +510,41 @@ func (s *Syncer) detectReorg(ctx context.Context, latest StoredVersion) (bool, i
 	}
 	s.log.Warn("reorg deeper than the retained window", "oldest_version", oldest)
 	return true, oldest, nil
+}
+
+// foreignModuleSet reports whether a stored module set and the chain's current one have
+// no address in common, which no reorg can produce.
+//
+// Both sides have to be non-empty for the answer to mean anything: an empty stored set is
+// a version written before this mattered, not evidence of a different chain, and refusing
+// on it would strand a store that is merely old.
+//
+// The addresses come from the version row's module_nonces map, which is keyed by them, so
+// this costs no query.
+func foreignModuleSet(stored map[string]int64, current []model.StakingModule) (bool, []string, []string) {
+	if len(stored) == 0 || len(current) == 0 {
+		return false, nil, nil
+	}
+
+	live := make(map[string]bool, len(current))
+	currentList := make([]string, 0, len(current))
+	for _, m := range current {
+		address := strings.ToLower(m.RawAddress())
+		live[address] = true
+		currentList = append(currentList, address)
+	}
+
+	storedList := make([]string, 0, len(stored))
+	for address := range stored {
+		storedList = append(storedList, address)
+		if live[strings.ToLower(address)] {
+			return false, nil, nil
+		}
+	}
+
+	sort.Strings(storedList)
+	sort.Strings(currentList)
+	return true, storedList, currentList
 }
 
 // operatorEvents asks the source whether operator metadata moved in the range.

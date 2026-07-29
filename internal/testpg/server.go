@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -98,6 +99,30 @@ func (s *Server) Get(tb testing.TB, path string) *http.Response {
 	resp, err := s.Client().Get(s.URL + path)
 	if err != nil {
 		tb.Fatalf("GET %s: %v", path, err)
+	}
+	return resp
+}
+
+// Do performs a request with any method and an optional JSON body, for the error-surface
+// cases that are about a method or a malformed payload rather than about data.
+func (s *Server) Do(tb testing.TB, method, path, body string) *http.Response {
+	tb.Helper()
+
+	var reader io.Reader
+	if body != "" {
+		reader = strings.NewReader(body)
+	}
+	req, err := http.NewRequest(method, s.URL+path, reader)
+	if err != nil {
+		tb.Fatalf("%s %s: %v", method, path, err)
+	}
+	if body != "" {
+		req.Header.Set("Content-Type", "application/json")
+	}
+
+	resp, err := s.Client().Do(req)
+	if err != nil {
+		tb.Fatalf("%s %s: %v", method, path, err)
 	}
 	return resp
 }

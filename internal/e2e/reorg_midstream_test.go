@@ -104,7 +104,7 @@ func TestAPinnedReadOfASupersededVersionAnswers409(t *testing.T) {
 
 	srv := testpg.NewServer(t, db.Reader(t, "latest", 3))
 
-	resp := srv.Get(t, "/v1/keys?snapshot="+testreg.HashAt(second.BlockNumber))
+	resp := srv.Get(t, "/ext/v1/keys?snapshot="+testreg.HashAt(second.BlockNumber))
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusConflict {
 		t.Fatalf("pinned read of a superseded version: status %d, want 409", resp.StatusCode)

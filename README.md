@@ -11,10 +11,13 @@ How it is put together — the source seam, the schema, one cycle, paging and di
 Against a chain: both services, one Postgres, two databases.
 
 ```bash
-PROVIDERS_URLS=http://node-1,http://node-2 docker compose up -d --build
+cp .env.example .env   # then set PROVIDERS_URLS, CHAIN_ID and LIDO_LOCATOR
+docker compose up -d --build
 docker compose run --rm tools diff -a http://canonical:3000 -b http://keys-api:3000 -live
 docker compose run --rm tools bench -url http://keys-api:3000/v1/keys
 ```
+
+`LIDO_LOCATOR` is required and has no per-chain default in the binary. An address compiled in needs a rebuild and a redeploy to correct, and a two-entry map of chains reads as a claim that those are the only chains this runs on — which is false, since devnets are what it is pointed at most often. The well-known values for mainnet and Hoodi are in `.env.example`.
 
 With no chain at all — up in a second, for a demo or for pointing a consumer at something:
 
@@ -30,11 +33,9 @@ Generate load from inside the compose network. Through a published port on Docke
 
 | Endpoint | Notes |
 |---|---|
-| `GET /v1/keys` | full dump, streamed; `?limit`/`?cursor` pages it |
+| `GET /v1/keys` | full dump, streamed |
 | `GET /v1/keys/{pubkey}`, `POST /v1/keys/find` | pubkey lookups |
-| `GET /v1/keys/diff?since=` | what changed between two versions |
 | `GET /v1/modules`, `GET /v1/modules/{id}` | module list and one module |
-| `GET /v1/modules/diff?since=` | which modules changed — the cheap poll |
 | `GET /v1/modules/keys` | grouped by module, streamed |
 | `GET /v1/modules/{id}/keys`, `POST …/keys/find` | per-module dump and lookup |
 | `GET /v1/operators` | grouped by module; what EVM reads for operator names |
@@ -45,11 +46,45 @@ Generate load from inside the compose network. Through a published port on Docke
 | `GET /docs`, `GET /openapi.yaml` | the API document, and a page that renders it |
 | `/health`, `/health/ready`, `/metrics` | liveness, readiness (503 until something is published), Prometheus |
 
-Two additions any consumer can ignore: `?snapshot=<latest|safe|block|hash>` reads a specific version — the default is `latest`, which is what a consumer already expects — and `X-Snapshot-Stale: true` says the served version is known not to reflect the chain while a rebuild is in flight. Bodies are unchanged either way.
+## Two surfaces
+
+**`/v1` and `/v2` are the canonical contract and nothing else.** Same paths, same bodies byte for byte, same status codes, and the same treatment of parameters that contract does not declare — they are ignored. An existing consumer cannot tell it was repointed here; that is the whole requirement while consumers migrate.
+
+**`/ext/v1` is everything this service added.** Every canonical read is mirrored there, and only there are the extensions honoured:
+
+| | |
+|---|---|
+| `?snapshot=<latest\|safe\|block\|hash>` | serve one request from a specific version |
+| `?limit`, `?cursor` | page a dump; the cursor names its version |
+| `GET /ext/v1/keys/diff?since=` | what changed between two versions |
+| `GET /ext/v1/modules/diff?since=` | which modules changed — the cheap poll |
+| `GET /ext/v1/modules/{id}/keys/diff?since=` | one module's changes |
+
+The canonical endpoint that lives on `/v2` is mirrored as `/ext/v1/modules/operators/keys`: this surface has a version axis of its own, and the canonical split between `/v1` and `/v2` — an accident of how that service moved one endpoint — does not leak into it.
+
+A request that sends `snapshot`, `limit` or `cursor` to `/v1` gets the canonical answer plus `X-Ignored-Parameters` naming what was dropped. A header rather than a `400`, because a `400` would itself be a difference from canonical — checked, not assumed: its `ValidationPipe` is `{ transform: true }` with no `whitelist`, so NestJS ignores an undeclared parameter. A header rather than silence, because `?limit=100` ignored on `/v1/keys` streams the entire 216 MiB dump and nothing in the body would say so.
+
+`X-Snapshot-Stale: true` is on both surfaces: it says the served version is known not to reflect the chain while a rebuild is in flight, and a header cannot break a consumer parsing the body.
+
+**Why not `/v3`.** The canonical service versions per endpoint through NestJS URI versioning — `app.enableVersioning({ type: VersioningType.URI })`, then `@Version('2')` on the one controller that moved. `/v3` is one decorator away in a repository this team does not own, on a protocol-critical service. A separate namespace leaves it free to reach `/v3` and beyond without ever colliding, and it tells a consumer the truth: moving to `/ext/v1` is a deliberate change of contract, not a version bump.
+
+The boundary is held by tests rather than by intent: `internal/e2e/surface_test.go` checks that `/v1` ignores each extension and that `/ext/v1` honours it, and `internal/api/openapi_test.go` checks that every canonical read has exactly one mirror at the right path — so a canonical route added without one fails the build, which is the mistake that would actually happen.
 
 The document at `/openapi.yaml` is hand-written and embedded rather than generated: half of what a consumer needs to know is contract rather than struct shape — that a request without `snapshot` gets `latest`, that a cursor pins its version, that a diff's two sides reconstruct a dump when applied in order, that `409` carries the head to jump to. A test holds it to the router in both directions, so a route added without a spec entry fails the build.
 
 Not implemented: the validator exit endpoints (they need consensus layer ingest), throttling, CORS, Sentry.
+
+## One schema per chain
+
+The store lives in a schema named after the chain id — `chain_1`, `chain_560048` — and that is a safety property, not tidiness.
+
+A database filled from one chain and opened with a node on another used to be silent and destructive: the loop probes the stored version's height on the new chain, finds a different hash, correctly concludes the branch is gone, finds nothing that survived, and rebuilds from scratch. Nothing above `reorg deeper than the retained window` is logged. The data is gone and the service looks healthy. Third parties run this service, and confusing `CHAIN_ID` is exactly the mistake they make.
+
+Naming the schema after the chain makes that impossible instead of detectable. A mainnet run does not find the Hoodi rows, so it cannot roll them back; it cold-syncs into an empty schema and the Hoodi data sits untouched. Fix the variable, restart, and the rows are back. A DSN that already carries a `search_path` wins — that is how the test harness gives each test its own schema, and it is the escape hatch for a deployment that wants the layout it already has.
+
+What naming cannot catch is a devnet reusing chain id 1, which lands in the same schema as mainnet with entirely different contracts. For that, the loop refuses to roll back when the stored module set and the chain's share no address — something no reorg can produce, since a fork cannot change which contracts exist.
+
+An existing deployment resyncs once when it picks this up: its rows are in `public` and the service now looks in `chain_<id>`. Nothing is deleted.
 
 ## Parity
 
@@ -63,6 +98,25 @@ OK  /v1/modules                   OK  /v1/keys?operatorIndex=1
 OK  /v1/modules/1                 OK  /v1/modules/1/keys        199.7 MiB vs 199.7 MiB
 OK  /v1/keys  216.7 MiB           OK  /v1/modules/keys          216.7 MiB vs 216.7 MiB
 ```
+
+### The error surface
+
+`diff -errors` compares what the two services do with requests neither can serve: 21 cases over module and operator references, pubkeys, query parameters, request bodies, methods and unrouted paths. It exists because parity had only ever been checked on successful responses, which is parity of half the contract — and the first run proved the point.
+
+Against canonical 4.0.1, both following Hoodi: **17 of 21 agreed, now 21 of 21.** The four differences and what each would have done to a consumer:
+
+| Case | Canonical | Ours, before | Consequence |
+|---|---|---|---|
+| `GET /v1/keys/not-a-pubkey` | 400 | 404 | a consumer that retries a 404 and gives up on a 400 retried forever |
+| `POST /v1/keys/find` `{"pubkeys":[]}` | 400 | 200, no keys | "your request is wrong" read as "none of your keys exist" |
+| `POST /v1/keys/find` with the wrong field name | 400 | 200, no keys | a typo in the field name looked like an empty result |
+| `POST /v1/keys` | 404 `Cannot POST /v1/keys` | 405 | Go is right and Fastify is not, but on their surface theirs wins |
+
+And one systematic difference the run surfaced that no single case is about: **every error body was missing `error`.** The canonical service sends `{message, error, statusCode}`; the field was declared in our struct and never set, so a consumer logging or matching on it saw a difference on every failure rather than on an edge case.
+
+Also confirmed, because the whole `/ext/v1` split rests on it: the canonical service really does ignore a query parameter it does not declare — `?limit=3`, `?snapshot=12345` and `?nonsense=1` all answer 200 there, which is why `/v1` ignores ours instead of answering 400.
+
+The expectations are pinned hermetically in `internal/e2e/surface_test.go`, so they hold without a canonical service running; the live run is what discovers a new one.
 
 Byte-identical covers the framing whitespace and the JSON property order of the canonical DTOs. Where the diff reports "equal ignoring key order", the row order out of Postgres differed between the two queries — neither service sorts, so consumers must not depend on order.
 

@@ -118,14 +118,34 @@ func routeLabel(r *http.Request) string {
 
 // streamFailed marks the response as truncated when a handler cannot recover.
 func streamFailed(w http.ResponseWriter, err error) {
-	if rec, ok := w.(*recorder); ok {
+	if rec := findRecorder(w); rec != nil {
 		rec.fail(err)
+	}
+}
+
+// findRecorder walks the wrapper chain to the recorder.
+//
+// Both helpers here used to type-assert for *recorder directly, which quietly required
+// them to be the outermost writer. Inserting one wrapper — the canonical method-mismatch
+// rewrite in extsurface.go — turned "abort the stream, this version left the chain" into
+// "write a 409 into the middle of a dump", because headerSent reported that nothing had
+// been sent yet. Unwrap is the convention http.ResponseController uses.
+func findRecorder(w http.ResponseWriter) *recorder {
+	for {
+		if rec, ok := w.(*recorder); ok {
+			return rec
+		}
+		unwrapper, ok := w.(interface{ Unwrap() http.ResponseWriter })
+		if !ok {
+			return nil
+		}
+		w = unwrapper.Unwrap()
 	}
 }
 
 // headerSent reports whether anything has already gone to the client, which
 // decides whether an error can still become a status code.
 func headerSent(w http.ResponseWriter) bool {
-	rec, ok := w.(*recorder)
-	return ok && rec.status != 0
+	rec := findRecorder(w)
+	return rec != nil && rec.status != 0
 }

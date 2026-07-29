@@ -29,7 +29,7 @@ func TestAPagedWalkStaysOnOneVersionAcrossPublishes(t *testing.T) {
 	srv := testpg.NewServer(t, db.Reader(t, "latest", 3))
 
 	verifier := testreg.NewVerifier(spec)
-	path := "/v1/keys?limit=100"
+	path := "/ext/v1/keys?limit=100"
 	pages, snapshot := 0, int64(0)
 
 	for {
@@ -67,7 +67,7 @@ func TestAPagedWalkStaysOnOneVersionAcrossPublishes(t *testing.T) {
 		if body.Pagination.Cursor == "" {
 			break
 		}
-		path = "/v1/keys?limit=100&cursor=" + body.Pagination.Cursor
+		path = "/ext/v1/keys?limit=100&cursor=" + body.Pagination.Cursor
 	}
 
 	if err := verifier.Done(); err != nil {
@@ -94,7 +94,7 @@ func TestAPagedWalkWhoseVersionIsPrunedAnswers410(t *testing.T) {
 
 	srv := testpg.NewServer(t, db.Reader(t, "latest", 3))
 
-	first := srv.Get(t, "/v1/keys?limit=10")
+	first := srv.Get(t, "/ext/v1/keys?limit=10")
 	body, err := testreg.NewVerifier(spec).Partial().V1Keys(first.Body)
 	first.Body.Close()
 	if err != nil {
@@ -116,7 +116,7 @@ func TestAPagedWalkWhoseVersionIsPrunedAnswers410(t *testing.T) {
 		t.Fatalf("nothing was pruned, so the walk below is not resuming into a gone version")
 	}
 
-	resumed := srv.Get(t, "/v1/keys?limit=10&cursor="+body.Pagination.Cursor)
+	resumed := srv.Get(t, "/ext/v1/keys?limit=10&cursor="+body.Pagination.Cursor)
 	defer resumed.Body.Close()
 	if resumed.StatusCode != http.StatusGone {
 		t.Fatalf("resuming a walk into a pruned version: status %d, want 410", resumed.StatusCode)
@@ -138,7 +138,7 @@ func TestACursorNamingAnUnknownVersion(t *testing.T) {
 	// A cursor is `block.module.operator.index`; this one names a block far above
 	// anything published.
 	cursor := fmt.Sprintf("%d.1.0.0", db.Block(999))
-	resp := srv.Get(t, "/v1/keys?limit=10&cursor="+cursor)
+	resp := srv.Get(t, "/ext/v1/keys?limit=10&cursor="+cursor)
 	defer resp.Body.Close()
 
 	if resp.StatusCode == http.StatusOK {

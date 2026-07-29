@@ -7,8 +7,12 @@
 // Response framing is byte-identical to the canonical service, whitespace included,
 // so pointing a consumer here is a URL change.
 //
-// Still not implemented: the validator exit endpoints (they need consensus layer
-// ingest) and the OpenAPI document.
+// There are two surfaces, and the line between them is the whole compatibility story:
+// /v1 and /v2 are that contract and nothing else, /ext/v1 is everything this service
+// added. See extsurface.go for the rule and why the prefix is not /v3.
+//
+// Still not implemented: the validator exit endpoints, which need consensus layer
+// ingest.
 package api
 
 import (
@@ -18,6 +22,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"strings"
 
 	"github.com/lidofinance/keys-api-versioned/internal/store"
 )
@@ -58,22 +63,30 @@ type route struct {
 	// undocumented marks operational endpoints that are deliberately not in the
 	// API document: health probes and the metrics scrape.
 	undocumented bool
+	// mirror marks a route that exists only because its canonical twin does. The
+	// document states the mirroring rule once instead of repeating fourteen response
+	// bodies, and a test checks the rule — which is stronger than an enumeration,
+	// because it also catches a canonical route that was added without a mirror.
+	mirror bool
 }
 
 // routes lists everything the service serves.
+//
+// The canonical paths are listed once and mirrored under extPrefix, because the
+// extended surface serves the same data from the same handlers — what differs is which
+// query parameters are honoured. The diff endpoints exist only under the prefix: this
+// service invented them, and a path we invented has no business sitting inside a
+// contract someone else owns and may extend. See extsurface.go.
 func (s *Server) routes() []route {
-	return []route{
+	canonical := []route{
 		{pattern: "GET /v1/keys", handler: s.handleKeys},
-		{pattern: "GET /v1/keys/diff", handler: s.handleKeysDiff},
 		{pattern: "GET /v1/keys/{pubkey}", handler: s.handleKeyByPubkey},
 		{pattern: "POST /v1/keys/find", handler: s.handleKeysFind},
 
 		{pattern: "GET /v1/modules", handler: s.handleModules},
-		{pattern: "GET /v1/modules/diff", handler: s.handleModulesDiff},
 		{pattern: "GET /v1/modules/keys", handler: s.handleGroupedKeys},
 		{pattern: "GET /v1/modules/{module_id}", handler: s.handleModule},
 		{pattern: "GET /v1/modules/{module_id}/keys", handler: s.handleModuleKeys},
-		{pattern: "GET /v1/modules/{module_id}/keys/diff", handler: s.handleKeysDiff},
 		{pattern: "POST /v1/modules/{module_id}/keys/find", handler: s.handleModuleKeysFind},
 
 		// Operators, and the two combined streams. These are what the consumers read:
@@ -86,20 +99,36 @@ func (s *Server) routes() []route {
 		{pattern: "GET /v2/modules/operators/keys", handler: s.handleModulesOperatorsKeysStream},
 
 		{pattern: "GET /v1/status", handler: s.handleStatus},
+	}
 
+	out := make([]route, 0, 2*len(canonical)+8)
+	out = append(out, canonical...)
+	for _, r := range canonical {
+		method, path, _ := strings.Cut(r.pattern, " ")
+		out = append(out, route{pattern: method + " " + mirrorPath(path), handler: r.handler, mirror: true})
+	}
+
+	// Ours, and only ours.
+	out = append(out,
+		route{pattern: "GET " + extPrefix + "/keys/diff", handler: s.handleKeysDiff},
+		route{pattern: "GET " + extPrefix + "/modules/diff", handler: s.handleModulesDiff},
+		route{pattern: "GET " + extPrefix + "/modules/{module_id}/keys/diff", handler: s.handleKeysDiff},
+	)
+
+	return append(out,
 		// The API document, and a page that renders it.
-		{pattern: "GET /openapi.yaml", handler: handleOpenAPISpec},
-		{pattern: "GET /docs", handler: handleDocs},
+		route{pattern: "GET /openapi.yaml", handler: handleOpenAPISpec},
+		route{pattern: "GET /docs", handler: handleDocs},
 
 		// Liveness answers as long as the process is up. Readiness answers only once a
 		// version is published, so a pod still doing its first sync is not sent traffic
 		// that would get a 425.
-		{pattern: "GET /health", undocumented: true, handler: func(w http.ResponseWriter, _ *http.Request) {
+		route{pattern: "GET /health", undocumented: true, handler: func(w http.ResponseWriter, _ *http.Request) {
 			w.WriteHeader(http.StatusOK)
 			w.Write([]byte("OK"))
 		}},
-		{pattern: "GET /health/ready", undocumented: true, handler: s.handleReady},
-	}
+		route{pattern: "GET /health/ready", undocumented: true, handler: s.handleReady},
+	)
 }
 
 // Handler returns the router.
@@ -107,14 +136,20 @@ func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 
 	for _, r := range s.routes() {
-		mux.HandleFunc(r.pattern, r.handler)
+		handler := r.handler
+		// One place, before any handler can write: a canonical-surface request that sent
+		// extension parameters is told they were ignored.
+		mux.HandleFunc(r.pattern, func(w http.ResponseWriter, req *http.Request) {
+			noteIgnoredExtParams(w, req)
+			handler(w, req)
+		})
 	}
 
 	if s.cfg.MetricsHandler != nil {
 		mux.Handle("GET /metrics", s.cfg.MetricsHandler)
 	}
 
-	return withLogging(mux, s.cfg.Log, s.cfg.Observe)
+	return withLogging(withCanonicalMethodMismatch(mux), s.cfg.Log, s.cfg.Observe)
 }
 
 // snapshot resolves the version one request is served from: the pin in
@@ -124,7 +159,14 @@ func (s *Server) Handler() http.Handler {
 // version — a dump and then a follow-up query — and get a definite answer if that
 // version has gone away, instead of a quietly different one.
 func (s *Server) snapshot(ctx context.Context, r *http.Request, fn func(store.Snapshot) error) error {
-	return s.snapshotAt(ctx, r, r.URL.Query().Get("snapshot"), fn)
+	// An explicit pin is one of the extensions, so it is honoured only on the extended
+	// surface. On the canonical one the parameter is ignored, the way the canonical
+	// service ignores a parameter it does not declare — see extsurface.go.
+	pin := ""
+	if onExtSurface(r) {
+		pin = r.URL.Query().Get("snapshot")
+	}
+	return s.snapshotAt(ctx, r, pin, fn)
 }
 
 // snapshotAt is snapshot with the pin decided by the caller, which paging needs: a
@@ -187,16 +229,25 @@ func writeJSON(w http.ResponseWriter, v any) error {
 }
 
 // httpError mirrors the canonical error body shape.
+// httpError is the canonical error body, and the field order is its order.
+//
+// `error` was declared here and never set, so every error response was missing a field
+// the canonical service always sends — found by comparing the error surface against a
+// running canonical service rather than by reading code, which is how the two defects
+// before it were found and is not a method that scales. A consumer that logs or matches
+// on `error` saw a difference on every failure, not on an edge case.
 type httpError struct {
-	StatusCode int    `json:"statusCode"`
 	Message    any    `json:"message"`
 	Error      string `json:"error,omitempty"`
+	StatusCode int    `json:"statusCode"`
 }
 
 func writeError(w http.ResponseWriter, status int, message any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-	json.NewEncoder(w).Encode(httpError{StatusCode: status, Message: message})
+	json.NewEncoder(w).Encode(httpError{
+		Message: message, Error: http.StatusText(status), StatusCode: status,
+	})
 }
 
 // tooEarly is returned while the database has no execution layer meta yet,

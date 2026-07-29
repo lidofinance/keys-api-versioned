@@ -28,12 +28,13 @@ import (
 )
 
 // Mainnet Lido Locator: the address the canonical service carries for chain 1.
-const mainnetLocator = "0xc1d0b3de6792bf6b4b37eccdcc24e45978cfd2eb"
+// No compiled-in address: see the note in cmd/keys-api. The flag or the environment
+// supplies it, or the probe says which one it wanted.
 
 func main() {
 	var (
 		rpc         = flag.String("rpc", envOr("PROVIDERS_URLS", ""), "comma separated execution endpoints")
-		locator     = flag.String("locator", envOr("LIDO_LOCATOR", mainnetLocator), "Lido Locator address")
+		locator     = flag.String("locator", envOr("LIDO_LOCATOR", ""), "Lido Locator address (required)")
 		modulesOnly = flag.Bool("modules-only", false, "stop after reading modules and nonces")
 		moduleID    = flag.Int("module", 0, "read one module id only; 0 means every module")
 		withOps     = flag.Bool("operators", false, "also print operator counts per module")
@@ -59,6 +60,11 @@ func main() {
 
 	if *rpc == "" {
 		log.Error("no execution endpoint: pass -rpc or set PROVIDERS_URLS")
+		os.Exit(2)
+	}
+	if *locator == "" {
+		log.Error("no locator: pass -locator or set LIDO_LOCATOR",
+			"reference", "the deployed-contracts page at docs.lido.fi")
 		os.Exit(2)
 	}
 

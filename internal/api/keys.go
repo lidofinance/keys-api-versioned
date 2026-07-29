@@ -270,22 +270,78 @@ type meta struct {
 	ELBlockSnapshot *model.ELBlockSnapshot `json:"elBlockSnapshot"`
 }
 
+// Pubkey validation, and why it is here rather than left to the lookup.
+//
+// The canonical service validates the shape before it looks anything up, so a malformed
+// pubkey is a 400 and a well-formed unknown one is a 404. Without this, both were 404
+// here: "there are no keys with not-a-pubkey in db" for a string that could never be a
+// pubkey. A consumer that retries a 404 and gives up on a 400 — the sensible reading —
+// would retry forever. Found by comparing the error surface against a running canonical
+// service.
+//
+// The message is canonical's own, because the whole point is to be indistinguishable.
+const badPubkeyMessage = "Each pubkey must be a valid 0x-prefixed 48-byte hex string"
+
+// validPubkey reports whether a string is a 0x-prefixed 48-byte hex value.
+func validPubkey(s string) bool {
+	if !strings.HasPrefix(s, "0x") || len(s) != 2+2*48 {
+		return false
+	}
+	for _, c := range s[2:] {
+		isHex := (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')
+		if !isHex {
+			return false
+		}
+	}
+	return true
+}
+
 // handleKeyByPubkey returns every key matching one pubkey across modules.
 func (s *Server) handleKeyByPubkey(w http.ResponseWriter, r *http.Request) {
 	pubkey := strings.ToLower(r.PathValue("pubkey"))
+	if !validPubkey(pubkey) {
+		writeError(w, http.StatusBadRequest, []string{badPubkeyMessage})
+		return
+	}
 	s.findKeys(w, r, []string{pubkey}, true)
 }
 
 // handleKeysFind returns keys matching a pubkey list across modules.
+//
+// The body is validated the way the canonical service validates it, down to reporting
+// every failed constraint at once — that is what class-validator does there, and a
+// consumer reading `message[0]` should see the same thing. Before this, an empty list and
+// a body with the wrong field name both answered 200 with no keys, which reads as "none
+// of your pubkeys exist" rather than "your request is wrong".
 func (s *Server) handleKeysFind(w http.ResponseWriter, r *http.Request) {
 	var body struct {
-		Pubkeys []string `json:"pubkeys"`
+		Pubkeys *[]string `json:"pubkeys"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		writeError(w, http.StatusBadRequest, []string{"pubkeys must be an array"})
 		return
 	}
-	s.findKeys(w, r, body.Pubkeys, false)
+	if body.Pubkeys == nil {
+		// Missing or the wrong field name: every constraint on the field failed, and
+		// canonical reports all three.
+		writeError(w, http.StatusBadRequest, []string{
+			badPubkeyMessage,
+			"pubkeys must contain at least 1 elements",
+			"pubkeys must be an array",
+		})
+		return
+	}
+	if len(*body.Pubkeys) == 0 {
+		writeError(w, http.StatusBadRequest, []string{"pubkeys must contain at least 1 elements"})
+		return
+	}
+	for _, pubkey := range *body.Pubkeys {
+		if !validPubkey(strings.ToLower(pubkey)) {
+			writeError(w, http.StatusBadRequest, []string{badPubkeyMessage})
+			return
+		}
+	}
+	s.findKeys(w, r, *body.Pubkeys, false)
 }
 
 func (s *Server) findKeys(w http.ResponseWriter, r *http.Request, pubkeys []string, notFoundWhenEmpty bool) {

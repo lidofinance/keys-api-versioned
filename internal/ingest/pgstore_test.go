@@ -3,6 +3,8 @@ package ingest_test
 import (
 	"context"
 	"fmt"
+	"github.com/jackc/pgx/v5/pgxpool"
+	"os"
 	"testing"
 
 	"github.com/lidofinance/keys-api-versioned/internal/ingest"
@@ -256,4 +258,99 @@ func readUsed(ctx context.Context, t *testing.T, s *store.App, m model.StakingMo
 		t.Fatalf("key %d of module %d is missing at this pin", index, m.ID)
 	}
 	return used
+}
+
+// TestTwoChainsCannotShareOneStore is the fix for a silent, destructive mistake: a
+// database filled from one chain opened with a node on another.
+//
+// Before the schema was named after the chain, that looked exactly like a reorg deeper
+// than the retained window — the loop rolled the store back and cold-rebuilt it, with
+// nothing logged above a warning. The data was gone and the service looked healthy.
+//
+// The property under test is that the two stores are simply different places, so the
+// mistake cannot destroy anything: fix the variable and the rows are still there. That is
+// a stronger guarantee than detecting the mistake, which is why it is done this way.
+func TestTwoChainsCannotShareOneStore(t *testing.T) {
+	dsn := os.Getenv("TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("set TEST_DATABASE_URL to run tests that need Postgres")
+	}
+	ctx := context.Background()
+
+	// Two chain ids no other test uses, so this can drop its own schemas.
+	const (
+		hoodiLike   = 990001
+		mainnetLike = 990002
+	)
+
+	open := func(chainID int64) *ingest.PGStore {
+		t.Helper()
+		s, err := ingest.NewPGStore(ctx, dsn, ingest.PGOptions{ChainID: chainID, Source: "test"})
+		if err != nil {
+			t.Fatalf("open the store for chain %d: %v", chainID, err)
+		}
+		if err := s.Migrate(ctx); err != nil {
+			t.Fatalf("migrate chain %d: %v", chainID, err)
+		}
+		return s
+	}
+
+	first := open(hoodiLike)
+	defer first.Close()
+	// Not fatal: the assertion that matters is further down, and a run that stops here
+	// would report the symptom rather than the consequence.
+	if got, want := first.Schema(), "chain_990001"; got != want {
+		t.Errorf("schema is %q, want %q", got, want)
+	}
+
+	// A version in the first store, at a height the second one would also use.
+	spec := testreg.Spec{Modules: 1, OperatorsPerModule: 1, KeysPerOperator: 2}
+	at := testreg.At(4_000_001)
+	spec.Publish(ctx, t, first, at)
+
+	second := open(mainnetLike)
+	defer second.Close()
+
+	// The second store does not see the first one's version, so it has nothing to roll
+	// back and nothing to delete. This is the whole point.
+	latest, err := second.Latest(ctx)
+	if err != nil {
+		t.Fatalf("latest in the second store: %v", err)
+	}
+	if latest != nil {
+		t.Fatalf("the store for chain %d sees a version from chain %d at block %d: "+
+			"one chain's data is reachable as another's", mainnetLike, hoodiLike, latest.BlockNumber)
+	}
+
+	// And the first store still holds it, untouched — the guarantee an operator needs
+	// when they fix CHAIN_ID and restart.
+	held, err := first.Latest(ctx)
+	if err != nil {
+		t.Fatalf("latest in the first store: %v", err)
+	}
+	if held == nil || held.BlockNumber != at.BlockNumber {
+		t.Fatalf("the first store no longer holds its version: %+v", held)
+	}
+
+	t.Cleanup(func() {
+		admin, err := pgxpool.New(context.Background(), dsn)
+		if err != nil {
+			return
+		}
+		defer admin.Close()
+		for _, schema := range []string{"chain_990001", "chain_990002"} {
+			_, _ = admin.Exec(context.Background(), `drop schema if exists `+schema+` cascade`)
+		}
+	})
+}
+
+// A DSN that already names a schema wins, which is what puts every other test in this
+// repo in a schema of its own — and doubles as the escape hatch for a deployment that
+// wants the layout it already has.
+func TestADSNWithASearchPathKeepsIt(t *testing.T) {
+	db := testpg.New(t)
+
+	if got := db.Writer.Schema(); got != "" {
+		t.Errorf("the store derived schema %q from a DSN that already named one", got)
+	}
 }

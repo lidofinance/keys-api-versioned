@@ -6,9 +6,35 @@ info:
   description: |
     The keys-api surface, served from published versions of the registry.
 
-    Responses are byte-identical to the canonical `lido-keys-api` on the endpoints
-    both implement, framing whitespace and JSON property order included, so a
-    consumer can be pointed here with a URL change.
+    ## Two surfaces
+
+    **`/v1` and `/v2` are the canonical `lido-keys-api` contract and nothing else.**
+    Same paths, same bodies byte for byte — framing whitespace and JSON property order
+    included — same status codes, and the same treatment of parameters that contract
+    does not declare: they are ignored. Pointing an existing consumer here is a URL
+    change and nothing more. Nothing this service invented appears on these paths.
+
+    **`/ext/v1` is everything this service added.** Every canonical read is mirrored
+    there — `/v1/keys` as `/ext/v1/keys`, and the one canonical endpoint that lives on
+    `/v2` as `/ext/v1/modules/operators/keys`, since this surface has a version axis of
+    its own — and only there are `snapshot`, `limit` and `cursor` honoured. The diff
+    endpoints exist only here, because paths this service invented have no business
+    sitting inside a contract someone else owns and may extend.
+
+    A request that sends one of those parameters to `/v1` gets the canonical answer
+    plus `X-Ignored-Parameters` naming what was dropped. It is a header rather than a
+    `400` because a `400` would itself be a difference from the canonical service; it
+    is a header rather than silence because `?limit=100` ignored on `/v1/keys` streams
+    the entire dump, and nothing in the body would say so.
+
+    `/ext/v1` is a separate namespace rather than `/v3` on purpose. The canonical
+    service versions per endpoint through NestJS URI versioning, so `/v3` is one
+    decorator away in a repository this team does not own, on a protocol-critical
+    service. A prefix leaves it free to reach `/v3` and beyond without colliding, and
+    it tells a consumer the truth: moving to `/ext/v1` is a deliberate change of
+    contract, not a version bump.
+
+    ## What the extended surface adds
 
     **Versions.** Every response is served from one published version and never from a
     table being written. Without `snapshot`, a request gets `latest` — the newest
@@ -20,13 +46,14 @@ info:
     `409` if a reorg took it off the chain, with the head to jump to, and `410` if it
     fell out of the retention window.
 
+    **Paging and diffs**, neither of which the canonical service can offer, because both
+    need rows that do not move: `limit`/`cursor` walks one version, and `since=` returns
+    only what changed between two.
+
     **Staleness.** `X-Snapshot-Stale: true` on a response means the version being
     served is known not to reflect the chain while a rebuild is in flight. The body is
-    unchanged, so a consumer that ignores the header behaves exactly as before.
-
-    **Two additions the canonical service cannot offer**, because they need rows that
-    do not move: `limit`/`cursor` paging, and `since=` diffs that return only what
-    changed between two versions.
+    unchanged, so a consumer that ignores the header behaves exactly as before — which
+    is why this one is on both surfaces.
 
 servers:
   # Relative, so "Try it out" hits whichever instance is serving this page rather
@@ -56,6 +83,47 @@ paths:
         - $ref: '#/components/parameters/Used'
         - $ref: '#/components/parameters/OperatorIndex'
         - $ref: '#/components/parameters/ModuleAddresses'
+      responses:
+        '200':
+          description: Keys, with pagination present only when asked for
+          headers:
+            X-Snapshot-Stale:
+              $ref: '#/components/headers/SnapshotStale'
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [meta, data]
+                properties:
+                  meta: { $ref: '#/components/schemas/ELMeta' }
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/Key' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '409': { $ref: '#/components/responses/Superseded' }
+        '410': { $ref: '#/components/responses/Pruned' }
+        '425': { $ref: '#/components/responses/TooEarly' }
+
+  /ext/v1/keys:
+    get:
+      tags: [keys]
+      summary: Every key of every module, with the extensions honoured
+      description: |
+        The mirror of `/v1/keys`. Same data, same framing; `snapshot`, `limit` and
+        `cursor` are read here and ignored there.
+
+        Every other canonical read is mirrored the same way and takes `snapshot` — this
+        entry is the one written out, rather than fourteen copies of the same response
+        body. The rule is checked by a test, so a canonical read added without a mirror
+        fails the build.
+
+        With `limit` or `cursor` the response carries one page and a `pagination` object
+        after the data array. The cursor names the version it came from, so a walk
+        started now stays on that version even as new ones are published.
+      parameters:
+        - $ref: '#/components/parameters/Used'
+        - $ref: '#/components/parameters/OperatorIndex'
+        - $ref: '#/components/parameters/ModuleAddresses'
         - $ref: '#/components/parameters/Snapshot'
         - $ref: '#/components/parameters/Limit'
         - $ref: '#/components/parameters/Cursor'
@@ -77,11 +145,12 @@ paths:
                     items: { $ref: '#/components/schemas/Key' }
                   pagination: { $ref: '#/components/schemas/Pagination' }
         '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/NotFound' }
         '409': { $ref: '#/components/responses/Superseded' }
         '410': { $ref: '#/components/responses/Pruned' }
         '425': { $ref: '#/components/responses/TooEarly' }
 
-  /v1/keys/diff:
+  /ext/v1/keys/diff:
     get:
       tags: [keys]
       summary: What changed between two versions
@@ -123,7 +192,6 @@ paths:
           in: path
           required: true
           schema: { type: string, pattern: '^0x[a-fA-F0-9]{96}$' }
-        - $ref: '#/components/parameters/Snapshot'
       responses:
         '200':
           description: Matching keys
@@ -138,7 +206,6 @@ paths:
       tags: [keys]
       summary: Keys matching a list of public keys, across modules
       parameters:
-        - $ref: '#/components/parameters/Snapshot'
       requestBody:
         required: true
         content:
@@ -172,7 +239,6 @@ paths:
         Note the envelope: `elBlockSnapshot` sits at the top level here, not under
         `meta`. That is the canonical shape and is kept as it is.
       parameters:
-        - $ref: '#/components/parameters/Snapshot'
       responses:
         '200':
           description: Modules
@@ -191,7 +257,7 @@ paths:
                   elBlockSnapshot: { $ref: '#/components/schemas/ELBlockSnapshot' }
         '425': { $ref: '#/components/responses/TooEarly' }
 
-  /v1/modules/diff:
+  /ext/v1/modules/diff:
     get:
       tags: [modules]
       summary: Which modules changed between two versions
@@ -234,7 +300,6 @@ paths:
       parameters:
         - $ref: '#/components/parameters/Used'
         - $ref: '#/components/parameters/OperatorIndex'
-        - $ref: '#/components/parameters/Snapshot'
       responses:
         '200':
           description: Keys per module
@@ -262,7 +327,6 @@ paths:
       summary: One module
       parameters:
         - $ref: '#/components/parameters/ModuleID'
-        - $ref: '#/components/parameters/Snapshot'
       responses:
         '200':
           description: The module
@@ -286,7 +350,6 @@ paths:
         - $ref: '#/components/parameters/ModuleID'
         - $ref: '#/components/parameters/Used'
         - $ref: '#/components/parameters/OperatorIndex'
-        - $ref: '#/components/parameters/Snapshot'
       responses:
         '200':
           description: Module and its keys
@@ -311,7 +374,7 @@ paths:
         '404': { $ref: '#/components/responses/NotFound' }
         '425': { $ref: '#/components/responses/TooEarly' }
 
-  /v1/modules/{module_id}/keys/diff:
+  /ext/v1/modules/{module_id}/keys/diff:
     get:
       tags: [keys]
       summary: What changed in one module between two versions
@@ -337,7 +400,6 @@ paths:
       summary: Keys of one module matching a list of public keys
       parameters:
         - $ref: '#/components/parameters/ModuleID'
-        - $ref: '#/components/parameters/Snapshot'
       requestBody:
         required: true
         content:
@@ -378,7 +440,6 @@ paths:
         What `ethereum-validators-monitoring` reads for the names it labels validators
         with, paired with `/v1/keys?used=true`.
       parameters:
-        - $ref: '#/components/parameters/Snapshot'
       responses:
         '200':
           description: Operators per module
@@ -410,7 +471,6 @@ paths:
       summary: Operators of one module
       parameters:
         - $ref: '#/components/parameters/ModuleID'
-        - $ref: '#/components/parameters/Snapshot'
       responses:
         '200':
           description: Module and its operators
@@ -441,7 +501,6 @@ paths:
           in: path
           required: true
           schema: { type: integer, minimum: 0 }
-        - $ref: '#/components/parameters/Snapshot'
       responses:
         '200':
           description: Module and the operator
@@ -470,7 +529,6 @@ paths:
         - $ref: '#/components/parameters/ModuleID'
         - $ref: '#/components/parameters/Used'
         - $ref: '#/components/parameters/OperatorIndex'
-        - $ref: '#/components/parameters/Snapshot'
       responses:
         '200':
           description: Module, operators and keys
@@ -504,7 +562,6 @@ paths:
         its four fields null. Per module, first a record carrying the module (and the
         meta, once), then one record per key, then one per operator.
       parameters:
-        - $ref: '#/components/parameters/Snapshot'
       responses:
         '200':
           description: A flat stream of records
