@@ -2,7 +2,9 @@ package ingest
 
 import (
 	"context"
+	"crypto/sha256"
 	_ "embed"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -124,13 +126,47 @@ func (s *PGStore) Close() { s.pool.Close() }
 // Pool exposes the connection pool so the app can share it with the read side.
 func (s *PGStore) Pool() *pgxpool.Pool { return s.pool }
 
-// Migrate creates the schema if it is ours to create, then applies the tables.
+// Migrate brings the schema to what this binary expects, dropping and rebuilding it when
+// the layout changed.
+//
+// There is no migration path and that is the design, not a gap. This store is a cache:
+// every row in it is derived from the chain, and refilling it costs 14 s on Hoodi and
+// 49 s on mainnet. Migrating something that cheap to rebuild buys nothing and costs the
+// thing migrations always cost — state about state, which can be wrong.
+//
+// It also produces correct data where an `alter` produces plausible data. Adding
+// finalized_block_number with `default 0` left every older version claiming finality
+// block 0, a value the writer never writes and which reads as "no finality known"; the
+// column was there and the rows were lying. A rebuild has no such halfway state, because
+// every row comes from the same writer that would have written it today.
+//
+// The trigger is a fingerprint of schema.sql with comments and blank lines stripped, so
+// editing a comment does not cost a resync and editing a column does. Nobody has to
+// remember to bump anything.
+//
+// What it costs, stated plainly: on a schema change the store is empty until the cold
+// sync finishes, and readers get 425 for that long. Only the writer does this — a
+// KEYS_API_MODE=server replica never migrates — so a rolling deploy hits it once.
 //
 // The schema.sql statements are unqualified, so they land wherever the search_path points
 // — which is the whole mechanism. It is verified rather than trusted: a search_path that
 // did not take effect would show up much later as an inexplicably empty store.
 func (s *PGStore) Migrate(ctx context.Context) error {
+	fingerprint := schemaFingerprint(schemaSQL)
+
 	if s.schema != "" {
+		stored, err := s.storedFingerprint(ctx)
+		if err != nil {
+			return err
+		}
+		if stored != fingerprint && s.schemaHasTables(ctx) {
+			// Dropping is scoped to the schema this chain owns, which is the other half
+			// of why chain_<id> exists: there is a blast radius and it is one chain's
+			// derived data.
+			if _, err := s.pool.Exec(ctx, `drop schema `+pgIdentifier(s.schema)+` cascade`); err != nil {
+				return fmt.Errorf("drop schema %s for rebuild: %w", s.schema, err)
+			}
+		}
 		if _, err := s.pool.Exec(ctx, `create schema if not exists `+pgIdentifier(s.schema)); err != nil {
 			return fmt.Errorf("create schema %s: %w", s.schema, err)
 		}
@@ -151,7 +187,77 @@ func (s *PGStore) Migrate(ctx context.Context) error {
 				"is not taking effect", landed, s.schema)
 		}
 	}
+
+	if _, err := s.pool.Exec(ctx, `
+		insert into schema_fingerprint (id, fingerprint) values (1, $1)
+		on conflict (id) do update set fingerprint = excluded.fingerprint, applied_at = now()`,
+		fingerprint); err != nil {
+		return fmt.Errorf("record the schema fingerprint: %w", err)
+	}
 	return nil
+}
+
+// storedFingerprint is the fingerprint the schema was last built from, or "" when the
+// schema does not record one.
+//
+// "" is not "leave it alone". A schema with tables and no fingerprint was built by a
+// binary whose layout is unknown — which is exactly the case where the layout cannot be
+// trusted — so it is rebuilt like any other mismatch. The gentler rule was written first
+// and was wrong: it preserved a store that had been through an `alter`, rows and all,
+// which is the halfway state this policy exists to rule out.
+func (s *PGStore) storedFingerprint(ctx context.Context) (string, error) {
+	// to_regclass resolves through the search_path and answers NULL for a name that is
+	// not there — including when the schema itself does not exist yet. So this is one
+	// safe question rather than a query that fails and an error string to match on.
+	var exists bool
+	if err := s.pool.QueryRow(ctx,
+		`select to_regclass('schema_fingerprint') is not null`).Scan(&exists); err != nil {
+		return "", fmt.Errorf("look for the schema fingerprint: %w", err)
+	}
+	if !exists {
+		return "", nil
+	}
+
+	var fingerprint string
+	err := s.pool.QueryRow(ctx, `select fingerprint from schema_fingerprint where id = 1`).Scan(&fingerprint)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("read the schema fingerprint: %w", err)
+	}
+	return fingerprint, nil
+}
+
+// schemaHasTables reports whether there is anything here to drop, so a first boot against
+// an empty schema does not log a rebuild it did not do.
+func (s *PGStore) schemaHasTables(ctx context.Context) bool {
+	var exists bool
+	if err := s.pool.QueryRow(ctx,
+		`select to_regclass('versions') is not null`).Scan(&exists); err != nil {
+		return false
+	}
+	return exists
+}
+
+// schemaFingerprint hashes the layout, ignoring comments and blank lines.
+//
+// Comments in this repo carry the reasoning and get edited often; a resync per typo would
+// make people stop writing them. What is hashed is the statements.
+func schemaFingerprint(sql string) string {
+	var meaningful []string
+	for _, line := range strings.Split(sql, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" || strings.HasPrefix(trimmed, "--") {
+			continue
+		}
+		if i := strings.Index(trimmed, "--"); i >= 0 {
+			trimmed = strings.TrimSpace(trimmed[:i])
+		}
+		meaningful = append(meaningful, trimmed)
+	}
+	sum := sha256.Sum256([]byte(strings.Join(meaningful, "\n")))
+	return hex.EncodeToString(sum[:])
 }
 
 // Schema is the schema this store writes to, empty when the DSN decided.
@@ -164,7 +270,7 @@ func pgIdentifier(name string) string {
 }
 
 const versionColumns = `id, block_number, block_hash, timestamp,
-	head_block_number, head_block_hash, head_timestamp,
+	head_block_number, head_block_hash, head_timestamp, finalized_block_number,
 	last_changed_block_hash, label, status, module_nonces`
 
 func scanVersion(row pgx.Row) (*StoredVersion, error) {
@@ -173,7 +279,7 @@ func scanVersion(row pgx.Row) (*StoredVersion, error) {
 		noncesJSON []byte
 	)
 	if err := row.Scan(&v.ID, &v.BlockNumber, &v.BlockHash, &v.Timestamp,
-		&v.HeadBlockNumber, &v.HeadBlockHash, &v.HeadTimestamp,
+		&v.HeadBlockNumber, &v.HeadBlockHash, &v.HeadTimestamp, &v.FinalizedBlockNumber,
 		&v.LastChangedBlockHash, &v.Label, &v.Status, &noncesJSON); err != nil {
 		return nil, err
 	}
@@ -254,16 +360,17 @@ func (s *PGStore) Begin(ctx context.Context, at model.ELBlockSnapshot) (Build, e
 // Extend advances a published version's observed head. Its identity — the block the
 // data was read at — and its lastChangedBlockHash are untouched: the first is what
 // pins and cursors name, and the second is what a consumer uses to skip a refetch.
-func (s *PGStore) Extend(ctx context.Context, v StoredVersion, at model.ELBlockSnapshot, nonces map[string]int64) error {
+func (s *PGStore) Extend(ctx context.Context, v StoredVersion, at model.ELBlockSnapshot, nonces map[string]int64, finalized int64) error {
 	payload, err := json.Marshal(nonces)
 	if err != nil {
 		return err
 	}
 	_, err = s.pool.Exec(ctx, `
 		update versions
-		   set head_block_number = $2, head_block_hash = $3, head_timestamp = $4, module_nonces = $5
+		   set head_block_number = $2, head_block_hash = $3, head_timestamp = $4, module_nonces = $5,
+		       finalized_block_number = greatest(finalized_block_number, $6)
 		 where id = $1`,
-		v.ID, at.BlockNumber, strings.ToLower(at.BlockHash), at.Timestamp, payload)
+		v.ID, at.BlockNumber, strings.ToLower(at.BlockHash), at.Timestamp, payload, finalized)
 	if err != nil {
 		return fmt.Errorf("extend version %d: %w", v.BlockNumber, err)
 	}
@@ -323,6 +430,27 @@ func (s *PGStore) SupersedeFrom(ctx context.Context, block int64) (Superseded, e
 	return out, nil
 }
 
+// finalizedVersionBlock is the block of the version `?snapshot=finalized` resolves to,
+// or 0 when the source reports no finality.
+//
+// Deliberately the same predicate the reader uses (internal/store/appstore.go). Two
+// copies of one rule is a thing to be uneasy about, and the alternative — the writer
+// importing the read package or the reader importing the writer — is worse; the test
+// that keeps them honest is the one asserting retention does not prune what `finalized`
+// answers.
+func (s *PGStore) finalizedVersionBlock(ctx context.Context) (int64, error) {
+	var block int64
+	err := s.pool.QueryRow(ctx, `
+		select coalesce(max(block_number), 0) from versions
+		 where status in ('published', 'stale')
+		   and block_number <= (select coalesce(max(finalized_block_number), 0) from versions)`).
+		Scan(&block)
+	if err != nil {
+		return 0, err
+	}
+	return block, nil
+}
+
 // Prune drops versions outside the retention window and the rows that were
 // already closed before the oldest kept version. Rows still current are never
 // touched, whatever the window.
@@ -360,6 +488,22 @@ func (s *PGStore) Prune(ctx context.Context, keep int) (Pruned, error) {
 			boundary = block
 			out.HeldAt = block
 		}
+	}
+
+	// The version `?snapshot=finalized` resolves to is held the same way, and it needs to be
+	// because retention counts *versions* while finality is measured in *time*. Finality
+	// is about two epochs, roughly thirteen minutes; twenty versions is however long
+	// twenty rebuilds take, which during active CSM deposits — one every minute or
+	// two — is the same order. So that version sits near the edge of the window by
+	// construction, and any rise in churn would start answering 410 to the one pin whose
+	// whole promise is that it stays put.
+	finalizedVersion, err := s.finalizedVersionBlock(ctx)
+	if err != nil {
+		return out, fmt.Errorf("prune held back, finalized version unreadable: %w", err)
+	}
+	if finalizedVersion > 0 && finalizedVersion < boundary {
+		boundary = finalizedVersion
+		out.HeldAt = finalizedVersion
 	}
 
 	// Only rows already closed before the boundary are dropped. A row that is still

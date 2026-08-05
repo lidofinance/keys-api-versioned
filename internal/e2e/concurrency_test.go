@@ -155,7 +155,7 @@ func TestASecondWriterAtTheSameBlockGetsErrVersionExists(t *testing.T) {
 	if err := first.Module(ctx, module, true); err != nil {
 		t.Fatalf("module row: %v", err)
 	}
-	if err := first.Publish(ctx, "latest"); err != nil {
+	if err := first.Publish(ctx, "latest", 0); err != nil {
 		t.Fatalf("publish: %v", err)
 	}
 }
@@ -181,10 +181,10 @@ func TestTwoWritersBuildingTheSameModuleAtDifferentBlocks(t *testing.T) {
 	earlyBuild := early.Fill(ctx, t, db.Writer, earlyAt, 1)
 	lateBuild := late.Fill(ctx, t, db.Writer, lateAt, 1)
 
-	if err := earlyBuild.Publish(ctx, "latest"); err != nil {
+	if err := earlyBuild.Publish(ctx, "latest", 0); err != nil {
 		t.Fatalf("publish the earlier version: %v", err)
 	}
-	if err := lateBuild.Publish(ctx, "latest"); err != nil {
+	if err := lateBuild.Publish(ctx, "latest", 0); err != nil {
 		t.Fatalf("publish the later version: %v", err)
 	}
 
@@ -353,5 +353,5 @@ func buildAndPublish(ctx context.Context, db *testpg.DB, spec testreg.Spec, at m
 		build.Abort(ctx)
 		return err
 	}
-	return build.Publish(ctx, "latest")
+	return build.Publish(ctx, "latest", 0)
 }

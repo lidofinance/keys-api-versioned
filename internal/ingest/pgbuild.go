@@ -264,7 +264,8 @@ func (b *pgBuild) Operators(ctx context.Context, module model.StakingModule, ope
 			stopped_validators           int     not null,
 			total_signing_keys           int     not null,
 			used_signing_keys            int     not null,
-			depositable_validators_count int     not null
+			depositable_validators_count int     not null,
+			group_id                     int
 		) on commit drop`); err != nil {
 		return 0, fmt.Errorf("staging table: %w", err)
 	}
@@ -275,14 +276,20 @@ func (b *pgBuild) Operators(ctx context.Context, module model.StakingModule, ope
 		if err != nil {
 			return 0, fmt.Errorf("operator %d reward address: %w", o.Index, err)
 		}
+		var group any
+		if o.Group != nil {
+			group = int32(*o.Group)
+		}
 		staged = append(staged, []any{o.Index, o.Active, o.Name, reward, o.StakingLimit,
-			o.StoppedValidators, o.TotalSigningKeys, o.UsedSigningKeys, o.DepositableValidatorsCount})
+			o.StoppedValidators, o.TotalSigningKeys, o.UsedSigningKeys, o.DepositableValidatorsCount,
+			group})
 	}
 
 	if _, err := tx.CopyFrom(ctx,
 		pgx.Identifier{"staged_operators"},
 		[]string{"operator_index", "active", "name", "reward_address", "staking_limit",
-			"stopped_validators", "total_signing_keys", "used_signing_keys", "depositable_validators_count"},
+			"stopped_validators", "total_signing_keys", "used_signing_keys", "depositable_validators_count",
+			"group_id"},
 		pgx.CopyFromSlice(len(staged), func(i int) ([]any, error) { return staged[i], nil })); err != nil {
 		return 0, fmt.Errorf("stage operators: %w", err)
 	}
@@ -301,7 +308,11 @@ func (b *pgBuild) Operators(ctx context.Context, module model.StakingModule, ope
 		          and s.stopped_validators = v.stopped_validators
 		          and s.total_signing_keys = v.total_signing_keys
 		          and s.used_signing_keys = v.used_signing_keys
-		          and s.depositable_validators_count = v.depositable_validators_count)`, module.ID, block)
+		          and s.depositable_validators_count = v.depositable_validators_count
+		          -- Nullable, so equality is not enough: null = null is null, which
+		          -- would close and reopen every operator of a group-less module on
+		          -- every rebuild.
+		          and s.group_id is not distinct from v.group_id)`, module.ID, block)
 	if err != nil {
 		return 0, fmt.Errorf("close superseded operators: %w", err)
 	}
@@ -309,9 +320,9 @@ func (b *pgBuild) Operators(ctx context.Context, module model.StakingModule, ope
 	opened, err := tx.Exec(ctx, `
 		insert into operator_version
 			(module_id, operator_index, active, name, reward_address, staking_limit, stopped_validators,
-			 total_signing_keys, used_signing_keys, depositable_validators_count, from_block, to_block)
+			 total_signing_keys, used_signing_keys, depositable_validators_count, group_id, from_block, to_block)
 		select $1, s.operator_index, s.active, s.name, s.reward_address, s.staking_limit, s.stopped_validators,
-		       s.total_signing_keys, s.used_signing_keys, s.depositable_validators_count, $2, null
+		       s.total_signing_keys, s.used_signing_keys, s.depositable_validators_count, s.group_id, $2, null
 		  from staged_operators s
 		 where not exists (
 		       select 1 from operator_version v
@@ -414,7 +425,7 @@ func (b *pgBuild) Module(ctx context.Context, m model.StakingModule, contentChan
 // lastChangedBlockHash moves only when some module's content moved, so a consumer
 // polling it keeps the skip guarantee the canonical contract promises — only here
 // it is true.
-func (b *pgBuild) Publish(ctx context.Context, label string) error {
+func (b *pgBuild) Publish(ctx context.Context, label string, finalized int64) error {
 	if label == "" {
 		label = "latest"
 	}
@@ -460,8 +471,9 @@ func (b *pgBuild) Publish(ctx context.Context, label string) error {
 	}
 
 	if _, err := tx.Exec(ctx, `update versions
-		   set status = 'published', label = $2, last_changed_block_hash = $3, module_nonces = $4
-		 where id = $1`, b.id, label, lastChanged, nonces); err != nil {
+		   set status = 'published', label = $2, last_changed_block_hash = $3, module_nonces = $4,
+		       finalized_block_number = $5
+		 where id = $1`, b.id, label, lastChanged, nonces, finalized); err != nil {
 		return fmt.Errorf("publish version: %w", err)
 	}
 

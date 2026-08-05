@@ -32,7 +32,7 @@ func (s *Server) handleKeysDiff(w http.ResponseWriter, r *http.Request) {
 
 	since := q.Get("since")
 	if since == "" {
-		writeError(w, http.StatusBadRequest, []string{"since is required: a block number, a block hash, or safe"})
+		writeError(w, http.StatusBadRequest, []string{"since is required: a block number, a block hash, or finalized"})
 		return
 	}
 
@@ -107,7 +107,7 @@ func (s *Server) handleModulesDiff(w http.ResponseWriter, r *http.Request) {
 
 	since := q.Get("since")
 	if since == "" {
-		writeError(w, http.StatusBadRequest, []string{"since is required: a block number, a block hash, or safe"})
+		writeError(w, http.StatusBadRequest, []string{"since is required: a block number, a block hash, or finalized"})
 		return
 	}
 

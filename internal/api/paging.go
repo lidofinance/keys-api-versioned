@@ -48,6 +48,20 @@ func parsePage(r *http.Request) (pageRequest, error) {
 		if err != nil {
 			return p, errBadRequest{[]string{err.Error()}}
 		}
+		// A cursor already names the version, so a `snapshot` alongside it is a second
+		// answer to a question that has one. Refused rather than resolved, because the
+		// natural client loop — build `?snapshot=finalized&limit=1000` once, append
+		// `&cursor=` each page — would otherwise re-resolve the label on every page: as
+		// finality advances mid-walk the consumer would be handed keys from two versions,
+		// with no gap, no error and no way to notice. Silently letting the cursor win
+		// would prevent that, but would leave the consumer believing something untrue
+		// about what it asked for. This way the loop fails on page two of its first run,
+		// deterministically, instead of on the day finality moves during a long walk.
+		if q.Get("snapshot") != "" {
+			return p, errBadRequest{[]string{
+				"cursor and snapshot cannot be combined: the cursor names the version the " +
+					"walk is on — pin with snapshot on the first page, then send the cursor alone"}}
+		}
 		p.after = &cursor
 		p.enabled = true
 		// A cursor without a limit still pages: the consumer clearly wants to
@@ -71,20 +85,19 @@ func parsePage(r *http.Request) (pageRequest, error) {
 	return p, nil
 }
 
-// pinFor returns the pin a paged request has to be served at: the version named by
-// the cursor, unless the request pinned one explicitly.
+// pinFor returns the pin a paged request has to be served at: the version named by the
+// cursor once a walk is under way, and whatever the first page asked for before that.
 //
-// This is what makes a walk consistent without asking the consumer to do anything.
-// Page one is served from whatever was current, the cursor carries that version, and
-// every later page follows it even as new versions are published.
+// This is what makes a walk consistent without asking the consumer to track versions.
+// Page one is served from the pin it named or from the surface default, the cursor carries
+// that version as a block number — an exact pin, not a label — and every later page
+// follows it while new versions are published. The two cannot disagree, because parsePage
+// refuses a request that sends both.
 func (p pageRequest) pinFor(r *http.Request) string {
-	if explicit := r.URL.Query().Get("snapshot"); explicit != "" {
-		return explicit
-	}
 	if p.after != nil {
 		return strconv.FormatInt(p.after.Block, 10)
 	}
-	return ""
+	return r.URL.Query().Get("snapshot")
 }
 
 // handleKeysPage serves one page of /v1/keys.

@@ -64,6 +64,8 @@ A reorg: the stored version's hash no longer matches the chain at its height. Th
 
 Operator metadata (a rename, a reward address) moves no nonce, so it is caught by a log filter per module instead: `NodeOperatorAdded`, `NodeOperatorNameSet`, `NodeOperatorRewardAddressSet` for the curated registry, `NodeOperatorRewardAddressChanged` for CSM. Same events the canonical service watches.
 
+Two CMv2 fields are outside that net, and it is worth being explicit rather than letting someone discover it: the operator name and the node operator group both live in the module's `META_REGISTRY`, a second contract, so they move no nonce *and* emit nothing at the module address the filter runs against. Until the scan learns a second address per module, an edit to either is picked up by the next change to that module's keys or by the periodic full audit — hours, not a cycle. It is a freshness gap, not a correctness one: what is served is always some consistent version of the chain.
+
 A full audit: every `MAX_BLOCKS_OVERLAP` blocks (default 1 000, about three hours) the loop re-reads everything regardless of the cheap signals, in case one of them lied. A healthy audit writes nothing, which is the point — it is a checkable statement that nonce and events were telling the truth. Note this differs from the canonical service's 30: there the window bounds an event scan, here the signal is a contract counter, and at 30 the audit fires every six minutes and re-reads half a million keys to write nothing. That was measured, not assumed.
 
 The cold sync, for scale: 511 877 keys and 731 operators across four modules, empty database to published version, in **107 s** at batch 40 / concurrency 6. It is round-trip bound rather than key bound — CSM's 26 000 keys cost 51 s against module 1's 472 000 in 47 s, because CSM has 609 operators and module 1 has 39.
@@ -106,9 +108,10 @@ KEYS_API_URL=http://keys-api:3000
 
 Response framing is byte-identical to the canonical service, whitespace and stream separators included, so this is a URL change and nothing else. Two additions a consumer can ignore or use:
 
-- `?snapshot=<latest|safe|block|hash>` serves one request from a specific version. Several requests against one version get consistent answers, and a version that has gone away answers 409 (reorged, with the head to jump to) or 410 (pruned) instead of quietly different data. Without it every request gets `latest` — the newest published version — which is the behaviour a consumer already expects.
+- `?snapshot=<latest|finalized|block|hash>` serves one request from a specific version. Several requests against one version get consistent answers, and a version that has gone away answers 409 (reorged, with the head to jump to) or 410 (pruned) instead of quietly different data. On `/v1` and `/v2` the parameter is ignored and every request gets `latest` — the newest published version, which is what the canonical service serves and therefore what a consumer already expects. On `/ext/v1` the default is `finalized` instead (`KEYS_API_EXT_PIN`): a version a reorg cannot take away, roughly two epochs behind, with the head one `?snapshot=latest` away.
 - `?limit` and `?cursor` page a dump; `/ext/v1/keys/diff?since=` and `/ext/v1/modules/diff?since=` say what changed. All of it lives under `/ext/v1` — see below.
 - `X-Snapshot-Stale: true` says the version being served is known not to reflect the chain while a rebuild is in flight. The body is unchanged, so a consumer that ignores the header behaves exactly as before.
+- `groupId` on an operator, on `/ext/v1` only, is the node operator group read from the module's `META_REGISTRY`. It answers "which operators belong to the same company" for dashboards that want to select by group — the case `/v1` cannot serve, since the canonical operator object has no such field. Absent where the module has no group registry, `null` where it has one and the operator is in no group; see the `Operator` schema in the API document for why those are not the same answer.
 
 ## Running it
 

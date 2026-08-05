@@ -18,10 +18,24 @@ func At(block int64) model.ELBlockSnapshot {
 }
 
 // Publish writes a full version of every module and publishes it.
+//
+// No finalized block is recorded, which is what most tests want: `?snapshot=finalized` is
+// then unavailable and cannot quietly satisfy an assertion meant for `latest`. Tests
+// about finality use PublishFinal.
 func (s Spec) Publish(ctx context.Context, tb testing.TB, pg *ingest.PGStore, at model.ELBlockSnapshot) {
 	tb.Helper()
 	build := s.Fill(ctx, tb, pg, at, s.ModuleIDs()...)
-	if err := build.Publish(ctx, "latest"); err != nil {
+	if err := build.Publish(ctx, "latest", 0); err != nil {
+		tb.Fatalf("publish version %d: %v", at.BlockNumber, err)
+	}
+}
+
+// PublishFinal publishes and records the finalized block observed at the time, which is
+// what `?snapshot=finalized` resolves against.
+func (s Spec) PublishFinal(ctx context.Context, tb testing.TB, pg *ingest.PGStore, at model.ELBlockSnapshot, finalized int64) {
+	tb.Helper()
+	build := s.Fill(ctx, tb, pg, at, s.ModuleIDs()...)
+	if err := build.Publish(ctx, "latest", finalized); err != nil {
 		tb.Fatalf("publish version %d: %v", at.BlockNumber, err)
 	}
 }
@@ -32,7 +46,7 @@ func (s Spec) Publish(ctx context.Context, tb testing.TB, pg *ingest.PGStore, at
 func (s Spec) PublishModules(ctx context.Context, tb testing.TB, pg *ingest.PGStore, at model.ELBlockSnapshot, ids ...int) {
 	tb.Helper()
 	build := s.Fill(ctx, tb, pg, at, ids...)
-	if err := build.Publish(ctx, "latest"); err != nil {
+	if err := build.Publish(ctx, "latest", 0); err != nil {
 		tb.Fatalf("publish version %d: %v", at.BlockNumber, err)
 	}
 }

@@ -388,6 +388,57 @@ func (c *Client) Head(ctx context.Context) (*big.Int, string, error) {
 	return n, block.Hash, nil
 }
 
+// FinalizedBlock returns the newest finalized block — number, hash and timestamp — or a
+// zero number when the endpoint does not know one.
+//
+// The hash matters as much as the number: a service configured to build at finality pins
+// its reads to it, and pinning by height alone does not name a branch.
+//
+// A header read and nothing else. What this number is *for* is choosing among versions
+// the service already built — it must never become the point registry data is read at.
+// That distinction is the whole bug the canonical service shipped in July 2026: it read
+// operator counters at a block fixed at the start of the cycle and the deposited count at
+// the floating `finalized` tag, so when the anchor was older than the finality delay the
+// second could overtake the first and the invariant between them broke. Two views of one
+// chain in one cycle. Here there is one view, and this is a label on it.
+//
+// A node with no finalized block — a devnet before the first finalization, or one that
+// does not implement the tag — answers null or errors. Both mean "no finality to report",
+// which is 0 rather than a failure: the loop keeps working and the finalized pin stays
+// unavailable.
+func (c *Client) FinalizedBlock(ctx context.Context) (int64, string, int64, error) {
+	res, err := c.do(ctx, []rpcRequest{{
+		JSONRPC: "2.0", ID: c.id(), Method: "eth_getBlockByNumber",
+		Params: []any{"finalized", false},
+	}})
+	if err != nil {
+		return 0, "", 0, err
+	}
+
+	var block *struct {
+		Number    string `json:"number"`
+		Hash      string `json:"hash"`
+		Timestamp string `json:"timestamp"`
+	}
+	if err := json.Unmarshal(res[0], &block); err != nil {
+		return 0, "", 0, err
+	}
+	if block == nil || block.Number == "" {
+		return 0, "", 0, nil
+	}
+
+	n, ok := new(big.Int).SetString(strings.TrimPrefix(block.Number, "0x"), 16)
+	if !ok {
+		return 0, "", 0, fmt.Errorf("bad finalized block number %q", block.Number)
+	}
+	ts, _ := new(big.Int).SetString(strings.TrimPrefix(block.Timestamp, "0x"), 16)
+	var seconds int64
+	if ts != nil {
+		seconds = ts.Int64()
+	}
+	return n.Int64(), block.Hash, seconds, nil
+}
+
 // ChainID returns the chain the endpoints serve.
 func (c *Client) ChainID(ctx context.Context) (int64, error) {
 	res, err := c.do(ctx, []rpcRequest{{

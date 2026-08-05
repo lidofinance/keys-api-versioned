@@ -44,6 +44,10 @@ type Spec struct {
 	Salt               uint64
 	// Used reports whether a key is deposited. Nil means none are.
 	Used func(module, operator, index int) bool
+	// Group reports an operator's node operator group. Nil, or a nil result, means
+	// the module has no group registry — which is what every module but
+	// curated-onchain-v2 looks like, and therefore the default.
+	Group func(module, operator int) *model.GroupID
 }
 
 // Small is the default for semantics tests: enough shape to have module and operator
@@ -65,6 +69,12 @@ func (s Spec) WithSalt(salt uint64) Spec { s.Salt = salt; return s }
 // WithUsed returns the same registry with a different deposited set.
 func (s Spec) WithUsed(used func(module, operator, index int) bool) Spec {
 	s.Used = used
+	return s
+}
+
+// WithGroups returns the same registry with node operator groups.
+func (s Spec) WithGroups(group func(module, operator int) *model.GroupID) Spec {
+	s.Group = group
 	return s
 }
 
@@ -145,9 +155,17 @@ func (s Spec) Operators(moduleID int) []model.Operator {
 			Active:                     true,
 			ModuleAddress:              ModuleAddress(moduleID),
 			DepositableValidatorsCount: int32(s.KeysPerOperator - used),
+			Group:                      s.group(moduleID, op),
 		})
 	}
 	return out
+}
+
+func (s Spec) group(module, operator int) *model.GroupID {
+	if s.Group == nil {
+		return nil
+	}
+	return s.Group(module, operator)
 }
 
 func (s Spec) used(module, operator, index int) bool {

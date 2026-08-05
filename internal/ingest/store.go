@@ -47,7 +47,7 @@ type Store interface {
 	// Extend advances a published version's observed block without touching its
 	// data or its lastChangedBlockHash. This is the "nothing changed" path, and it
 	// is one row update.
-	Extend(ctx context.Context, v StoredVersion, at model.ELBlockSnapshot, nonces map[string]int64) error
+	Extend(ctx context.Context, v StoredVersion, at model.ELBlockSnapshot, nonces map[string]int64, finalized int64) error
 
 	// MarkStale flags a version as no longer reflecting the chain. It keeps being
 	// served, with the staleness surfaced to the client, because a consistent
@@ -93,8 +93,9 @@ type Build interface {
 	// re-read that found nothing leaves it alone.
 	Module(ctx context.Context, m model.StakingModule, contentChanged bool) error
 
-	// Publish makes the version current with a single status change.
-	Publish(ctx context.Context, label string) error
+	// Publish makes the version current with a single status change. finalized is the
+	// newest finalized block observed at the time, 0 when the source reports none.
+	Publish(ctx context.Context, label string, finalized int64) error
 
 	// Abort discards the version. Rows already written stay: they are invisible,
 	// no published version claims their block, and retention collects them.
@@ -123,9 +124,12 @@ type StoredVersion struct {
 	Timestamp   int64
 	// HeadBlockNumber, HeadBlockHash and HeadTimestamp are the newest block the
 	// version was confirmed current at. These move on every quiet cycle.
-	HeadBlockNumber      int64
-	HeadBlockHash        string
-	HeadTimestamp        int64
+	HeadBlockNumber int64
+	HeadBlockHash   string
+	HeadTimestamp   int64
+	// FinalizedBlockNumber is the newest finalized block seen when this version was last
+	// confirmed. 0 means the source reports no finality.
+	FinalizedBlockNumber int64
 	LastChangedBlockHash string
 	Label                string
 	Status               string

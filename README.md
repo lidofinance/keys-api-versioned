@@ -54,17 +54,22 @@ Generate load from inside the compose network. Through a published port on Docke
 
 | | |
 |---|---|
-| `?snapshot=<latest\|safe\|block\|hash>` | serve one request from a specific version |
-| `?limit`, `?cursor` | page a dump; the cursor names its version |
+| `?snapshot=<latest\|finalized\|block\|hash>` | serve one request from a specific version |
+| `?limit`, `?cursor` | page a dump; the cursor names its version, and `snapshot` alongside it is a `400` |
 | `GET /ext/v1/keys/diff?since=` | what changed between two versions |
 | `GET /ext/v1/modules/diff?since=` | which modules changed — the cheap poll |
 | `GET /ext/v1/modules/{id}/keys/diff?since=` | one module's changes |
+| `groupId` on an operator | the node operator group, on every operator representation |
 
 The canonical endpoint that lives on `/v2` is mirrored as `/ext/v1/modules/operators/keys`: this surface has a version axis of its own, and the canonical split between `/v1` and `/v2` — an accident of how that service moved one endpoint — does not leak into it.
 
 A request that sends `snapshot`, `limit` or `cursor` to `/v1` gets the canonical answer plus `X-Ignored-Parameters` naming what was dropped. A header rather than a `400`, because a `400` would itself be a difference from canonical — checked, not assumed: its `ValidationPipe` is `{ transform: true }` with no `whitelist`, so NestJS ignores an undeclared parameter. A header rather than silence, because `?limit=100` ignored on `/v1/keys` streams the entire 216 MiB dump and nothing in the body would say so.
 
 `X-Snapshot-Stale: true` is on both surfaces: it says the served version is known not to reflect the chain while a rebuild is in flight, and a header cannot break a consumer parsing the body.
+
+**Node operator groups** are the one field the extended surface adds to a body rather than to a query. `groupId` comes from the module's `META_REGISTRY` — the same contract the CMv2 operator names come from — and it exists for `curated-onchain-v2` and no other module type, which is why absence and `null` mean different things: the field is **absent** where the module has no group registry, **`null`** where it has one and the operator is in no group (`NO_GROUP_ID`, which on chain is `0` and would be a lie as a group id), and a **number** otherwise. It is on `/ext/v1` only, since the canonical operator object has no such field. Mainnet module 4, at the time of writing: 45 operators, 38 in one of 27 groups, 7 in none.
+
+**The default version belongs to the surface.** `/ext/v1` serves `finalized` unless a request pins something else (`KEYS_API_EXT_PIN`, default `finalized`; `latest` when the source has no finality at all, because there the pin answers 501 by design). `/v1` and `/v2` serve `latest` (`KEYS_API_PIN`), which is what the canonical service serves — its keys-update job reads the registry at `getBlock('latest')`. Finalized there would be a difference in content with no way out, since that surface ignores `?snapshot=`. A consumer on the extended surface gets the version a reorg cannot take away and reaches the head with `?snapshot=latest`; a consumer still on `/v1` notices nothing. The one finalized read the canonical service does do is a single field — `finalizedUsedSigningKeys` on a CSM operator, at `blockTag: 'finalized'` inside a body assembled at the head — which is why its own deposited counters are not consistent with each other.
 
 **Why not `/v3`.** The canonical service versions per endpoint through NestJS URI versioning — `app.enableVersioning({ type: VersioningType.URI })`, then `@Version('2')` on the one controller that moved. `/v3` is one decorator away in a repository this team does not own, on a protocol-critical service. A separate namespace leaves it free to reach `/v3` and beyond without ever colliding, and it tells a consumer the truth: moving to `/ext/v1` is a deliberate change of contract, not a version bump.
 

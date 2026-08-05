@@ -27,6 +27,8 @@ import (
 //     the operator's totalDepositedKeys, the same rule the canonical service uses.
 //   - Operators have no on-chain name in CSM. CSM gets a generated one; CMv2
 //     resolves it through the module's META_REGISTRY, which is a second contract.
+//     The same registry holds node operator groups, so name and group are read
+//     together, from the same batch.
 type CommunityReader struct {
 	KeysBatch       uint64
 	CallsPerRequest int
@@ -98,7 +100,7 @@ func (r *CommunityReader) Operators(ctx context.Context, c *eth.Client, at eth.B
 		}
 	}
 
-	if err := r.fillNames(ctx, c, at, moduleAddress, operators); err != nil {
+	if err := r.fillMetaRegistryFields(ctx, c, at, moduleAddress, operators); err != nil {
 		return nil, err
 	}
 	if r.Log != nil {
@@ -107,12 +109,25 @@ func (r *CommunityReader) Operators(ctx context.Context, c *eth.Client, at eth.B
 	return operators, nil
 }
 
-// fillNames resolves operator names.
+// fillMetaRegistryFields resolves the operator fields that live off the module: the
+// name and the node operator group.
 //
-// CSM has none on chain, and the canonical service generates "CSM Operator <i>",
-// so consumers already see that string — matching it keeps responses comparable.
-// CMv2 keeps names in a MetaRegistry, one call per operator.
-func (r *CommunityReader) fillNames(ctx context.Context, c *eth.Client, at eth.BlockRef, moduleAddress string, operators []model.Operator) error {
+// CSM has no name on chain, and the canonical service generates "CSM Operator <i>",
+// so consumers already see that string — matching it keeps responses comparable. A
+// module without a MetaRegistry has no groups either, and its operators keep a nil
+// Group, which is how the surface says "groups do not exist here" rather than
+// "this operator is in none".
+//
+// Two calls per operator, in one batch each round — the same two-kinds-of-call
+// layout Operators uses above, so adding groups costs no extra round trip beyond
+// what the batch size already implies.
+//
+// What this does not do is notice a group change on its own. Group membership lives
+// in the MetaRegistry, so it moves no module nonce and emits no event at the module
+// address the operator-event scan filters on — the same blind spot operator names
+// already have here. Until the scan learns a second address, a group edit is picked
+// up by the next key change or by the periodic full audit.
+func (r *CommunityReader) fillMetaRegistryFields(ctx context.Context, c *eth.Client, at eth.BlockRef, moduleAddress string, operators []model.Operator) error {
 	registry, err := r.resolveMetaRegistry(ctx, c, at, moduleAddress)
 	if err != nil {
 		return err
@@ -127,26 +142,43 @@ func (r *CommunityReader) fillNames(ctx context.Context, c *eth.Client, at eth.B
 	for start := 0; start < len(operators); start += operatorBatchSize {
 		end := min(start+operatorBatchSize, len(operators))
 
-		calls := make([]eth.Call, 0, end-start)
+		calls := make([]eth.Call, 0, (end-start)*2)
 		for i := start; i < end; i++ {
 			calls = append(calls, eth.Call{
 				To: registry, ABI: &eth.MetaRegistryABI, Method: "getOperatorMetadata",
 				Args: []any{big.NewInt(int64(operators[i].Index))},
 			})
 		}
+		for i := start; i < end; i++ {
+			calls = append(calls, eth.Call{
+				To: registry, ABI: &eth.MetaRegistryABI, Method: "getNodeOperatorGroupId",
+				Args: []any{big.NewInt(int64(operators[i].Index))},
+			})
+		}
 		results, err := c.CallBatch(ctx, at, calls)
 		if err != nil {
-			return fmt.Errorf("getOperatorMetadata %d–%d: %w", start, end, err)
+			return fmt.Errorf("operator metadata and groups %d–%d: %w", start, end, err)
 		}
-		for i, values := range results {
-			operators[start+i].Name = metadataName(values)
+
+		width := end - start
+		for i := 0; i < width; i++ {
+			operators[start+i].Name = metadataName(results[i])
+			group := model.GroupID(intOf(firstValue(results[width+i])))
+			operators[start+i].Group = &group
 		}
+	}
+	if r.Log != nil {
+		r.Log.Debug("operator groups read", "module", moduleAddress,
+			"registry", registry, "operators", len(operators))
 	}
 	return nil
 }
 
 // resolveMetaRegistry returns the module's MetaRegistry address, or an empty
 // string when the module has none (plain CSM).
+//
+// One call per module, cached, so a module without the getter costs one revert on
+// the first cycle and nothing afterwards — never a call per operator.
 func (r *CommunityReader) resolveMetaRegistry(ctx context.Context, c *eth.Client, at eth.BlockRef, moduleAddress string) (string, error) {
 	r.metaMu.Lock()
 	if r.metaRegistry == nil {

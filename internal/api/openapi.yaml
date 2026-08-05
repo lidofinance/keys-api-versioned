@@ -37,10 +37,12 @@ info:
     ## What the extended surface adds
 
     **Versions.** Every response is served from one published version and never from a
-    table being written. Without `snapshot`, a request gets `latest` — the newest
-    published version — which is the behaviour a consumer already expects. With it, a
-    request gets exactly the version named, so several requests can be made against
-    one consistent state.
+    table being written. With `snapshot`, a request gets exactly the version named, so
+    several requests can be made against one consistent state.
+
+    Without it, the default is the surface's: `finalized` on `/ext/v1`, and `latest` on
+    `/v1` and `/v2` — the head, which is what the canonical service serves and therefore
+    what a consumer repointed here already expects.
 
     A version that has gone away answers definitively rather than with different data:
     `409` if a reorg took it off the chain, with the head to jump to, and `410` if it
@@ -49,6 +51,12 @@ info:
     **Paging and diffs**, neither of which the canonical service can offer, because both
     need rows that do not move: `limit`/`cursor` walks one version, and `since=` returns
     only what changed between two.
+
+    **Node operator groups.** `groupId` on an operator, read from the module's
+    MetaRegistry. Only `curated-onchain-v2` has one, so the field appears on that
+    module's operators and on no others — see the `Operator` schema for what its
+    absence and its `null` each mean. `/ext/v1` only, because the canonical operator
+    object has no such field and these paths may not add one.
 
     **Staleness.** `X-Snapshot-Stale: true` on a response means the version being
     served is known not to reflect the chain while a rebuild is in flight. The body is
@@ -645,9 +653,15 @@ components:
       name: snapshot
       in: query
       description: |
-        Which version to serve from: `latest` (the default), `safe`, a block number, or
-        a block hash. A version that is gone answers 409 or 410 rather than serving
-        different data.
+        Which version to serve from: `latest`, `finalized`, a block number, or a block
+        hash. A version that is gone answers 409 or 410 rather than serving different
+        data.
+
+        The default is `finalized` here on `/ext/v1` — the newest version at or below the
+        finalized block, which a reorg cannot take away, and roughly two epochs behind the
+        head. `?snapshot=latest` asks for the head. On `/v1` and `/v2` this parameter is
+        ignored and the head is always served, because that is what the canonical service
+        serves.
       schema: { type: string }
       example: latest
     Limit:
@@ -662,13 +676,18 @@ components:
         Continue a walk. Returned as `pagination.cursor`, and it names the version, so
         later pages come from the version page one came from. Null cursor means the
         walk is finished.
+
+        Sending `snapshot` alongside a cursor is a `400`: the cursor already names the
+        version. Pin on the first page if you want a particular one, then send the cursor
+        alone — repeating `?snapshot=finalized` on every page would resolve the label
+        again each time and walk across two versions as finality advances.
       schema: { type: string }
       example: 25609646.1.0.9999
     Since:
       name: since
       in: query
       required: true
-      description: The version to diff from — a block number, a block hash, or `safe`.
+      description: The version to diff from — a block number, a block hash, or `finalized`.
       schema: { type: string }
     To:
       name: to
@@ -754,6 +773,31 @@ components:
         active: { type: boolean }
         moduleAddress: { type: string }
         depositableValidatorsCount: { type: integer }
+        groupId:
+          type: integer
+          nullable: true
+          example: 17
+          description: |
+            The node operator group, from the module's MetaRegistry.
+
+            `/ext/v1` only. The canonical operator object has no such field, so `/v1`
+            and `/v2` never carry it whatever the module.
+
+            Three states, and two of them are different facts:
+
+            - **absent** — the module has no group registry. Groups exist for
+              `curated-onchain-v2` and for no other module type, and `null` there would
+              read as "this operator was left out of a group".
+            - **`null`** — the module has groups and this operator is in none. On chain
+              that is `NO_GROUP_ID`, which is literally `0`; serving the `0` would name
+              a group that does not exist and invite a consumer to bucket every
+              ungrouped operator together.
+            - **a number** — the group the operator belongs to. Several operators of one
+              company usually share it, which is what makes it worth selecting on.
+
+            Group membership moves no module nonce and emits no event at the module
+            address, so a group edit is picked up by the next change to that module's
+            keys or by the periodic full audit, not within a cycle of the edit.
 
     StakingModule:
       type: object

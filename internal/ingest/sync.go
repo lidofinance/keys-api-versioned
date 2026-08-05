@@ -41,9 +41,22 @@ type SyncConfig struct {
 	MaxBlockGap int64
 	// RetainVersions is the retention window. 0 disables pruning.
 	RetainVersions int
-	// SafeLagVersions is how far behind head the `safe` label sits. Reserved for
-	// the label policy; the loop publishes `latest`.
-	SafeLagVersions int
+	// BuildAtFinalized reads the registry at the finalized block rather than at the
+	// head.
+	//
+	// It buys the thing the reorg machinery exists to survive: a version built at a
+	// finalized block cannot be superseded, so `?snapshot=finalized` is answerable the
+	// moment the first sync finishes instead of once the head catches up, and no
+	// consumer of it ever has to handle a 409.
+	//
+	// It costs freshness. Finality is about two epochs — measured on Hoodi, 61 to 85
+	// blocks, twelve to seventeen minutes — so a key added now appears that much later.
+	// Whether that matters is a question about the consumer, not about the service,
+	// which is why this is configuration and not a decision baked in.
+	//
+	// A source that reports no finality falls back to the head, so a devnet before its
+	// first finalization still syncs.
+	BuildAtFinalized bool
 	// ReorgSearchDepth is how many stored versions the fork-point walk may inspect.
 	ReorgSearchDepth int
 }
@@ -65,6 +78,9 @@ type CycleResult struct {
 	Rebuilt       bool
 	KeysStaged    int64
 	KeysChanged   int64
+	// FinalizedBlock is the newest finalized block this cycle observed, 0 when the
+	// source reports none. What `?snapshot=finalized` is answered from.
+	FinalizedBlock int64
 	// ReorgFrom is the block a reorg rolled versions back to, 0 when there was none.
 	// It is separate from Action because a reorg does not imply a rebuild: after the
 	// rollback the cycle runs the ordinary incremental check, and on mainnet the usual
@@ -134,7 +150,30 @@ func (s *Syncer) Cycle(ctx context.Context) (result CycleResult) {
 	}
 	result.HeadBlock = head.BlockNumber
 	result.HeadTimestamp = head.Timestamp
-	s.log.Debug("cycle: head", "block", head.BlockNumber, "hash", head.BlockHash, "timestamp", head.Timestamp)
+
+	// One header read, and its only use is choosing among versions this service already
+	// built: `?snapshot=finalized` resolves to the newest published version at or below it.
+	// It is never a point registry state is read at — everything below stays pinned to
+	// the one hash this cycle got from the head. Mixing a floating tag into the reads is
+	// how the canonical service broke the invariant between its deposited counters.
+	final := s.finalizedBlock(ctx)
+	finalized := final.BlockNumber
+	result.FinalizedBlock = finalized
+
+	// What the registry is read at. The head by default; the finalized block when the
+	// deployment asked for it and the source has one.
+	//
+	// Everything downstream pins to this one block — modules, operators, keys — so the
+	// consistency argument is unchanged whichever it is. The observed head keeps moving
+	// separately, which is what meta.elBlockSnapshot reports and what the freshness gap
+	// is measured against.
+	readAt := head
+	if s.cfg.BuildAtFinalized && final.BlockNumber > 0 {
+		readAt = final
+	}
+
+	s.log.Debug("cycle: head", "block", head.BlockNumber, "hash", head.BlockHash,
+		"timestamp", head.Timestamp, "finalized", finalized, "reading_at", readAt.BlockNumber)
 
 	latest, err := s.store.Latest(ctx)
 	if err != nil {
@@ -151,7 +190,7 @@ func (s *Syncer) Cycle(ctx context.Context) (result CycleResult) {
 		// A cold start reads every module and takes minutes, so it says so up front
 		// rather than after the first module lands.
 		s.log.Info("cold start: no published version, reading every module", "head", head.BlockNumber)
-		if err := s.rebuild(ctx, head, nil, &result); err != nil {
+		if err := s.rebuild(ctx, readAt, nil, finalized, &result); err != nil {
 			result.Err = err
 		} else {
 			// Same as the ordinary rebuild path below. Without it a cold start
@@ -183,7 +222,7 @@ func (s *Syncer) Cycle(ctx context.Context) (result CycleResult) {
 	//
 	// Read before the reorg check rather than after, because a rollback deletes rows and
 	// the module set is what says whether a rollback is the right thing to do at all.
-	modules, err := s.source.Modules(ctx, source.Ref{BlockHash: head.BlockHash, BlockNumber: head.BlockNumber})
+	modules, err := s.source.Modules(ctx, source.Ref{BlockHash: readAt.BlockHash, BlockNumber: readAt.BlockNumber})
 	if err != nil {
 		result.Err = fmt.Errorf("read modules: %w", err)
 		return result
@@ -242,7 +281,7 @@ func (s *Syncer) Cycle(ctx context.Context) (result CycleResult) {
 			result.Action = ActionSupersede
 			result.Reason = fmt.Sprintf("reorg below the whole retained window (fork at %d): rebuilding from scratch", forkPoint)
 			s.log.Warn("reorg left no version to build on, rebuilding from scratch", "fork_point", forkPoint)
-			if err := s.rebuild(ctx, head, nil, &result); err != nil {
+			if err := s.rebuild(ctx, readAt, nil, finalized, &result); err != nil {
 				result.Err = err
 			} else {
 				result.VersionBlock = head.BlockNumber
@@ -255,8 +294,8 @@ func (s *Syncer) Cycle(ctx context.Context) (result CycleResult) {
 	}
 
 	state := HeadState{
-		BlockNumber:  head.BlockNumber,
-		BlockHash:    head.BlockHash,
+		BlockNumber:  readAt.BlockNumber,
+		BlockHash:    readAt.BlockHash,
 		ModuleNonces: nonceMap(modules),
 	}
 	state.OperatorEvents, err = s.operatorEvents(ctx, modules, latest.BlockNumber, head.BlockNumber)
@@ -292,7 +331,7 @@ func (s *Syncer) Cycle(ctx context.Context) (result CycleResult) {
 		// block: the data is still from there, and an alert on data age has to say so.
 		// Moving them to head here would report a version confirmed-current at head as
 		// if it had been rebuilt at head — freshness by relabelling.
-		if err := s.store.Extend(ctx, *latest, head, state.ModuleNonces); err != nil {
+		if err := s.store.Extend(ctx, *latest, head, state.ModuleNonces, finalized); err != nil {
 			result.Err = err
 		} else {
 			s.log.Debug("cycle: extended", "version", latest.BlockNumber,
@@ -318,7 +357,7 @@ func (s *Syncer) Cycle(ctx context.Context) (result CycleResult) {
 			// leave keys alone. Passing an empty scope would mean "everything".
 			scope = allModuleAddresses(modules)
 		}
-		if err := s.rebuild(ctx, head, scope, &result); err != nil {
+		if err := s.rebuild(ctx, readAt, scope, finalized, &result); err != nil {
 			result.Err = err
 			break
 		}
@@ -335,7 +374,7 @@ func (s *Syncer) Cycle(ctx context.Context) (result CycleResult) {
 // scope names the modules whose keys must be re-read; nil means all of them.
 // Everything outside the scope is inherited from the previous version at no cost,
 // because its rows are simply still open.
-func (s *Syncer) rebuild(ctx context.Context, head model.ELBlockSnapshot, scope []string, result *CycleResult) error {
+func (s *Syncer) rebuild(ctx context.Context, head model.ELBlockSnapshot, scope []string, finalized int64, result *CycleResult) error {
 	at := source.Ref{BlockHash: head.BlockHash, BlockNumber: head.BlockNumber}
 
 	modules, err := s.source.Modules(ctx, at)
@@ -410,7 +449,7 @@ func (s *Syncer) rebuild(ctx context.Context, head model.ELBlockSnapshot, scope 
 	}
 
 	publishStarted := time.Now()
-	if err := build.Publish(ctx, "latest"); err != nil {
+	if err := build.Publish(ctx, "latest", finalized); err != nil {
 		return err
 	}
 	committed = true
@@ -545,6 +584,25 @@ func foreignModuleSet(stored map[string]int64, current []model.StakingModule) (b
 	sort.Strings(storedList)
 	sort.Strings(currentList)
 	return true, storedList, currentList
+}
+
+// finalizedBlock asks the source for the newest finalized block.
+//
+// A source without the capability, or one that cannot answer right now, yields 0 — which
+// leaves `finalized` unavailable and changes nothing else. It is deliberately not an error:
+// finality is a convenience for consumers who want a pin that cannot be reorged away, and
+// losing it must not stop the loop from syncing.
+func (s *Syncer) finalizedBlock(ctx context.Context) model.ELBlockSnapshot {
+	reporter, ok := s.source.(source.FinalityReporter)
+	if !ok {
+		return model.ELBlockSnapshot{}
+	}
+	block, err := reporter.FinalizedBlock(ctx)
+	if err != nil {
+		s.log.Warn("could not read the finalized block; the finalized pin stays unavailable this cycle", "err", err)
+		return model.ELBlockSnapshot{}
+	}
+	return block
 }
 
 // operatorEvents asks the source whether operator metadata moved in the range.

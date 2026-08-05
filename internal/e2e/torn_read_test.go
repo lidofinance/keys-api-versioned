@@ -49,7 +49,7 @@ func TestAPublishBetweenTwoModuleQueriesCannotStitchAPinnedDump(t *testing.T) {
 					// happens-before, not a race: Publish has committed before the query for
 					// the next module is sent.
 					if !published {
-						if err := staged.Publish(ctx, "latest"); err != nil {
+						if err := staged.Publish(ctx, "latest", 0); err != nil {
 							return err
 						}
 						published = true
@@ -147,7 +147,7 @@ func TestTheNaivePredicateAnswersFromTwoVersionsAtOnce(t *testing.T) {
 		t.Fatalf("a pinned read during an in-flight build was not the published version: %v", err)
 	}
 
-	if err := staged.Publish(ctx, "latest"); err != nil {
+	if err := staged.Publish(ctx, "latest", 0); err != nil {
 		t.Fatalf("publish the staged version: %v", err)
 	}
 }

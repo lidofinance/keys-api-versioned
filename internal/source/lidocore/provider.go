@@ -138,6 +138,20 @@ func (p *Provider) ChainID(ctx context.Context) (int64, error) {
 	return p.client.ChainID(ctx)
 }
 
+// FinalizedBlock reports the newest block the node considers final, which is what makes
+// `?snapshot=finalized` answerable. A header read; never a point state is read at.
+func (p *Provider) FinalizedBlock(ctx context.Context) (model.ELBlockSnapshot, error) {
+	number, hash, timestamp, err := p.client.FinalizedBlock(ctx)
+	if err != nil || number == 0 {
+		return model.ELBlockSnapshot{}, err
+	}
+	return model.ELBlockSnapshot{
+		BlockNumber: number,
+		BlockHash:   strings.ToLower(hash),
+		Timestamp:   timestamp,
+	}, nil
+}
+
 // Head returns the block a cycle should read at.
 func (p *Provider) Head(ctx context.Context) (model.ELBlockSnapshot, error) {
 	number, hash, err := p.client.Head(ctx)
