@@ -29,6 +29,53 @@ func parseOperatorsFilter(r *http.Request) (model.OperatorsFilter, error) {
 	return f, nil
 }
 
+// extOperator is an operator as the extended surface renders it: every canonical
+// field in its canonical order, then the node operator group.
+//
+// A field rather than a whole endpoint, and on /ext/v1 rather than on /v1, because
+// those two surfaces promise different things. /v1 is the canonical service's
+// contract byte for byte — a field it does not send is a difference a parity run
+// would flag and a strict consumer could choke on — while /ext/v1 is where this
+// service's own additions live. A consumer that wants groups changes one prefix.
+//
+// Three states, because two of them are different facts:
+//
+//	field absent      the module has no group registry. Groups do not exist for
+//	                  modules 1–3, and `"groupId": null` there would read as "this
+//	                  operator was left out of one".
+//	"groupId": null   the module has groups and this operator is in none. On chain
+//	                  that is NO_GROUP_ID, which is 0 — a number that names no
+//	                  group, so serving it would be worse than serving nothing.
+//	"groupId": 17     the group the operator belongs to.
+type extOperator struct {
+	model.Operator
+	GroupID *model.GroupID `json:"groupId,omitempty"`
+}
+
+// renderOperators picks the representation for the surface a request came in on.
+//
+// The return is `any` because the two shapes are different types; the alternative,
+// one struct with a flag the marshaller reads, needs a custom MarshalJSON for the
+// whole operator and would put the surface rule somewhere no one looks.
+func renderOperators(r *http.Request, operators []model.Operator) any {
+	if !onExtSurface(r) {
+		return operators
+	}
+	out := make([]extOperator, len(operators))
+	for i := range operators {
+		out[i] = extOperator{Operator: operators[i], GroupID: operators[i].Group}
+	}
+	return out
+}
+
+// renderOperator is renderOperators for the single-operator endpoint.
+func renderOperator(r *http.Request, operator model.Operator) any {
+	if !onExtSurface(r) {
+		return operator
+	}
+	return extOperator{Operator: operator, GroupID: operator.Group}
+}
+
 // operatorsOf reads one module's operators, mapping the "this backend has none"
 // case to a 501 rather than an empty list.
 func operatorsOf(ctx context.Context, snap store.Snapshot, moduleAddress string, f model.OperatorsFilter) ([]model.Operator, error) {
@@ -45,7 +92,7 @@ func operatorsOf(ctx context.Context, snap store.Snapshot, moduleAddress string,
 // handleOperators returns every module's operators, grouped by module.
 func (s *Server) handleOperators(w http.ResponseWriter, r *http.Request) {
 	type group struct {
-		Operators []model.Operator    `json:"operators"`
+		Operators any                 `json:"operators"`
 		Module    model.StakingModule `json:"module"`
 	}
 	type response struct {
@@ -77,7 +124,7 @@ func (s *Server) handleOperators(w http.ResponseWriter, r *http.Request) {
 			if err != nil {
 				return err
 			}
-			out.Data = append(out.Data, group{Operators: operators, Module: modules[i]})
+			out.Data = append(out.Data, group{Operators: renderOperators(r, operators), Module: modules[i]})
 		}
 
 		return writeJSON(w, out)
@@ -90,7 +137,7 @@ func (s *Server) handleOperators(w http.ResponseWriter, r *http.Request) {
 // handleModuleOperators returns one module's operators.
 func (s *Server) handleModuleOperators(w http.ResponseWriter, r *http.Request) {
 	type data struct {
-		Operators []model.Operator    `json:"operators"`
+		Operators any                 `json:"operators"`
 		Module    model.StakingModule `json:"module"`
 	}
 	type response struct {
@@ -129,7 +176,7 @@ func (s *Server) handleModuleOperators(w http.ResponseWriter, r *http.Request) {
 		}
 
 		return writeJSON(w, response{
-			Data: data{Operators: operators, Module: *module},
+			Data: data{Operators: renderOperators(r, operators), Module: *module},
 			Meta: meta{ELBlockSnapshot: elMeta},
 		})
 	})
@@ -141,7 +188,7 @@ func (s *Server) handleModuleOperators(w http.ResponseWriter, r *http.Request) {
 // handleModuleOperator returns one operator of one module.
 func (s *Server) handleModuleOperator(w http.ResponseWriter, r *http.Request) {
 	type data struct {
-		Operator model.Operator      `json:"operator"`
+		Operator any                 `json:"operator"`
 		Module   model.StakingModule `json:"module"`
 	}
 	type response struct {
@@ -193,7 +240,7 @@ func (s *Server) handleModuleOperator(w http.ResponseWriter, r *http.Request) {
 		}
 
 		return writeJSON(w, response{
-			Data: data{Operator: operators[0], Module: *module},
+			Data: data{Operator: renderOperator(r, operators[0]), Module: *module},
 			Meta: meta{ELBlockSnapshot: elMeta},
 		})
 	})

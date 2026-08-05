@@ -76,7 +76,7 @@ func (s *Server) handleModuleOperatorsKeys(w http.ResponseWriter, r *http.Reques
 		bw.WriteString(`}, "data": { "module": `)
 		bw.Write(marshalCompact(module))
 		bw.WriteString(`, "operators": `)
-		bw.Write(marshalCompact(operators))
+		bw.Write(marshalCompact(renderOperators(r, operators)))
 		bw.WriteString(`, "keys": [`)
 
 		first := true
@@ -172,7 +172,7 @@ func (s *Server) handleModulesOperatorsKeysStream(w http.ResponseWriter, r *http
 			for j := range operators {
 				next()
 				bw.WriteString(`{"stakingModule":null,"meta":null,"key":null,"operator":`)
-				bw.Write(marshalCompact(operators[j]))
+				bw.Write(marshalCompact(renderOperator(r, operators[j])))
 				bw.WriteByte('}')
 			}
 		}

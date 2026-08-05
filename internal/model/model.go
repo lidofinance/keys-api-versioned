@@ -8,6 +8,7 @@ package model
 
 import (
 	"encoding/hex"
+	"strconv"
 	"strings"
 )
 
@@ -78,6 +79,35 @@ type Operator struct {
 	DepositableValidatorsCount int32  `json:"depositableValidatorsCount"`
 
 	FinalizedUsedSigningKeys int32 `json:"-"`
+
+	// Group is the node operator group this operator belongs to, read from the
+	// module's MetaRegistry. Nil means the module has no group registry at all,
+	// which is the case for every module except curated-onchain-v2.
+	//
+	// Untagged for the same reason FinalizedUsedSigningKeys is: the canonical
+	// Operator DTO has no such field, and /v1 and /v2 have to stay byte-identical
+	// to it. The extended surface renders it — see api.extOperator.
+	Group *GroupID `json:"-"`
+}
+
+// NoGroupID is the MetaRegistry's sentinel for "this operator is in no group".
+// It is a real value on chain and it is literally zero, so it cannot also be a
+// group id — see MetaRegistry.NO_GROUP_ID in the community-staking-module repo.
+const NoGroupID GroupID = 0
+
+// GroupID is a node operator group id as the extended surface renders it: the
+// number, or null for an operator that belongs to no group.
+//
+// Null rather than 0 because 0 names no group and serving it would invite a
+// consumer to group every ungrouped operator together under it.
+type GroupID int32
+
+// MarshalJSON renders the sentinel as null and everything else as the number.
+func (g GroupID) MarshalJSON() ([]byte, error) {
+	if g == NoGroupID {
+		return []byte("null"), nil
+	}
+	return strconv.AppendInt(nil, int64(g), 10), nil
 }
 
 // ELBlockSnapshot describes the execution layer block the data is consistent with.

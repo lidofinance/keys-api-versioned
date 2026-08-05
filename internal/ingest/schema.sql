@@ -1,6 +1,17 @@
--- Schema for the versioned registry this service owns. Applied on every boot;
--- every statement is idempotent, so there is no migration tool and no migration
--- state to get wrong.
+-- Schema for the versioned registry this service owns. Applied on every boot.
+--
+-- There is no migration tool and there will not be one: when this file changes, the
+-- schema is dropped and rebuilt. Everything in it is derived from the chain, a cold sync
+-- is 14 s on Hoodi and 49 s on mainnet, and migrating a cache costs more than refilling
+-- it. See Migrate in pgstore.go.
+--
+-- The alternative was tried for one column and is instructive. `create table if not
+-- exists` does nothing to a table that already exists, so an added column needs an
+-- `alter`, and an `alter … add column … default 0` leaves old rows carrying a value the
+-- writer never wrote: versions from before the change reported finalized block 0, which
+-- reads as "finality unknown" rather than "this predates the column". The shape was right
+-- and the meaning was wrong. A rename or a type change cannot be written idempotently at
+-- all, so the approach only ever covers the easy half.
 --
 -- The shape is one `versions` table plus three data tables. A version's status
 -- decides whether readers can see it; a data row says which block range it was
@@ -23,6 +34,14 @@
 -- saturated. Small tables keep readable text — twenty version rows are not worth
 -- losing psql legibility over.
 
+-- What layout the schema was last built from. When it stops matching the embedded file,
+-- the schema is dropped and rebuilt rather than migrated — see Migrate in pgstore.go.
+create table if not exists schema_fingerprint (
+    id          smallint    primary key default 1 check (id = 1),
+    fingerprint text        not null,
+    applied_at  timestamptz not null default now()
+);
+
 create table if not exists versions (
     id                      bigserial primary key,
     -- The block the data was read at. This is the version's identity and it never
@@ -38,6 +57,19 @@ create table if not exists versions (
     head_block_number       bigint      not null default 0,
     head_block_hash         varchar(66) not null default '',
     head_timestamp          bigint      not null default 0,
+    -- The newest finalized block observed when this version was last confirmed. Moves
+    -- with the head, for the same reason: it is an observation about the chain, not part
+    -- of the version's identity.
+    --
+    -- It exists so `?snapshot=finalized` can be answered by a predicate — the newest published
+    -- version at or below it — instead of by a label somebody has to keep moving. A
+    -- version at or below a finalized block cannot be superseded, which is the whole
+    -- point of the pin: it never answers 409.
+    --
+    -- 0 means the source reports no finality (a file, a devnet before its first
+    -- finalization, a node without the tag). The pin is then unavailable rather than
+    -- guessed at.
+    finalized_block_number  bigint      not null default 0,
     last_changed_block_hash varchar(66) not null,
     label                   text        not null default 'latest',
     -- building → published → (stale) → superseded. The status change is what makes
@@ -97,6 +129,12 @@ create table if not exists operator_version (
     total_signing_keys           int          not null,
     used_signing_keys            int          not null,
     depositable_validators_count int          not null,
+    -- The node operator group, as the module's MetaRegistry reports it. Null where
+    -- the module has no such registry, which is every module but curated-onchain-v2:
+    -- the concept does not exist there, and storing 0 would be indistinguishable
+    -- from the registry's NO_GROUP_ID sentinel, which does exist and means "in no
+    -- group". Two different facts, so two different values.
+    group_id                     int,
     from_block                   bigint       not null,
     to_block                     bigint
 );

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"os"
+	"strings"
 	"testing"
 
 	"github.com/lidofinance/keys-api-versioned/internal/ingest"
@@ -80,7 +81,7 @@ func TestWriterVersionsAndDiff(t *testing.T) {
 			t.Fatalf("module row: %v", err)
 		}
 	}
-	if err := build.Publish(ctx, "latest"); err != nil {
+	if err := build.Publish(ctx, "latest", 0); err != nil {
 		t.Fatalf("publish v2: %v", err)
 	}
 
@@ -352,5 +353,108 @@ func TestADSNWithASearchPathKeepsIt(t *testing.T) {
 
 	if got := db.Writer.Schema(); got != "" {
 		t.Errorf("the store derived schema %q from a DSN that already named one", got)
+	}
+}
+
+// TestASchemaChangeRebuildsRatherThanMigrates pins the policy: this store is a cache, so
+// a layout change drops and refills it instead of being migrated.
+//
+// The alternative was tried once and is what motivated this. Adding a column with
+// `alter … default 0` left older rows carrying a value the writer never writes — the
+// shape was right and the meaning was wrong. A rebuild cannot produce a halfway state,
+// because every row comes from the same writer that would write it today.
+func TestASchemaChangeRebuildsRatherThanMigrates(t *testing.T) {
+	dsn := os.Getenv("TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("set TEST_DATABASE_URL to run tests that need Postgres")
+	}
+	ctx := context.Background()
+
+	const chainID = 990003
+	schema := "chain_990003"
+
+	t.Cleanup(func() {
+		admin, err := pgxpool.New(context.Background(), dsn)
+		if err != nil {
+			return
+		}
+		defer admin.Close()
+		_, _ = admin.Exec(context.Background(), `drop schema if exists `+schema+` cascade`)
+	})
+
+	open := func() *ingest.PGStore {
+		t.Helper()
+		s, err := ingest.NewPGStore(ctx, dsn, ingest.PGOptions{ChainID: chainID, Source: "test"})
+		if err != nil {
+			t.Fatalf("open: %v", err)
+		}
+		if err := s.Migrate(ctx); err != nil {
+			t.Fatalf("migrate: %v", err)
+		}
+		return s
+	}
+
+	first := open()
+	spec := testreg.Spec{Modules: 1, OperatorsPerModule: 1, KeysPerOperator: 3}
+	at := testreg.At(7_000_001)
+	spec.Publish(ctx, t, first, at)
+
+	held, err := first.Latest(ctx)
+	if err != nil || held == nil {
+		t.Fatalf("the version was not written: %+v %v", held, err)
+	}
+	first.Close()
+
+	// Reopening with the same layout must not touch anything: a rebuild on every boot
+	// would make the policy unusable, and this is the assertion that would catch it.
+	second := open()
+	stillThere, err := second.Latest(ctx)
+	if err != nil {
+		t.Fatalf("latest after an unchanged reopen: %v", err)
+	}
+	if stillThere == nil || stillThere.BlockNumber != at.BlockNumber {
+		t.Fatalf("reopening with an unchanged schema lost the store: %+v", stillThere)
+	}
+	second.Close()
+
+	// Now say the layout changed, by writing a fingerprint no build will ever produce.
+	separator := "?"
+	if strings.Contains(dsn, "?") {
+		separator = "&"
+	}
+	admin, err := pgxpool.New(ctx, dsn+separator+"search_path="+schema)
+	if err != nil {
+		t.Fatalf("admin pool: %v", err)
+	}
+	if _, err := admin.Exec(ctx,
+		`update schema_fingerprint set fingerprint = 'a-layout-from-another-binary' where id = 1`); err != nil {
+		admin.Close()
+		t.Fatalf("age the fingerprint: %v", err)
+	}
+	admin.Close()
+
+	third := open()
+	defer third.Close()
+	rebuilt, err := third.Latest(ctx)
+	if err != nil {
+		t.Fatalf("latest after the rebuild: %v", err)
+	}
+	if rebuilt != nil {
+		t.Errorf("the store survived a layout change at version %d; it has to be rebuilt, "+
+			"not migrated", rebuilt.BlockNumber)
+	}
+}
+
+// A comment is not a layout. The reasoning in schema.sql is edited often and a resync per
+// typo would teach people to stop writing it.
+func TestCommentsDoNotCountAsASchemaChange(t *testing.T) {
+	layout := "create table t (\n    a int -- trailing\n);\n"
+	commented := "-- a new paragraph of reasoning\n--\n-- and more\ncreate table t (\n\n    a int -- a different trailing note\n);\n"
+
+	if ingest.SchemaFingerprintForTest(layout) != ingest.SchemaFingerprintForTest(commented) {
+		t.Error("editing comments changed the fingerprint, so every comment costs a full resync")
+	}
+	if ingest.SchemaFingerprintForTest(layout) == ingest.SchemaFingerprintForTest("create table t (\n    a bigint\n);\n") {
+		t.Error("changing a column type did not change the fingerprint")
 	}
 }

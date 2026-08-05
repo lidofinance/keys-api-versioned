@@ -322,3 +322,118 @@ func readBody(t *testing.T, resp *http.Response) string {
 	}
 	return string(buf)
 }
+
+// TestTheFinalizedPinResolvesToTheNewestFinalizedVersion is the pin that was documented and did not
+// work: it was called `safe`, the query was `label = 'safe'`, and nothing ever wrote the
+// label — so a consumer
+// asking for it got 425 "not ready" forever.
+//
+// What it has to be instead is the newest published version at or below the finalized
+// block — a version a reorg cannot take away. The assertions are about that boundary, not
+// about a label.
+func TestTheFinalizedPinResolvesToTheNewestFinalizedVersion(t *testing.T) {
+	db := testpg.New(t)
+	ctx := context.Background()
+
+	spec := testreg.Spec{Modules: 1, OperatorsPerModule: 1, KeysPerOperator: 4}
+
+	final := testreg.At(db.Block(10))
+	spec.PublishFinal(ctx, t, db.Writer, final, final.BlockNumber)
+
+	// Two more versions above finality, with different content so "which version
+	// answered" is visible in the body rather than only in the meta.
+	spec.WithSalt(1).PublishFinal(ctx, t, db.Writer, testreg.At(db.Block(11)), final.BlockNumber)
+	spec.WithSalt(2).PublishFinal(ctx, t, db.Writer, testreg.At(db.Block(12)), final.BlockNumber)
+
+	srv := testpg.NewServer(t, db.Reader(t, "latest", 3))
+
+	safe := srv.Get(t, "/ext/v1/keys?snapshot=finalized")
+	defer safe.Body.Close()
+	if safe.StatusCode != http.StatusOK {
+		t.Fatalf("GET ?snapshot=finalized: status %d, want 200 — body %s", safe.StatusCode, readBody(t, safe))
+	}
+	verifier := testreg.NewVerifier(spec)
+	if _, err := verifier.V1Keys(safe.Body); err != nil {
+		t.Fatalf("the finalized pin did not answer from the finalized version: %v", err)
+	}
+	if err := verifier.Done(); err != nil {
+		t.Fatalf("the finalized pin answered from a version above the finalized block: %v", err)
+	}
+
+	// The control: latest is a different version. Without it this would pass on a
+	// service where the pin simply aliased latest and finality meant nothing.
+	head := srv.Get(t, "/v1/keys")
+	defer head.Body.Close()
+	if _, err := testreg.NewVerifier(spec.WithSalt(2)).V1Keys(head.Body); err != nil {
+		t.Errorf("latest is not the newest version, so finalized and latest cannot be told apart: %v", err)
+	}
+}
+
+// A source with no finality must say so rather than look unready. A store fed from a file
+// will never produce a finalized version, and 425 would have a consumer retry forever.
+func TestTheFinalizedPinWithoutFinalityIsUnsupportedRatherThanTooEarly(t *testing.T) {
+	db := testpg.New(t)
+	ctx := context.Background()
+
+	spec := testreg.Spec{Modules: 1, OperatorsPerModule: 1, KeysPerOperator: 3}
+	// Publish, not PublishFinal: a version exists, no finalized block was ever recorded.
+	spec.Publish(ctx, t, db.Writer, testreg.At(db.Block(0)))
+
+	srv := testpg.NewServer(t, db.Reader(t, "latest", 2))
+
+	resp := srv.Get(t, "/ext/v1/keys?snapshot=finalized")
+	body := readBody(t, resp)
+	if resp.StatusCode != http.StatusNotImplemented {
+		t.Errorf("?snapshot=finalized with no finality recorded: status %d, want 501 — body %s",
+			resp.StatusCode, body)
+	}
+	if !strings.Contains(body, "finality") {
+		t.Errorf("the body does not say what is missing: %s", body)
+	}
+}
+
+// Retention counts versions and finality is measured in time, so the finalized version drifts
+// towards the edge of the window on its own. Pruning it would break the one pin whose
+// promise is that it stays put, so retention holds for it exactly as it holds for a
+// reader's lease.
+func TestRetentionDoesNotPruneTheFinalizedVersion(t *testing.T) {
+	testpg.Exclusive(t)
+
+	db := testpg.New(t)
+	ctx := context.Background()
+
+	spec := testreg.Spec{Modules: 1, OperatorsPerModule: 1, KeysPerOperator: 4}
+	final := testreg.At(db.Block(0))
+	spec.PublishFinal(ctx, t, db.Writer, final, final.BlockNumber)
+
+	// Newer versions, all above finality.
+	for i := 1; i <= 3; i++ {
+		spec.WithSalt(uint64(i)).PublishFinal(ctx, t, db.Writer, testreg.At(db.Block(int64(i))), final.BlockNumber)
+	}
+
+	// A window of one would drop everything below the newest version — including the
+	// finalized one.
+	pruned, err := db.Writer.Prune(ctx, 1)
+	if err != nil {
+		t.Fatalf("prune: %v", err)
+	}
+	if pruned.HeldAt != final.BlockNumber {
+		t.Errorf("Pruned.HeldAt = %d, want %d: retention did not recognise the finalized version",
+			pruned.HeldAt, final.BlockNumber)
+	}
+
+	srv := testpg.NewServer(t, db.Reader(t, "latest", 2))
+	resp := srv.Get(t, "/ext/v1/keys?snapshot=finalized")
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("the finalized pin after retention ran: status %d, want 200 — the version it names was pruned",
+			resp.StatusCode)
+	}
+	verifier := testreg.NewVerifier(spec)
+	if _, err := verifier.V1Keys(resp.Body); err != nil {
+		t.Fatalf("the finalized pin no longer answers its own version: %v", err)
+	}
+	if err := verifier.Done(); err != nil {
+		t.Fatalf("the finalized pin answered something else after retention: %v", err)
+	}
+}

@@ -41,7 +41,7 @@ func (a *App) logger() *slog.Logger {
 	return a.Log
 }
 
-// NewApp connects to the app schema with a default pin ("latest", "safe", a block
+// NewApp connects to the app schema with a default pin ("latest", "finalized", a block
 // number or a block hash).
 func NewApp(ctx context.Context, dsn string, maxConns int32, pin string) (*App, error) {
 	cfg, err := pgxpool.ParseConfig(dsn)
@@ -144,10 +144,31 @@ func resolveAppPin(ctx context.Context, conn pinReader, pin string) (*model.ELBl
 		q = `select ` + appVersionCols + ` from versions
 		     where status in ('` + StatusPublished + `', '` + StatusStale + `')
 		     order by id desc limit 1`
-	case pin == "safe":
-		// safe exists to not flap: it never resolves to a version we distrust.
+	case pin == "finalized":
+		// The newest published version at or below the finalized block.
+		//
+		// Resolved by predicate rather than by a label, and that is the difference
+		// between a pin that works and one that does not. A label has to be moved by
+		// the writer as finality advances — an extra write every cycle and a race over
+		// which row currently holds it. Before this the pin was called `safe`, the query
+		// was `label = 'safe'`, and nothing ever set the label, so a documented pin
+		// answered 425 "not ready" forever.
+		//
+		// It is `finalized` and not `safe` because those are different blocks in the
+		// execution layer's own vocabulary: `safe` is the justified checkpoint and
+		// `finalized` is the finalized one. Naming this after the wrong tag would tell a
+		// consumer something untrue about what it is holding.
+		//
+		// What a consumer gets for it: a version a reorg cannot take away, by
+		// definition of finality. `finalized` therefore never answers 409, which is the
+		// property the pin exists for — `latest` can and does.
+		//
+		// The finalized block is read from the newest version's observation of it, not
+		// from a chain call: the store is what the reader has, and a read replica has no
+		// node of its own.
 		q = `select ` + appVersionCols + ` from versions
-		     where status = '` + StatusPublished + `' and label = 'safe'
+		     where status in ('` + StatusPublished + `', '` + StatusStale + `')
+		       and block_number <= (select max(finalized_block_number) from versions)
 		     order by id desc limit 1`
 	case strings.HasPrefix(pin, "0x"):
 		// Exact version. The only pin that survives a reorg unambiguously: a height
@@ -158,7 +179,7 @@ func resolveAppPin(ctx context.Context, conn pinReader, pin string) (*model.ELBl
 		n, err := strconv.ParseInt(pin, 10, 64)
 		if err != nil {
 			return nil, 0, 0, "", ErrBadRequest{
-				What: "snapshot must be latest, safe, a block number or a block hash",
+				What: "snapshot must be latest, finalized, a block number or a block hash",
 				Ref:  pin,
 			}
 		}
@@ -176,7 +197,10 @@ func resolveAppPin(ctx context.Context, conn pinReader, pin string) (*model.ELBl
 	err := conn.QueryRow(ctx, q, arg...).Scan(&versionID, &pinBlock, &m.BlockNumber, &m.BlockHash,
 		&m.Timestamp, &m.LastChangedBlockHash, &status)
 	if errors.Is(err, pgx.ErrNoRows) {
-		if pin == "latest" || pin == "safe" {
+		if pin == "finalized" {
+			return nil, 0, 0, "", classifyMissingFinalizedPin(ctx, conn)
+		}
+		if pin == "latest" {
 			// Nothing published yet: the canonical 425 case.
 			return nil, 0, 0, "", nil
 		}
@@ -203,6 +227,30 @@ func resolveAppPin(ctx context.Context, conn pinReader, pin string) (*model.ELBl
 	return &m, versionID, pinBlock, status, nil
 }
 
+// classifyMissingFinalizedPin tells "this source has no finality" apart from "not yet".
+//
+// They need different answers. A store fed from a file, a devnet before its first
+// finalization, or a node without the tag will never produce a safe version, and
+// answering 425 "too early" would have a consumer retry forever. A store whose versions
+// are simply all newer than the finalized block genuinely is too early — finality catches
+// up on its own.
+func classifyMissingFinalizedPin(ctx context.Context, conn pinReader) error {
+	var (
+		versions  int64
+		finalized int64
+	)
+	if err := conn.QueryRow(ctx,
+		`select count(*), coalesce(max(finalized_block_number), 0) from versions`).
+		Scan(&versions, &finalized); err != nil {
+		return fmt.Errorf("classify finalized: %w", err)
+	}
+	if versions > 0 && finalized == 0 {
+		return ErrNotImplemented{What: "?snapshot=finalized: this source reports no finality"}
+	}
+	// Nothing published, or nothing final yet. Both are the 425 case.
+	return nil
+}
+
 func classifyMissingAppPin(ctx context.Context, conn pinReader, pin string) error {
 	var oldest int64
 	if err := conn.QueryRow(ctx, `select coalesce(min(block_number), 0) from versions`).Scan(&oldest); err != nil {
@@ -226,7 +274,7 @@ func classifyMissingAppPin(ctx context.Context, conn pinReader, pin string) erro
 	n, err := strconv.ParseInt(pin, 10, 64)
 	if err != nil {
 		return ErrBadRequest{
-			What: "snapshot must be latest, safe, a block number or a block hash",
+			What: "snapshot must be latest, finalized, a block number or a block hash",
 			Ref:  pin,
 		}
 	}
@@ -569,7 +617,7 @@ func (s *appSnapshot) KeysByPubkeys(ctx context.Context, moduleAddress string, p
 }
 
 const appOperatorCols = `operator_index, active, name, reward_address, staking_limit,
-	stopped_validators, total_signing_keys, used_signing_keys, depositable_validators_count`
+	stopped_validators, total_signing_keys, used_signing_keys, depositable_validators_count, group_id`
 
 // Operators returns a module's operators at the pinned version.
 func (s *appSnapshot) Operators(ctx context.Context, moduleAddress string, f model.OperatorsFilter) ([]model.Operator, error) {
@@ -601,11 +649,18 @@ func (s *appSnapshot) Operators(ctx context.Context, moduleAddress string, f mod
 		var (
 			o      model.Operator
 			reward []byte
+			group  *int32
 		)
 		if err := rows.Scan(&o.Index, &o.Active, &o.Name, &reward, &o.StakingLimit,
 			&o.StoppedValidators, &o.TotalSigningKeys, &o.UsedSigningKeys,
-			&o.DepositableValidatorsCount); err != nil {
+			&o.DepositableValidatorsCount, &group); err != nil {
 			return nil, fmt.Errorf("scan operator: %w", err)
+		}
+		// A null column is a module without groups, and it stays nil all the way to
+		// the renderer, which then omits the field rather than serving a number.
+		if group != nil {
+			id := model.GroupID(*group)
+			o.Group = &id
 		}
 		o.RewardAddress = ethaddr.Checksum(model.EncodeHex(reward))
 		o.ModuleAddress = checksummed

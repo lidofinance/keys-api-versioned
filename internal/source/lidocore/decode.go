@@ -146,6 +146,14 @@ func depositableFromSummary(values []any) int64 {
 }
 
 // metadataName picks the name out of the MetaRegistry metadata struct.
+// firstValue is the single return of a one-output call, or nil for an empty result.
+func firstValue(values []any) any {
+	if len(values) == 0 {
+		return nil
+	}
+	return values[0]
+}
+
 func metadataName(values []any) string {
 	if len(values) == 0 {
 		return ""

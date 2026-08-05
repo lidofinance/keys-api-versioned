@@ -22,6 +22,14 @@
 //	UPDATE_KEYS_INTERVAL_MS           cycle interval (default 5000)
 //	MAX_BLOCKS_OVERLAP                full audit re-read when this far behind (default 1000)
 //	RETAIN_VERSIONS                   retention window in versions (default 20)
+//	KEYS_API_BUILD_AT_FINALIZED       read the registry at the finalized block instead of
+//	                                  the head (default false); costs ~13 min of freshness
+//	                                  and buys versions a reorg cannot take away
+//	KEYS_API_PIN                      default pin on /v1 and /v2: latest (default) or
+//	                                  finalized
+//	KEYS_API_EXT_PIN                  default pin on /ext/v1: finalized (default, latest
+//	                                  for a source with no finality), overridden per
+//	                                  request by ?snapshot=
 //	PROVIDER_JSON_RPC_MAX_BATCH_SIZE  calls per JSON-RPC request (default 100)
 //	PROVIDER_CONCURRENT_REQUESTS      in-flight requests (default 8)
 //	KEYS_BATCH_SIZE                   keys per contract call (default 1100)
@@ -107,6 +115,20 @@ func run(log *slog.Logger) error {
 		return errors.New("DATABASE_URL is required")
 	}
 
+	// The two serving defaults, resolved before anything starts: a pin that does not
+	// parse would otherwise answer 400 to every request, which reads like a client
+	// problem rather than a deployment one.
+	var pin, extPin string
+	if mode != "ingest" {
+		var err error
+		if pin, err = pinOption("KEYS_API_PIN", "latest"); err != nil {
+			return err
+		}
+		if extPin, err = pinOption("KEYS_API_EXT_PIN", defaultExtPin(envOr("KEYS_API_SOURCE", "lido-core"))); err != nil {
+			return err
+		}
+	}
+
 	m := metrics.New("keys_api")
 
 	chainID := int64(envInt("CHAIN_ID", 1))
@@ -142,7 +164,10 @@ func run(log *slog.Logger) error {
 
 	log.Info("keys-api starting",
 		"mode", mode, "source", envOr("KEYS_API_SOURCE", "lido-core"),
-		"app_version", appVersion, "providers", redactedProviders())
+		"app_version", appVersion, "providers", redactedProviders(),
+		// Which version each surface serves by default is the first thing to check when
+		// a consumer reports data older than its own node's head.
+		"pin", pin, "ext_pin", extPin)
 
 	// The schema is applied by whoever writes. A read-only replica does not create
 	// tables — if they are missing, that is a deployment order problem and it should
@@ -176,6 +201,10 @@ func run(log *slog.Logger) error {
 			Interval:       time.Duration(envInt("UPDATE_KEYS_INTERVAL_MS", 5000)) * time.Millisecond,
 			MaxBlockGap:    int64(envInt("MAX_BLOCKS_OVERLAP", 1000)),
 			RetainVersions: envInt("RETAIN_VERSIONS", 20),
+			// Default head, so upgrading changes nothing a consumer can see. Flipping
+			// this is what a deployment does when it wants data that cannot be reorged
+			// away and can afford to be a finality behind.
+			BuildAtFinalized: envBool("KEYS_API_BUILD_AT_FINALIZED", false),
 		}, log)
 		syncer.OnCycle = func(r ingest.CycleResult) { observeCycle(m, r) }
 	}
@@ -195,11 +224,12 @@ func run(log *slog.Logger) error {
 	var server *http.Server
 	if mode != "ingest" {
 		// The reader shares the writer's pool: one process, one set of connections.
-		reader := store.NewAppWithPool(pgStore.Pool(), envOr("KEYS_API_PIN", "latest"))
+		reader := store.NewAppWithPool(pgStore.Pool(), pin)
 		reader.Log = log
 		handler := api.New(reader, api.Config{
 			ChainID:        chainID,
 			AppVersion:     appVersion,
+			ExtPin:         extPin,
 			Log:            log,
 			MetricsHandler: m.Handler(),
 			Observe:        m.ObserveRequest,
@@ -401,6 +431,34 @@ func envOr(key, def string) string {
 		return v
 	}
 	return def
+}
+
+// pinOption reads a surface's default pin and accepts only a label.
+//
+// A block number or a hash is a reasonable pin for one request and a bad one for a whole
+// deployment: retention deletes that version within minutes and the service would then
+// answer 410 to everything. A misspelt label is worth refusing here too — as a default it
+// turns every request into a 400 about a value the consumer never sent.
+func pinOption(name, def string) (string, error) {
+	pin := envOr(name, def)
+	if pin != "latest" && pin != "finalized" {
+		return "", fmt.Errorf("%s must be latest or finalized, got %q", name, pin)
+	}
+	return pin, nil
+}
+
+// defaultExtPin is the pin /ext/v1 serves from when the deployment does not say.
+//
+// finalized, except for a source that cannot produce it: a file-backed registry records
+// no finalized block ever, and there the pin answers 501 by design. Defaulting to it
+// would take the whole extended surface down over a value the operator did not choose,
+// so that source falls back to the head — where the file's contents are, in any case,
+// the only thing there is.
+func defaultExtPin(source string) string {
+	if source == "static" {
+		return "latest"
+	}
+	return "finalized"
 }
 
 func envInt(key string, def int) int {

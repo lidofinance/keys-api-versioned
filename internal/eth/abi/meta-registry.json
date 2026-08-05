@@ -16,5 +16,12 @@
     ],
     "stateMutability": "view",
     "type": "function"
+  },
+  {
+    "inputs": [{ "internalType": "uint256", "name": "nodeOperatorId", "type": "uint256" }],
+    "name": "getNodeOperatorGroupId",
+    "outputs": [{ "internalType": "uint256", "name": "operatorGroupId", "type": "uint256" }],
+    "stateMutability": "view",
+    "type": "function"
   }
 ]

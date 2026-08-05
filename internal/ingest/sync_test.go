@@ -401,7 +401,7 @@ func (s *fakeStore) Begin(_ context.Context, at model.ELBlockSnapshot) (Build, e
 // block is its identity and never moves. Modelling it the other way made the reorg
 // walk probe the head instead of the version's own height, which is the difference
 // between finding the fork point and not.
-func (s *fakeStore) Extend(_ context.Context, v StoredVersion, at model.ELBlockSnapshot, nonces map[string]int64) error {
+func (s *fakeStore) Extend(_ context.Context, v StoredVersion, at model.ELBlockSnapshot, nonces map[string]int64, finalized int64) error {
 	s.extends++
 	v.HeadBlockNumber = at.BlockNumber
 	v.HeadBlockHash = at.BlockHash
@@ -473,14 +473,15 @@ func (b *fakeBuild) Module(_ context.Context, m model.StakingModule, _ bool) err
 	return nil
 }
 
-func (b *fakeBuild) Publish(_ context.Context, label string) error {
+func (b *fakeBuild) Publish(_ context.Context, label string, finalized int64) error {
 	v := StoredVersion{
-		ID:           b.id,
-		BlockNumber:  b.at.BlockNumber,
-		BlockHash:    b.at.BlockHash,
-		Label:        label,
-		Status:       StatusPublished,
-		ModuleNonces: b.nonces,
+		ID:                   b.id,
+		BlockNumber:          b.at.BlockNumber,
+		BlockHash:            b.at.BlockHash,
+		Label:                label,
+		Status:               StatusPublished,
+		FinalizedBlockNumber: finalized,
+		ModuleNonces:         b.nonces,
 	}
 	b.store.published = append(b.store.published, v)
 	b.store.latest = &v

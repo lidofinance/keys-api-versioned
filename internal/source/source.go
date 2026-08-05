@@ -96,6 +96,25 @@ type ChainIdentifier interface {
 	ChainID(ctx context.Context) (int64, error)
 }
 
+// FinalityReporter is an optional Provider capability: the newest block that cannot be
+// reorged away. It is what makes `?snapshot=finalized` answerable — a version at or below it
+// will never be superseded, so a consumer that pins there never has to handle a 409.
+//
+// Optional because not every source has the notion. A registry read from a file has no
+// finality, and a source that returns 0 simply leaves the pin unavailable rather than
+// inventing an answer.
+//
+// It is a block a cycle may legitimately read at — KEYS_API_BUILD_AT=finalized does
+// exactly that, and reading everything at one finalized hash is as consistent as reading
+// everything at one head hash. What is forbidden is *mixing*: taking counters at one
+// block and a count at a floating tag in the same cycle is how the canonical service
+// broke the invariant between its own deposited counters.
+type FinalityReporter interface {
+	// FinalizedBlock returns the newest block that cannot be reorged away. A zero
+	// BlockNumber means the source has no finality to report.
+	FinalizedBlock(ctx context.Context) (model.ELBlockSnapshot, error)
+}
+
 // Ref identifies the point a read happens at. A hash pins the branch; a height
 // alone does not, so the sync loop always carries the hash.
 type Ref struct {

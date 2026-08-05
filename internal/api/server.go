@@ -31,7 +31,19 @@ import (
 type Config struct {
 	ChainID    int64
 	AppVersion string
-	Log        *slog.Logger
+	// ExtPin is the pin an /ext/v1 request without `?snapshot=` is served from. Empty
+	// means the store's own default, which is what the canonical surface always uses.
+	//
+	// The default belongs to the surface rather than to the process because the two
+	// surfaces promise different things. /v1 and /v2 promise a consumer cannot tell this
+	// service from the canonical one, and the canonical one reads the registry at the
+	// head — `getBlock('latest')` in its keys-update job — so anything but the head
+	// there would be a difference in content, invisible in the framing and impossible to
+	// opt out of, since /v1 ignores `?snapshot=` by that same promise. /ext/v1 promises
+	// nothing of the sort, so it can default to the version a reorg cannot take away and
+	// let a consumer ask for the head explicitly.
+	ExtPin string
+	Log    *slog.Logger
 	// MetricsHandler is mounted at /metrics when set, and Observe receives one call
 	// per served request. The API depends on neither a metrics library nor a
 	// registry; the app passes both in.
@@ -153,7 +165,9 @@ func (s *Server) Handler() http.Handler {
 }
 
 // snapshot resolves the version one request is served from: the pin in
-// ?snapshot=<latest|safe|block|hash> when given, otherwise the configured default.
+// ?snapshot=<latest|finalized|block|hash> when given, otherwise the default for the
+// surface the request came in on — Config.ExtPin under /ext/v1, the store's own pin
+// under /v1 and /v2.
 //
 // An explicit pin is what lets a consumer make several requests against one
 // version — a dump and then a follow-up query — and get a definite answer if that
@@ -172,6 +186,12 @@ func (s *Server) snapshot(ctx context.Context, r *http.Request, fn func(store.Sn
 // snapshotAt is snapshot with the pin decided by the caller, which paging needs: a
 // page follows the version named by its cursor rather than whatever is current now.
 func (s *Server) snapshotAt(ctx context.Context, r *http.Request, pin string, fn func(store.Snapshot) error) error {
+	// The surface default applies only when nothing more specific was decided — an
+	// explicit `?snapshot=` or, for a paged walk, the version the cursor names. Both
+	// arrive here as a non-empty pin, so both keep winning over it.
+	if pin == "" && onExtSurface(r) {
+		pin = s.cfg.ExtPin
+	}
 	if pin == "" {
 		return s.store.Snapshot(ctx, fn)
 	}

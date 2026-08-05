@@ -42,13 +42,25 @@ type Server struct {
 
 // NewServer starts the API over a store, on HTTP/1.1 so that the framing a test
 // asserts on — chunked, and an abort in the middle of it — is deterministic.
+//
+// Both surfaces serve the store's own pin, so a test says what it means about pins in the
+// request rather than inheriting a deployment's choice. NewServerWithExtPin is for the
+// tests that are about that choice.
 func NewServer(tb testing.TB, s store.Store) *Server {
+	tb.Helper()
+	return NewServerWithExtPin(tb, s, "")
+}
+
+// NewServerWithExtPin starts the API with a default pin for the extended surface, the way
+// a deployment configures /ext/v1 to serve finalized while /v1 stays on the head.
+func NewServerWithExtPin(tb testing.TB, s store.Store, extPin string) *Server {
 	tb.Helper()
 
 	srv := &Server{Logs: NewLogCapture()}
 	handler := api.New(s, api.Config{
 		ChainID:    1,
 		AppVersion: "test",
+		ExtPin:     extPin,
 		Log:        slog.New(srv.Logs),
 		Observe: func(route string, status int, bytes int64, took time.Duration) {
 			srv.mu.Lock()

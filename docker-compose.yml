@@ -86,6 +86,14 @@ services:
       PORT: "3000"
       UPDATE_KEYS_INTERVAL_MS: ${UPDATE_KEYS_INTERVAL_MS:-12000}
       RETAIN_VERSIONS: ${RETAIN_VERSIONS:-20}
+      # Build versions at the finalized block rather than at the head. Off here so the
+      # stand stays comparable with the canonical service, which reads at the head.
+      KEYS_API_BUILD_AT_FINALIZED: ${KEYS_API_BUILD_AT_FINALIZED:-false}
+      # Which version each surface serves by default. /v1 and /v2 have to stay on latest
+      # for the parity runs to mean anything; /ext/v1 defaults to finalized, and with
+      # BUILD_AT_FINALIZED off that pin is around two epochs behind the head.
+      KEYS_API_PIN: ${KEYS_API_PIN:-latest}
+      KEYS_API_EXT_PIN: ${KEYS_API_EXT_PIN:-finalized}
       # Below default on purpose: these are shared nodes. Raising these is still worth
       # about a quarter of the cold sync — 49.6 s of chain reads here against 37.7 s at
       # batch 100 / concurrency 8.
