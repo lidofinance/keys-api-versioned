@@ -1,0 +1,81 @@
+name: Build and push keys-api-versioned to Harbor
+
+# The image the EVM charts run: vroom-evm-kapi-writer (KEYS_API_MODE=all) and
+# vroom-evm-kapi-server (KEYS_API_MODE=server) are the same image with different env.
+#
+# Merge to main, this builds and pushes :dev, and argocd-image-updater rolls both
+# Deployments. The updater's strategy is `digest`, set by the ApplicationSet, so a mutable
+# `:dev` tag is correct and distinguishable tags are not needed here.
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - 'cmd/**'
+      - 'internal/**'
+      - 'go.mod'
+      - 'go.sum'
+      - 'Dockerfile'
+      - '.github/workflows/build_push_harbor.yaml'
+
+env:
+  REGISTRY: registry.dev.k8s-dev.org
+  REPOSITORY: team-vroom
+  APP: keys-api-versioned
+  IMAGE_TAG: dev
+  REGISTRY_USER: robot$team-vroom+keys-api-versioned
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-24.04
+    environment: harbor_dev_release
+    steps:
+      # Actions pinned by commit SHA rather than by tag: a tag is mutable, and this is a
+      # workflow that holds a Harbor push credential.
+      - name: Check out the repo
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # The hermetic half of `make test`. The rest of the suite needs a Postgres
+      # (TEST_DATABASE_URL) and the fork suite needs anvil; neither belongs in the path
+      # that publishes an image, but both are why this is a gate rather than a guarantee.
+      #
+      # It is a gate at all because the image is the delivery path: pushing one that fails
+      # its own tests costs a roll to find out.
+      - name: go vet
+        run: go vet ./...
+
+      - name: go test
+        run: go test ./...
+
+      - name: Setup buildx
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+
+      - name: Log in to Harbor
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ env.REGISTRY_USER }}
+          password: ${{ secrets.HARBOR_DEV_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          push: true
+          tags: ${{ env.REGISTRY }}/${{ env.REPOSITORY }}/${{ env.APP }}:${{ env.IMAGE_TAG }}
+          # The Go build is the slow part and it is identical between runs that touch
+          # neither go.sum nor the sources it compiles.
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
