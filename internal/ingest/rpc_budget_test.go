@@ -307,6 +307,101 @@ func TestOperatorEventsRereadOperatorsAndNotKeys(t *testing.T) {
 	}
 }
 
+// The scan range used to start at the published version's own block, and a version
+// that nothing changed is never rewritten — so the window grew by a block every cycle
+// and the same blocks were re-read five times a minute until the periodic audit reset
+// it. With a mark, each cycle asks only about the blocks that arrived since the last
+// one said there was nothing.
+func TestOperatorScanOnlyCoversNewBlocks(t *testing.T) {
+	node := newBudgetNode()
+	server := httptest.NewServer(node)
+	defer server.Close()
+
+	syncer, _ := budgetSyncer(t, server.URL)
+	if r := syncer.Cycle(context.Background()); r.Err != nil {
+		t.Fatalf("cold start: %v", r.Err)
+	}
+
+	// Four quiet cycles, each one block further along. Every scan should cover exactly
+	// the block that arrived, and the window must not widen.
+	for i := 0; i < 4; i++ {
+		node.advance()
+		node.reset()
+		r := syncer.Cycle(context.Background())
+		if r.Err != nil {
+			t.Fatalf("cycle %d: %v", i, r.Err)
+		}
+		if r.Action != ActionExtend {
+			t.Fatalf("cycle %d: action %q (%s), want extend", i, r.Action, r.Reason)
+		}
+
+		want := [2]int64{r.HeadBlock, r.HeadBlock}
+		for _, scan := range node.scanned() {
+			if scan != want {
+				t.Fatalf("cycle %d scanned blocks %d..%d, want just the new block %d",
+					i, scan[0], scan[1], r.HeadBlock)
+			}
+		}
+	}
+}
+
+// A scan that found something must not move the mark. The signal is discharged by a
+// rebuild that re-reads operators, and a rebuild can fail — advancing the mark first
+// would answer "no events" next cycle to a question nothing had acted on, and the
+// rename would surface hours later in the periodic audit.
+func TestAFoundEventSurvivesAFailedRebuild(t *testing.T) {
+	node := newBudgetNode()
+	server := httptest.NewServer(node)
+	defer server.Close()
+
+	syncer, store := budgetSyncer(t, server.URL)
+	if r := syncer.Cycle(context.Background()); r.Err != nil {
+		t.Fatalf("cold start: %v", r.Err)
+	}
+	node.advance()
+	if r := syncer.Cycle(context.Background()); r.Err != nil {
+		t.Fatalf("quiet cycle: %v", r.Err)
+	}
+	versionBlock := store.latest.BlockNumber
+
+	// An event arrives, and the rebuild it triggers fails.
+	store.failOperators = true
+	node.advance()
+	node.emitOperatorEvent(budgetModules[0].address)
+
+	r := syncer.Cycle(context.Background())
+	if r.Err == nil {
+		t.Fatal("want the rebuild to fail, so that the next cycle has to rescan")
+	}
+	failedAt := r.HeadBlock
+
+	// The event is gone from the chain's answer, so the only way the next cycle can
+	// still see it is by asking about the blocks it was in — which is what the mark
+	// staying put is for.
+	store.failOperators = false
+	node.clearOperatorEvents()
+	node.advance()
+	node.reset()
+
+	if r := syncer.Cycle(context.Background()); r.Err != nil {
+		t.Fatalf("cycle after the failure: %v", r.Err)
+	}
+	scans := node.scanned()
+	if len(scans) == 0 {
+		t.Fatal("no scan at all after a failed rebuild")
+	}
+	for _, scan := range scans {
+		if scan[0] > failedAt {
+			t.Errorf("scanned %d..%d, want the range to still start at or below %d — the block the failed rebuild was for",
+				scan[0], scan[1], failedAt)
+		}
+		if scan[0] > versionBlock+1 && scan[0] > failedAt {
+			t.Errorf("scanned %d..%d, want it to reach back to the published version at %d",
+				scan[0], scan[1], versionBlock)
+		}
+	}
+}
+
 // assertEveryModuleWritten checks that the rebuild was not scoped to a subset: a
 // provenance change invalidates every module row, and a scope would leave the modules
 // whose nonce happened not to move holding rows decoded the old way.
@@ -415,6 +510,14 @@ type budgetNode struct {
 	wcType   uint8
 	nonces   map[string]int64
 	logHits  map[string]bool
+	scans    [][2]int64
+}
+
+// scanned returns the block ranges the node was asked about since the last reset.
+func (n *budgetNode) scanned() [][2]int64 {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return append([][2]int64(nil), n.scans...)
 }
 
 type budgetModule struct {
@@ -496,6 +599,13 @@ func (n *budgetNode) reset() {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	n.requests = map[string]int{}
+	n.scans = nil
+}
+
+func (n *budgetNode) clearOperatorEvents() {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	n.logHits = nil
 }
 
 func (n *budgetNode) counts() map[string]int {
@@ -599,12 +709,15 @@ func (n *budgetNode) answer(req budgetRequest) json.RawMessage {
 
 	case "eth_getLogs":
 		var filter struct {
-			Address []string `json:"address"`
+			Address   []string `json:"address"`
+			FromBlock string   `json:"fromBlock"`
+			ToBlock   string   `json:"toBlock"`
 		}
 		_ = json.Unmarshal(req.Params[0], &filter)
 
 		n.mu.Lock()
 		hits := n.logHits
+		n.scans = append(n.scans, [2]int64{hexToInt(filter.FromBlock), hexToInt(filter.ToBlock)})
 		n.mu.Unlock()
 		for _, address := range filter.Address {
 			if hits[strings.ToLower(address)] {
@@ -741,6 +854,14 @@ func budgetError(id int, message string) json.RawMessage {
 }
 
 func hexInt(n int64) string { return "0x" + big.NewInt(n).Text(16) }
+
+func hexToInt(hex string) int64 {
+	n, _ := new(big.Int).SetString(strings.TrimPrefix(hex, "0x"), 16)
+	if n == nil {
+		return -1
+	}
+	return n.Int64()
+}
 
 func blockHash(block int64) string {
 	return "0x" + common.Bytes2Hex(common.LeftPadBytes(big.NewInt(block).Bytes(), 32))

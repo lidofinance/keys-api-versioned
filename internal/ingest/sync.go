@@ -27,6 +27,19 @@ type Syncer struct {
 	cfg    SyncConfig
 	log    *slog.Logger
 
+	// scannedTo is the highest block the operator event scan has covered and found
+	// nothing in. It exists because the scan range starts at the published version's
+	// own block, and a version that nothing changed is never rewritten — so without a
+	// mark, every cycle re-scans a window that grows until the periodic audit resets
+	// it, and eth_getLogs over a wide range is the most expensive thing a metered
+	// endpoint bills. Measured on the range this uses: up to MAX_BLOCKS_OVERLAP blocks,
+	// re-read five times a minute for three hours.
+	//
+	// Deliberately not persisted. A restart pays one wide scan and then narrows again,
+	// which is cheaper than a schema column and a migration for a number whose only
+	// job is saving requests.
+	scannedTo int64
+
 	// hooks let the app observe cycles without this package importing metrics.
 	OnCycle func(CycleResult)
 	// OnModule fires once per module a rebuild read, before the version is
@@ -304,6 +317,11 @@ func (s *Syncer) Cycle(ctx context.Context) (result CycleResult) {
 			"rows_dropped", rolled.Dropped, "rows_reopened", rolled.Reopened)
 		result.ReorgFrom = forkPoint
 
+		// The scanned range was scanned on a branch that is gone, so it says nothing
+		// about this one. Dropping the mark makes the next scan start from the surviving
+		// version's own block, which is the last height both branches agree on.
+		s.scannedTo = 0
+
 		// What survived the rollback becomes the version this cycle decides against,
 		// which is the whole point of holding versions: a reorg costs a rollback plus
 		// the ordinary incremental check, and a fork that changed nothing costs no key
@@ -356,12 +374,27 @@ func (s *Syncer) Cycle(ctx context.Context) (result CycleResult) {
 	// the input is fetched.
 	decision := Evaluate(latest.AsVersion(), state, s.cfg.MaxBlockGap)
 	if decision.Action == ActionExtend {
-		state.OperatorEvents, err = s.operatorEvents(ctx, modules, latest.BlockNumber, head.BlockNumber)
-		if err != nil {
+		from := s.scanFloor(latest.BlockNumber)
+		state.OperatorEvents, err = s.operatorEvents(ctx, modules, from, head.BlockNumber)
+		switch {
+		case err != nil:
 			// A log filter failing is not a reason to stop syncing; it is a reason to
 			// treat operator metadata as possibly stale, which is what a rebuild does.
+			// The mark stays where it was, so the range is scanned again.
 			s.log.Warn("operator event scan failed, assuming a change", "err", err)
 			state.OperatorEvents = true
+		case state.OperatorEvents:
+			// Found something. The mark deliberately does not move: the signal is only
+			// discharged by a rebuild that actually re-reads operators, and a rebuild can
+			// fail. Advancing here would answer "no events" next cycle to a question
+			// nothing had yet acted on, and the rename would surface hours later in the
+			// periodic audit.
+			s.log.Debug("operator events found, leaving the scan mark",
+				"from", from+1, "to", head.BlockNumber, "mark", s.scannedTo)
+		default:
+			// Nothing in this range, and it will not change: scanned blocks stay scanned
+			// until a reorg says the branch they were on is gone.
+			s.scannedTo = head.BlockNumber
 		}
 		decision = Evaluate(latest.AsVersion(), state, s.cfg.MaxBlockGap)
 	}
@@ -688,6 +721,19 @@ func (s *Syncer) finalizedBlock(ctx context.Context) model.ELBlockSnapshot {
 		return model.ELBlockSnapshot{}
 	}
 	return block
+}
+
+// scanFloor is the block the next event scan starts above: the published version's own
+// block, or the scan mark when it is further along.
+//
+// The version's block is a floor rather than the answer, because the mark can be behind
+// it — a rebuild moves the version to head and discharges everything below — and it can
+// be ahead of it, which is the whole point.
+func (s *Syncer) scanFloor(versionBlock int64) int64 {
+	if s.scannedTo > versionBlock {
+		return s.scannedTo
+	}
+	return versionBlock
 }
 
 // operatorEvents asks the source whether operator metadata moved in the range.
