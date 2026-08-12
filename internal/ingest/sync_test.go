@@ -2,6 +2,7 @@ package ingest
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"testing"
@@ -372,9 +373,14 @@ type fakeStore struct {
 
 	keyWrites       int
 	keyWriteModules []int32
-	extends         int
-	staled          int
-	supersededFrom  int64
+	operatorWrites  []int32
+	moduleWrites    []int32
+	// failOperators makes the operator write fail, which is how a test gets a rebuild
+	// that starts and does not finish.
+	failOperators  bool
+	extends        int
+	staled         int
+	supersededFrom int64
 }
 
 func newFakeStore() *fakeStore { return &fakeStore{} }
@@ -461,7 +467,11 @@ func (b *fakeBuild) Keys(_ context.Context, m model.StakingModule) (ModuleKeys, 
 	return &fakeModuleKeys{}, nil
 }
 
-func (b *fakeBuild) Operators(context.Context, model.StakingModule, []model.Operator) (int, error) {
+func (b *fakeBuild) Operators(_ context.Context, m model.StakingModule, _ []model.Operator) (int, error) {
+	if b.store.failOperators {
+		return 0, errors.New("operator write failed")
+	}
+	b.store.operatorWrites = append(b.store.operatorWrites, m.ID)
 	return 0, nil
 }
 
@@ -470,6 +480,7 @@ func (b *fakeBuild) Module(_ context.Context, m model.StakingModule, _ bool) err
 		b.nonces = map[string]int64{}
 	}
 	b.nonces[m.RawAddress()] = int64(m.Nonce)
+	b.store.moduleWrites = append(b.store.moduleWrites, m.ID)
 	return nil
 }
 

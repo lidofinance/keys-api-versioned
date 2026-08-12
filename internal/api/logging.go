@@ -69,7 +69,7 @@ func logRequest(r *http.Request, rec *recorder, log *slog.Logger, observe Observ
 	if observe != nil {
 		// Labelled by pattern rather than by path, so a pubkey or a module id
 		// cannot turn one metric into thousands of series.
-		observe(routeLabel(r), rec.status, rec.written, took)
+		observe(r.Method, routeLabel(r), rec.status, rec.written, took)
 	}
 	attrs := []any{
 		"method", r.Method,
@@ -104,7 +104,7 @@ func logRequest(r *http.Request, rec *recorder, log *slog.Logger, observe Observ
 
 // ObserveFunc receives one served request. The API takes it as a function so this
 // package needs no metrics dependency.
-type ObserveFunc func(route string, status int, bytes int64, d time.Duration)
+type ObserveFunc func(method, route string, status int, bytes int64, d time.Duration)
 
 // routeLabel is the matched pattern, which for Go's mux is available on the
 // request. Falling back to the raw path would be a cardinality trap, so an

@@ -27,8 +27,56 @@ type Syncer struct {
 	cfg    SyncConfig
 	log    *slog.Logger
 
+	// scannedTo is the highest block the operator event scan has covered and found
+	// nothing in. It exists because the scan range starts at the published version's
+	// own block, and a version that nothing changed is never rewritten — so without a
+	// mark, every cycle re-scans a window that grows until the periodic audit resets
+	// it, and eth_getLogs over a wide range is the most expensive thing a metered
+	// endpoint bills. Measured on the range this uses: up to MAX_BLOCKS_OVERLAP blocks,
+	// re-read five times a minute for three hours.
+	//
+	// Deliberately not persisted. A restart pays one wide scan and then narrows again,
+	// which is cheaper than a schema column and a migration for a number whose only
+	// job is saving requests.
+	scannedTo int64
+
 	// hooks let the app observe cycles without this package importing metrics.
 	OnCycle func(CycleResult)
+	// OnModule fires once per module a rebuild read, before the version is
+	// published. It exists because the per-module numbers the canonical service
+	// exports — how long a module's key update took, how many keys each operator
+	// holds — are known here and nowhere else: by the time OnCycle runs, the cycle
+	// is one aggregate.
+	OnModule func(ModuleResult)
+}
+
+// ModuleNonce is a module's identity and the nonce a cycle read for it. It is what
+// the canonical `nonce_value` gauge is labelled by, and the cheap read every cycle
+// makes anyway.
+type ModuleNonce struct {
+	ID      int32
+	Address string
+	Nonce   int32
+}
+
+// ModuleResult is what a rebuild did for one module.
+//
+// Operators are carried rather than counted because the canonical service exports a
+// gauge per operator (used and unused keys), and this is the only place they are in
+// memory. A cycle that rebuilds nothing produces none of these, which is correct:
+// the numbers cannot have changed.
+type ModuleResult struct {
+	ModuleID int32
+	Address  string
+	Nonce    int32
+	KeysRead int64
+	// KeysReread says whether the keys were read at all. An operators-only rebuild
+	// reports zero keys, which is not the same statement as a module that has none.
+	KeysReread bool
+	// Duration is the key read alone, which is the thing that takes tens of seconds
+	// and the thing the canonical histogram measures.
+	Duration  time.Duration
+	Operators []model.Operator
 }
 
 // SyncConfig configures the loop.
@@ -66,8 +114,11 @@ type CycleResult struct {
 	Action         Action
 	Reason         string
 	ChangedModules []string
-	HeadBlock      int64
-	VersionBlock   int64
+	// Modules is the module set with the nonces this cycle read, empty on a cycle
+	// that failed before the cheap read.
+	Modules      []ModuleNonce
+	HeadBlock    int64
+	VersionBlock int64
 	// VersionTimestamp is the published version's own block time: how old the data
 	// is. It legitimately climbs while the chain is quiet.
 	VersionTimestamp int64
@@ -190,7 +241,7 @@ func (s *Syncer) Cycle(ctx context.Context) (result CycleResult) {
 		// A cold start reads every module and takes minutes, so it says so up front
 		// rather than after the first module lands.
 		s.log.Info("cold start: no published version, reading every module", "head", head.BlockNumber)
-		if err := s.rebuild(ctx, readAt, nil, finalized, &result); err != nil {
+		if err := s.rebuild(ctx, readAt, nil, DepthKeys, finalized, &result); err != nil {
 			result.Err = err
 		} else {
 			// Same as the ordinary rebuild path below. Without it a cold start
@@ -227,6 +278,7 @@ func (s *Syncer) Cycle(ctx context.Context) (result CycleResult) {
 		result.Err = fmt.Errorf("read modules: %w", err)
 		return result
 	}
+	result.Modules = moduleNonces(modules)
 
 	// Is the version still on the chain? A hash mismatch at its own height means
 	// the branch it was built on is gone.
@@ -265,6 +317,11 @@ func (s *Syncer) Cycle(ctx context.Context) (result CycleResult) {
 			"rows_dropped", rolled.Dropped, "rows_reopened", rolled.Reopened)
 		result.ReorgFrom = forkPoint
 
+		// The scanned range was scanned on a branch that is gone, so it says nothing
+		// about this one. Dropping the mark makes the next scan start from the surviving
+		// version's own block, which is the last height both branches agree on.
+		s.scannedTo = 0
+
 		// What survived the rollback becomes the version this cycle decides against,
 		// which is the whole point of holding versions: a reorg costs a rollback plus
 		// the ordinary incremental check, and a fork that changed nothing costs no key
@@ -281,7 +338,7 @@ func (s *Syncer) Cycle(ctx context.Context) (result CycleResult) {
 			result.Action = ActionSupersede
 			result.Reason = fmt.Sprintf("reorg below the whole retained window (fork at %d): rebuilding from scratch", forkPoint)
 			s.log.Warn("reorg left no version to build on, rebuilding from scratch", "fork_point", forkPoint)
-			if err := s.rebuild(ctx, readAt, nil, finalized, &result); err != nil {
+			if err := s.rebuild(ctx, readAt, nil, DepthKeys, finalized, &result); err != nil {
 				result.Err = err
 			} else {
 				result.VersionBlock = head.BlockNumber
@@ -298,15 +355,49 @@ func (s *Syncer) Cycle(ctx context.Context) (result CycleResult) {
 		BlockHash:    readAt.BlockHash,
 		ModuleNonces: nonceMap(modules),
 	}
-	state.OperatorEvents, err = s.operatorEvents(ctx, modules, latest.BlockNumber, head.BlockNumber)
-	if err != nil {
-		// A log filter failing is not a reason to stop syncing; it is a reason to
-		// treat operator metadata as possibly stale, which is what a rebuild does.
-		s.log.Warn("operator event scan failed, assuming a change", "err", err)
-		state.OperatorEvents = true
+	// Asked after the module read, because that read is where a source notices it is
+	// reading from somewhere else — and consumed here, so one deploy causes one
+	// rebuild rather than one per cycle.
+	if reporter, ok := s.source.(source.SourceChangeReporter); ok {
+		if reason, changed := reporter.SourceChanged(); changed {
+			state.SourceChange = reason
+		}
 	}
 
+	// The event scan is the last signal Evaluate consults, so it is only asked for when
+	// the ones above it said nothing changed. Scanning first — which is what this did —
+	// spent an eth_getLogs per module family to compute a boolean that a nonce
+	// difference had already made irrelevant: the rebuild was decided either way.
+	//
+	// Evaluated twice rather than reordering Evaluate, because the order of the rules is
+	// the canonical service's and worth keeping literal; what changes here is only when
+	// the input is fetched.
 	decision := Evaluate(latest.AsVersion(), state, s.cfg.MaxBlockGap)
+	if decision.Action == ActionExtend {
+		from := s.scanFloor(latest.BlockNumber)
+		state.OperatorEvents, err = s.operatorEvents(ctx, modules, from, head.BlockNumber)
+		switch {
+		case err != nil:
+			// A log filter failing is not a reason to stop syncing; it is a reason to
+			// treat operator metadata as possibly stale, which is what a rebuild does.
+			// The mark stays where it was, so the range is scanned again.
+			s.log.Warn("operator event scan failed, assuming a change", "err", err)
+			state.OperatorEvents = true
+		case state.OperatorEvents:
+			// Found something. The mark deliberately does not move: the signal is only
+			// discharged by a rebuild that actually re-reads operators, and a rebuild can
+			// fail. Advancing here would answer "no events" next cycle to a question
+			// nothing had yet acted on, and the rename would surface hours later in the
+			// periodic audit.
+			s.log.Debug("operator events found, leaving the scan mark",
+				"from", from+1, "to", head.BlockNumber, "mark", s.scannedTo)
+		default:
+			// Nothing in this range, and it will not change: scanned blocks stay scanned
+			// until a reorg says the branch they were on is gone.
+			s.scannedTo = head.BlockNumber
+		}
+		decision = Evaluate(latest.AsVersion(), state, s.cfg.MaxBlockGap)
+	}
 	s.log.Debug("cycle: decision", "action", decision.Action, "reason", decision.Reason,
 		"changed_modules", decision.ChangedModules, "version", latest.BlockNumber,
 		"head", head.BlockNumber, "behind", head.BlockNumber-latest.BlockNumber,
@@ -341,7 +432,7 @@ func (s *Syncer) Cycle(ctx context.Context) (result CycleResult) {
 	case ActionRebuild, ActionSupersede:
 		// A rebuild is the expensive path, so say why it started. Quiet cycles stay
 		// silent — they are the common case and the metrics cover them.
-		s.log.Info("rebuild starting", "reason", decision.Reason,
+		s.log.Info("rebuild starting", "reason", decision.Reason, "reads", decision.Depth.String(),
 			"changed_modules", decision.ChangedModules, "version", latest.BlockNumber, "head", head.BlockNumber)
 
 		// The version being replaced is marked stale first, so that if the rebuild
@@ -351,13 +442,11 @@ func (s *Syncer) Cycle(ctx context.Context) (result CycleResult) {
 			result.Err = err
 			return result
 		}
-		scope := decision.ChangedModules
-		if state.OperatorEvents && len(scope) == 0 {
-			// Operators moved with no nonce change: re-read them everywhere, but
-			// leave keys alone. Passing an empty scope would mean "everything".
-			scope = allModuleAddresses(modules)
-		}
-		if err := s.rebuild(ctx, readAt, scope, finalized, &result); err != nil {
+		// The scope says which modules, the depth says how much of them — so "operators
+		// moved somewhere, re-read operators everywhere and leave keys alone" is now
+		// expressible, which it was not when scope was the only axis: the old code widened
+		// the scope to every module and then read every key, against its own comment.
+		if err := s.rebuild(ctx, readAt, decision.ChangedModules, decision.Depth, finalized, &result); err != nil {
 			result.Err = err
 			break
 		}
@@ -371,10 +460,12 @@ func (s *Syncer) Cycle(ctx context.Context) (result CycleResult) {
 
 // rebuild writes a new version and publishes it.
 //
-// scope names the modules whose keys must be re-read; nil means all of them.
-// Everything outside the scope is inherited from the previous version at no cost,
-// because its rows are simply still open.
-func (s *Syncer) rebuild(ctx context.Context, head model.ELBlockSnapshot, scope []string, finalized int64, result *CycleResult) error {
+// scope names the modules the depth applies to; nil means all of them. Everything
+// outside it is inherited from the previous version at no cost, because its rows are
+// simply still open — and so is everything the depth does not reach. Module rows are
+// always written: the module set is a read the cycle has already paid for, and the
+// store compares fields, so a module whose metadata did not change writes nothing.
+func (s *Syncer) rebuild(ctx context.Context, head model.ELBlockSnapshot, scope []string, depth ReadDepth, finalized int64, result *CycleResult) error {
 	at := source.Ref{BlockHash: head.BlockHash, BlockNumber: head.BlockNumber}
 
 	modules, err := s.source.Modules(ctx, at)
@@ -383,6 +474,11 @@ func (s *Syncer) rebuild(ctx context.Context, head model.ELBlockSnapshot, scope 
 	}
 	if len(modules) == 0 {
 		return errors.New("source returned no modules")
+	}
+	// The cold start reads the module set here rather than in the caller, so this is
+	// where its nonces become visible to metrics.
+	if len(result.Modules) == 0 {
+		result.Modules = moduleNonces(modules)
 	}
 
 	build, err := s.store.Begin(ctx, head)
@@ -403,44 +499,66 @@ func (s *Syncer) rebuild(ctx context.Context, head model.ELBlockSnapshot, scope 
 
 	inScope := scopeSet(scope)
 	for _, m := range modules {
-		contentChanged := false
+		read := depth
+		if inScope != nil && !inScope[m.RawAddress()] {
+			read = DepthModule
+		}
+		if read == DepthModule {
+			s.log.Debug("module: metadata only, contents inherited",
+				"module", m.ID, "nonce", m.Nonce)
+			if err := build.Module(ctx, m, false); err != nil {
+				return err
+			}
+			continue
+		}
 
-		if inScope == nil || inScope[m.RawAddress()] {
-			// Announced before the work, not after: reading one mainnet module takes
-			// tens of seconds and this is the line that says which one is running.
-			s.log.Info("module: reading", "module", m.ID, "type", m.Type,
-				"nonce", m.Nonce, "address", m.RawAddress())
+		// Announced before the work, not after: reading one mainnet module takes tens
+		// of seconds and this is the line that says which one is running.
+		s.log.Info("module: reading", "module", m.ID, "type", m.Type,
+			"nonce", m.Nonce, "address", m.RawAddress(), "reads", read.String())
 
+		var (
+			contentChanged bool
+			diff           KeyDiff
+			keysTook       time.Duration
+		)
+		if read.reads(DepthKeys) {
 			moduleStarted := time.Now()
-			diff, err := s.writeModuleKeys(ctx, build, at, m)
+			diff, err = s.writeModuleKeys(ctx, build, at, m)
 			if err != nil {
 				return err
 			}
-			keysTook := time.Since(moduleStarted)
+			keysTook = time.Since(moduleStarted)
 			result.KeysStaged += diff.Staged
 			result.KeysChanged += diff.Opened + diff.Closed
 			contentChanged = diff.Changed()
+		}
 
-			operatorsStarted := time.Now()
-			operators, err := s.source.Operators(ctx, at, m)
-			if err != nil {
-				return fmt.Errorf("read operators of module %d: %w", m.ID, err)
-			}
-			changed, err := build.Operators(ctx, m, operators)
-			if err != nil {
-				return err
-			}
-			contentChanged = contentChanged || changed > 0
+		operatorsStarted := time.Now()
+		operators, err := s.source.Operators(ctx, at, m)
+		if err != nil {
+			return fmt.Errorf("read operators of module %d: %w", m.ID, err)
+		}
+		changed, err := build.Operators(ctx, m, operators)
+		if err != nil {
+			return err
+		}
+		contentChanged = contentChanged || changed > 0
 
-			s.log.Info("module written",
-				"module", m.ID, "type", m.Type, "nonce", m.Nonce,
-				"keys_read", diff.Staged, "keys_opened", diff.Opened, "keys_closed", diff.Closed,
-				"keys_unchanged", diff.Unchanged,
-				"operators", len(operators), "operators_changed", changed,
-				"keys_took", keysTook.Round(time.Millisecond).String(),
-				"operators_took", time.Since(operatorsStarted).Round(time.Millisecond).String())
-		} else {
-			s.log.Debug("module: inherited unchanged", "module", m.ID, "nonce", m.Nonce)
+		s.log.Info("module written",
+			"module", m.ID, "type", m.Type, "nonce", m.Nonce, "reads", read.String(),
+			"keys_read", diff.Staged, "keys_opened", diff.Opened, "keys_closed", diff.Closed,
+			"keys_unchanged", diff.Unchanged,
+			"operators", len(operators), "operators_changed", changed,
+			"keys_took", keysTook.Round(time.Millisecond).String(),
+			"operators_took", time.Since(operatorsStarted).Round(time.Millisecond).String())
+
+		if s.OnModule != nil {
+			s.OnModule(ModuleResult{
+				ModuleID: m.ID, Address: m.RawAddress(), Nonce: m.Nonce,
+				KeysReread: read.reads(DepthKeys), KeysRead: diff.Staged,
+				Duration: keysTook, Operators: operators,
+			})
 		}
 
 		if err := build.Module(ctx, m, contentChanged); err != nil {
@@ -605,12 +723,36 @@ func (s *Syncer) finalizedBlock(ctx context.Context) model.ELBlockSnapshot {
 	return block
 }
 
+// scanFloor is the block the next event scan starts above: the published version's own
+// block, or the scan mark when it is further along.
+//
+// The version's block is a floor rather than the answer, because the mark can be behind
+// it — a rebuild moves the version to head and discharges everything below — and it can
+// be ahead of it, which is the whole point.
+func (s *Syncer) scanFloor(versionBlock int64) int64 {
+	if s.scannedTo > versionBlock {
+		return s.scannedTo
+	}
+	return versionBlock
+}
+
 // operatorEvents asks the source whether operator metadata moved in the range.
 // A source that cannot answer cheaply does not implement the capability, and the
 // signal is simply absent.
+//
+// A provider that can answer for every module at once is asked that way: the loop
+// wants one boolean per cycle, and on mainnet the per-module path spends one
+// eth_getLogs per module to compute it.
 func (s *Syncer) operatorEvents(ctx context.Context, modules []model.StakingModule, fromBlock, toBlock int64) (bool, error) {
+	if fromBlock >= toBlock {
+		return false, nil
+	}
+	if grouped, ok := s.source.(source.GroupedOperatorWatcher); ok {
+		return grouped.OperatorsChangedAny(ctx, modules, fromBlock+1, toBlock)
+	}
+
 	watcher, ok := s.source.(source.OperatorWatcher)
-	if !ok || fromBlock >= toBlock {
+	if !ok {
 		return false, nil
 	}
 	for _, m := range modules {
@@ -655,18 +797,18 @@ func (s *Syncer) prune(ctx context.Context) {
 	}
 }
 
-func nonceMap(modules []model.StakingModule) map[string]int64 {
-	out := make(map[string]int64, len(modules))
+func moduleNonces(modules []model.StakingModule) []ModuleNonce {
+	out := make([]ModuleNonce, 0, len(modules))
 	for _, m := range modules {
-		out[m.RawAddress()] = int64(m.Nonce)
+		out = append(out, ModuleNonce{ID: m.ID, Address: m.RawAddress(), Nonce: m.Nonce})
 	}
 	return out
 }
 
-func allModuleAddresses(modules []model.StakingModule) []string {
-	out := make([]string, 0, len(modules))
+func nonceMap(modules []model.StakingModule) map[string]int64 {
+	out := make(map[string]int64, len(modules))
 	for _, m := range modules {
-		out = append(out, m.RawAddress())
+		out[m.RawAddress()] = int64(m.Nonce)
 	}
 	return out
 }

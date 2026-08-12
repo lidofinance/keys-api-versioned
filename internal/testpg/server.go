@@ -62,7 +62,7 @@ func NewServerWithExtPin(tb testing.TB, s store.Store, extPin string) *Server {
 		AppVersion: "test",
 		ExtPin:     extPin,
 		Log:        slog.New(srv.Logs),
-		Observe: func(route string, status int, bytes int64, took time.Duration) {
+		Observe: func(method, route string, status int, bytes int64, took time.Duration) {
 			srv.mu.Lock()
 			srv.events = append(srv.events, Event{route, status, bytes, took})
 			srv.mu.Unlock()

@@ -33,7 +33,10 @@ type rawModule struct {
 	withdrawalCredentialsType int32
 }
 
-func decodeStakingModules(v any) ([]rawModule, error) {
+// defaultWithdrawalCredentialsType is what a module has before the router reports one.
+const defaultWithdrawalCredentialsType = 1
+
+func decodeStakingModules(v any, version int64) ([]rawModule, error) {
 	rv := reflect.ValueOf(v)
 	if rv.Kind() != reflect.Slice {
 		return nil, fmt.Errorf("getStakingModules: expected a slice, got %T", v)
@@ -54,14 +57,23 @@ func decodeStakingModules(v any) ([]rawModule, error) {
 			lastDepositBlock:      fieldInt(item, "LastDepositBlock"),
 			exitedValidatorsCount: int32(fieldInt(item, "ExitedValidatorsCount")),
 		}
-		// Present only from staking router v4; older versions imply type 1.
-		if f := item.FieldByName("WithdrawalCredentialsType"); f.IsValid() {
+		// The type comes from the contract only from staking router v4; below it the
+		// field is either absent from the tuple or present and unset, and type 1 is
+		// implied. Decided by the version the router reported this cycle rather than by
+		// whether our ABI file happens to declare the field: the ABI is a property of
+		// this build, the tuple is a property of the chain, and reading one for the
+		// other is how a service claims to support a version it has never seen.
+		f := item.FieldByName("WithdrawalCredentialsType")
+		switch {
+		case version >= srVersionWithWCType && f.IsValid():
 			m.withdrawalCredentialsType = int32(fieldInt(item, "WithdrawalCredentialsType"))
-		} else {
-			m.withdrawalCredentialsType = 1
+		default:
+			m.withdrawalCredentialsType = defaultWithdrawalCredentialsType
 		}
 		if m.withdrawalCredentialsType == 0 {
-			m.withdrawalCredentialsType = 1
+			// v4 with the field still unset, which is what a chain looks like between the
+			// upgrade and the vote that sets it.
+			m.withdrawalCredentialsType = defaultWithdrawalCredentialsType
 		}
 		out = append(out, m)
 	}

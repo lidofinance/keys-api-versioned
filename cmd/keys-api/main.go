@@ -41,7 +41,14 @@
 //	PROVIDER_MULTICALL_ADDRESS        override the standard deployment address
 //	PROVIDER_MULTICALL_MAX_CALLS      reads per aggregate (default 200)
 //	PROVIDER_MULTICALL_MAX_KEYS       keys one aggregate may return (default 1000)
+//	KEYS_API_ENV                      the `env` label on build_info (default unknown)
 //	LOG_LEVEL                         debug | info (default) | warn | error
+//
+// /metrics carries two families. This service's own series are under keys_api_*, and
+// the canonical service's are exported under the canonical names as well, so its
+// dashboards and alerts work here unchanged — see internal/metrics for what differs.
+// keys_api_rpc_requests_total is the one to watch on a metered endpoint: it counts
+// round trips by method, which is what a provider bills.
 //
 // Multicall3 is a contract, not a node feature, so it needs no support from the
 // endpoint — but what an endpoint tolerates in one eth_call does vary, and a hosted
@@ -92,6 +99,10 @@ import (
 // semantic version rather than a build hash.
 const appVersion = "0.1.0-poc"
 
+// metricsNamespace prefixes this service's own series. The canonical service's are
+// exported alongside them under their own names — see internal/metrics.
+const metricsNamespace = "keys_api"
+
 func main() {
 	log := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: logLevel()}))
 
@@ -129,9 +140,14 @@ func run(log *slog.Logger) error {
 		}
 	}
 
-	m := metrics.New("keys_api")
+	m := metrics.New(metricsNamespace)
 
 	chainID := int64(envInt("CHAIN_ID", 1))
+
+	// build_info is the canonical service's, and its `network` label is the chain: a
+	// dashboard filters on it, so it is the chain id rather than a deployment name.
+	m.SetBuildInfo("keys-api-versioned", appVersion,
+		envOr("KEYS_API_ENV", "unknown"), strconv.FormatInt(chainID, 10))
 
 	// The store lives in a schema named after the chain, so a database filled from one
 	// chain cannot be opened as another. Without it, that mistake is silent and
@@ -181,7 +197,7 @@ func run(log *slog.Logger) error {
 
 	var syncer *ingest.Syncer
 	if mode != "server" {
-		provider, err := buildSource(ctx, chainID, log)
+		provider, err := buildSource(ctx, chainID, log, m)
 		if err != nil {
 			return err
 		}
@@ -207,6 +223,7 @@ func run(log *slog.Logger) error {
 			BuildAtFinalized: envBool("KEYS_API_BUILD_AT_FINALIZED", false),
 		}, log)
 		syncer.OnCycle = func(r ingest.CycleResult) { observeCycle(m, r) }
+		syncer.OnModule = func(r ingest.ModuleResult) { observeModule(m, r) }
 	}
 
 	errs := make(chan error, 2)
@@ -276,7 +293,7 @@ func run(log *slog.Logger) error {
 
 // buildSource picks the registry reader. This is the one place that knows which
 // implementations exist; everything downstream sees source.Provider.
-func buildSource(ctx context.Context, chainID int64, log *slog.Logger) (source.Provider, error) {
+func buildSource(ctx context.Context, chainID int64, log *slog.Logger, m *metrics.Metrics) (source.Provider, error) {
 	switch name := envOr("KEYS_API_SOURCE", "lido-core"); name {
 	case "lido-core":
 		urls := envOr("PROVIDERS_URLS", "")
@@ -306,6 +323,19 @@ func buildSource(ctx context.Context, chainID int64, log *slog.Logger) (source.P
 			// At LOG_LEVEL=debug this prints one line per JSON-RPC request, which is
 			// how a slow sync becomes legible instead of silent.
 			Log: log,
+			// And at every level, one metric per request. The debug line answers
+			// "what is this sync waiting on" for someone watching; this answers "how
+			// many requests is this deployment spending" for someone who was not.
+			Observe: func(r eth.RequestInfo) {
+				m.ObserveRPC(r.Method, r.Result, r.Calls, r.Duration)
+			},
+		})
+		m.BindRPCStats(metricsNamespace, func() metrics.RPCStats {
+			s := client.Stats()
+			return metrics.RPCStats{
+				Requests: s.Requests, Calls: s.Calls,
+				Aggregates: s.Aggregates, Splits: s.Splits, Fallbacks: s.Fallbacks,
+			}
 		})
 		provider := lidocore.NewProvider(client, locator, lidocore.Options{
 			KeysBatch:       uint64(envInt("KEYS_BATCH_SIZE", lidocore.KeysBatchSize)),
@@ -318,6 +348,16 @@ func buildSource(ctx context.Context, chainID int64, log *slog.Logger) (source.P
 			// node that tolerates few concurrent requests.
 			Concurrency: envInt("KEYS_READ_CONCURRENCY", envInt("PROVIDER_CONCURRENT_REQUESTS", 8)),
 			Log:         log,
+			// A router replacement is rare and consequential, so it gets a counter of
+			// its own rather than being left in the log: the registry changing
+			// completely is otherwise indistinguishable from a bug.
+			OnRouterChange: func(previous, current string) { m.RouterChanges.Inc() },
+			// The version is a gauge because its value is the fact — which shape the
+			// tuple has — and a counter alongside it because "it changed" is the event.
+			OnContractVersion: func(previous, current int64) {
+				m.RouterVersion.Set(float64(current))
+				m.VersionChanges.Inc()
+			},
 		})
 		log.Info("source: lido core",
 			"locator", locator, "module_types", strings.Join(provider.SupportedTypes(), ","))
@@ -398,6 +438,57 @@ func observeCycle(m *metrics.Metrics, r ingest.CycleResult) {
 		stale = 1
 	}
 	m.VersionStale.Set(stale)
+
+	observeCanonicalCycle(m, r, outcome)
+}
+
+// canonicalJobName is what the canonical service labels this work with. Copied
+// exactly, spaces included: a dashboard selects on the string.
+const canonicalJobName = "Update Staking Router Modules keys"
+
+// observeCanonicalCycle fills the canonical service's per-cycle series.
+//
+// last_block_number and last_update_timestamp are the head this cycle confirmed
+// against, which is what the canonical el_meta row holds after an iteration — not the
+// published version's own block. The two differ here in a way they cannot there,
+// because a version that nothing changed is kept rather than rewritten; the
+// version's own block is published_version_block, which has no canonical
+// counterpart.
+func observeCanonicalCycle(m *metrics.Metrics, r ingest.CycleResult, outcome string) {
+	result := "success"
+	if outcome != "ok" {
+		result = "error"
+	}
+	m.ObserveJob(canonicalJobName, result, r.Duration)
+
+	if r.Err != nil {
+		return
+	}
+	if r.HeadBlock > 0 {
+		m.LastBlockNumber.Set(float64(r.HeadBlock))
+	}
+	if r.HeadTimestamp > 0 {
+		m.LastUpdate.Set(float64(r.HeadTimestamp))
+	}
+	for _, module := range r.Modules {
+		m.SetNonce(module.ID, module.Nonce)
+	}
+}
+
+// observeModule fills the canonical per-module series from a rebuild.
+func observeModule(m *metrics.Metrics, r ingest.ModuleResult) {
+	// Only when the keys were actually read: an operators-only rebuild would otherwise
+	// record a key update of zero keys, which reads as a module that has none.
+	if r.KeysReread {
+		m.ObserveModuleUpdate(r.Address, r.KeysRead, r.Duration)
+	}
+	for _, op := range r.Operators {
+		unused := op.TotalSigningKeys - op.UsedSigningKeys
+		if unused < 0 {
+			unused = 0
+		}
+		m.SetOperatorKeys(r.ModuleID, op.Index, op.UsedSigningKeys, unused)
+	}
 }
 
 // redactedProviders lists the endpoint hosts, without paths.
