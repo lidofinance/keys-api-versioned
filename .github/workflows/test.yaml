@@ -1,0 +1,104 @@
+name: Test
+
+# Tests ran only after merge until this existed: the Harbor workflow gates the image on
+# `go vet` and `go test`, but it triggers on push to main, so a pull request got no signal
+# at all and a broken change was found by the build that publishes it. This is the same
+# suite one step earlier, plus the half that needs a database.
+#
+# The Harbor workflow keeps its own copy on purpose — it is the gate in front of a push
+# credential, and it should not depend on a green run somewhere else having happened.
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+# A pull request that gets three pushes in a minute needs one run, not three.
+concurrency:
+  group: test-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+
+    # The suite is in two halves. Most of it is hermetic — fake nodes over httptest, no
+    # network — and skips the rest when TEST_DATABASE_URL is unset. The store, the ingest
+    # loop against real SQL, and the e2e surface need Postgres, and skipping them silently
+    # is how the interesting half stops being run.
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: keys_api_test
+        ports:
+          - 5432:5432
+        # Without this the first connection races the container's own initdb.
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    steps:
+      # Actions pinned by commit SHA rather than by tag, matching build_push_harbor.yaml:
+      # a tag is mutable, and a workflow that runs repository code should not also trust a
+      # moving reference for its tooling.
+      - name: Check out the repo
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # Named files rather than a count, so the failure says what to run.
+      - name: gofmt
+        run: |
+          unformatted="$(gofmt -l . | grep -v '^vendor/' || true)"
+          if [ -n "$unformatted" ]; then
+            echo "::error::gofmt would change these files. Run: gofmt -w ."
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: go test
+        run: go test ./...
+
+      # The same packages again, this time with a database, so the tests that skipped
+      # above actually run. -count=1 because the first pass cached them as passing-by-
+      # skipping and the results are not interchangeable.
+      #
+      # This is also where the RPC budget projection runs against a real Syncer — see
+      # internal/ingest/rpc_quota_test.go. It fails when a day of polling stops fitting
+      # the provider's daily compute-unit limit, which is a thing CI can catch and a
+      # person reviewing a diff cannot.
+      - name: go test with Postgres
+        env:
+          TEST_DATABASE_URL: postgres://postgres:postgres@127.0.0.1:5432/keys_api_test?sslmode=disable
+        run: go test ./internal/ingest/ ./internal/e2e/ -count=1
+
+      # Not run here, and both for the same reason — they need something this runner has
+      # no business holding:
+      #
+      #   make test-fork  an anvil fork of a real chain, so an archive endpoint and its
+      #                   key. It also spends provider quota, which is the thing the
+      #                   budget test above exists to protect.
+      #   make diff       both services live against a chain, which is a stand and not a
+      #                   CI job.
+      #
+      # docs/fork-tests.md says how to run the fork suite locally.
+      - name: Build the binaries
+        run: go build ./...
