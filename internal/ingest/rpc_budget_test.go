@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/ethereum/go-ethereum/accounts/abi"
 	"github.com/ethereum/go-ethereum/common"
@@ -31,6 +32,12 @@ import (
 //
 // Counted per method rather than as a total, because "eth_getLogs went from 2 to 4"
 // says what happened and "9 != 8" does not.
+//
+// This is the tight guard: it fails on any new round trip, whether or not the bill still
+// fits. The consequence — whether a day of it fits the provider's daily budget — is
+// TestADayOfPollingFitsTheProviderQuota in rpc_quota_test.go, which projects the measured
+// profile over a day and fails when it does not. Both are worth having: one added call
+// often still fits, and the day it stops fitting is not the day it was added.
 
 func TestQuietCycleRequestBudget(t *testing.T) {
 	node := newBudgetNode()
@@ -63,18 +70,20 @@ func TestQuietCycleRequestBudget(t *testing.T) {
 	}
 
 	want := map[string]int{
-		// Head, the finality pin, and the reorg check reading the version's own height.
-		"eth_getBlockByNumber": 3,
-		// The head's timestamp. Removable: it is in the header the head read already
-		// returned, and this line is here so that removing it shows up as a win.
-		"eth_getBlockByHash": 1,
-		// One request resolving the locator and reading the module set together, one
-		// carrying every getType and getNonce.
+		// The head, and the finality pin — the latter only because this test leaves the
+		// epoch pacing off. There is no third header read: the reorg probe is skipped
+		// while the version's own block is finalized, which is where it sits almost
+		// always, and no eth_getBlockByHash because the head's timestamp arrives in the
+		// head header itself.
+		"eth_getBlockByNumber": 2,
+		// One request resolving the locator, the contract version and the module set
+		// together, one carrying every getType and getNonce.
 		"eth_call": 2,
 		// One filter per module family, not one per module: four modules, two families.
+		// Also only because the pacing is off here.
 		"eth_getLogs": 2,
 	}
-	assertRequests(t, node, want, 8)
+	assertRequests(t, node, want, 6)
 }
 
 // A cycle where a module's nonce moved re-reads that module's keys, and the operator
@@ -402,6 +411,379 @@ func TestAFoundEventSurvivesAFailedRebuild(t *testing.T) {
 	}
 }
 
+// The number a metered provider bills is the JSON-RPC call, not the round trip, and a
+// quiet cycle sends eleven of the former inside two of the latter. Aggregating them
+// takes it to two — which is the difference between 2 000 000 compute units lasting five
+// hours and lasting days.
+//
+// Asserted as billed calls rather than as compute units on purpose: CU per method is the
+// provider's pricing table and not ours to encode. The call count is what we control and
+// what any provider's table multiplies.
+func TestMeteredCycleBillsTwoCallsInsteadOfEleven(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		metered bool
+		want    int
+	}{
+		{"own node: one eth_call per read, packed into batches", false, 11},
+		{"metered: one aggregate per dependent step", true, 2},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			node := newBudgetNode()
+			node.multicall = true
+			server := httptest.NewServer(node)
+			defer server.Close()
+
+			client := eth.NewClient(server.URL, eth.Options{
+				Concurrency: 4, BatchSize: 100,
+				Multicall: true, Metered: tc.metered,
+			})
+			provider := lidocore.NewProvider(client, budgetLocator, lidocore.Options{})
+			store := newFakeStore()
+			syncer := NewSyncer(provider, store, SyncConfig{MaxBlockGap: 1000}, nil)
+
+			if r := syncer.Cycle(context.Background()); r.Err != nil {
+				t.Fatalf("cold start: %v", r.Err)
+			}
+			node.advance()
+			node.reset()
+
+			r := syncer.Cycle(context.Background())
+			if r.Err != nil {
+				t.Fatalf("quiet cycle: %v", r.Err)
+			}
+			if r.Action != ActionExtend {
+				t.Fatalf("action %q (%s), want extend", r.Action, r.Reason)
+			}
+
+			// Two dependent steps, and no way to make it one: the module addresses the
+			// second reads from come out of the first.
+			if got := node.billedCalls("eth_call"); got != tc.want {
+				t.Errorf("a quiet cycle billed %d eth_call, want %d", got, tc.want)
+			}
+		})
+	}
+}
+
+// A poll that finds the same head it found last time is the common case whenever the
+// interval is at or below the slot time, and it can be answered from one request: no new
+// block means no new state, so every signal below would be read at a point already
+// accounted for. This is what makes a 12-second interval — one slot — affordable, and it
+// is the canonical service's own trick, which is how it affords a 5-second default.
+func TestAnUnchangedHeadCostsOneRequest(t *testing.T) {
+	node := newBudgetNode()
+	server := httptest.NewServer(node)
+	defer server.Close()
+
+	syncer, store := budgetSyncerOver(t, server.URL, newFakeStore())
+	if r := syncer.Cycle(context.Background()); r.Err != nil {
+		t.Fatalf("cold start: %v", r.Err)
+	}
+	extendsBefore := store.extends
+
+	// The chain has not produced a block: same head, three polls.
+	node.reset()
+	for i := 0; i < 3; i++ {
+		r := syncer.Cycle(context.Background())
+		if r.Err != nil {
+			t.Fatalf("poll %d: %v", i, r.Err)
+		}
+		if r.Action != ActionExtend {
+			t.Fatalf("poll %d: action %q (%s), want extend", i, r.Action, r.Reason)
+		}
+		if !strings.Contains(r.Reason, "still") {
+			t.Errorf("poll %d: reason %q should say the head has not moved", i, r.Reason)
+		}
+	}
+
+	counts := node.counts()
+	if counts["eth_getBlockByNumber"] != 3 {
+		t.Errorf("%d head reads for three polls, want 3", counts["eth_getBlockByNumber"])
+	}
+	for method, n := range counts {
+		if method != "eth_getBlockByNumber" {
+			t.Errorf("%s was called %d times; an unchanged head should read nothing else", method, n)
+		}
+	}
+	// And nothing is written: extending a version to a head it is already recorded at
+	// would be a write that says nothing.
+	if store.extends != extendsBefore {
+		t.Errorf("%d version writes on an unchanged head, want none", store.extends-extendsBefore)
+	}
+
+	// A new block, and the full set of cheap signals comes back.
+	node.advance()
+	node.reset()
+	r := syncer.Cycle(context.Background())
+	if r.Err != nil {
+		t.Fatalf("cycle after a new block: %v", r.Err)
+	}
+	if got := node.counts()["eth_call"]; got == 0 {
+		t.Error("a moved head should read the module set and nonces")
+	}
+	if store.extends == extendsBefore {
+		t.Error("a moved head should extend the version")
+	}
+}
+
+// The operator scan and the finalized read are paced by the epoch, because that is how
+// fast their subjects move: finality advances once per epoch by definition, and an
+// operator rename is a months-apart event. Running them on the cycle's clock — five times
+// a minute — spent most of a metered budget re-asking questions whose answer could not
+// have changed.
+//
+// Because a compute-unit provider bills the call and not the block range, scanning once
+// per epoch over a range 32 slots wide costs exactly what scanning every cycle over one
+// slot did, per scan — so this is a straight division of the bill, not a trade.
+func TestEpochPacedReadsHappenOncePerEpoch(t *testing.T) {
+	node := newBudgetNode()
+	server := httptest.NewServer(node)
+	defer server.Close()
+
+	epoch := 384 * time.Second // mainnet: 12 s × 32
+	syncer, _ := budgetSyncerOver(t, server.URL, newFakeStore())
+	syncer.cfg.EpochDuration = epoch
+
+	clock := time.Unix(1_700_000_000, 0)
+	syncer.now = func() time.Time { return clock }
+
+	if r := syncer.Cycle(context.Background()); r.Err != nil {
+		t.Fatalf("cold start: %v", r.Err)
+	}
+
+	// One cycle to take the first scan, which a fresh process always does: it knows
+	// nothing yet and waiting an epoch to find out would be worse than the cost.
+	clock = clock.Add(12 * time.Second)
+	node.advance()
+	if r := syncer.Cycle(context.Background()); r.Err != nil {
+		t.Fatalf("first cycle: %v", r.Err)
+	}
+	if len(node.scanned()) == 0 {
+		t.Fatal("a fresh process should scan on its first cycle rather than wait an epoch")
+	}
+
+	// Thirty further cycles inside the same epoch. None of them should scan, and none
+	// should re-read the finalized block.
+	node.reset()
+	for i := 0; i < 30; i++ {
+		clock = clock.Add(12 * time.Second)
+		node.advance()
+		if r := syncer.Cycle(context.Background()); r.Err != nil {
+			t.Fatalf("cycle %d: %v", i, r.Err)
+		}
+	}
+	if got := len(node.scanned()); got != 0 {
+		t.Errorf("%d operator scans inside one epoch, want none", got)
+	}
+	if got := node.finalizedReads(); got != 0 {
+		t.Errorf("%d finalized reads inside one epoch, want none", got)
+	}
+
+	// Crossing the epoch boundary: one scan of each family, over everything that
+	// accumulated rather than only the newest block.
+	node.reset()
+	clock = clock.Add(2 * 12 * time.Second)
+	node.advance()
+	r := syncer.Cycle(context.Background())
+	if r.Err != nil {
+		t.Fatalf("cycle at the epoch boundary: %v", r.Err)
+	}
+	if r.Action != ActionExtend {
+		t.Fatalf("action %q (%s), want extend", r.Action, r.Reason)
+	}
+	scans := node.scanned()
+	if len(scans) != 2 {
+		t.Fatalf("%d log filters after a full epoch, want 2 — one per module family", len(scans))
+	}
+	for _, scan := range scans {
+		if width := scan[1] - scan[0]; width < 30 {
+			t.Errorf("scanned %d..%d — %d blocks; want the whole epoch's worth accumulated",
+				scan[0], scan[1], width+1)
+		}
+	}
+	if got := node.finalizedReads(); got != 1 {
+		t.Errorf("%d finalized reads at the epoch boundary, want 1", got)
+	}
+}
+
+// With the pacing off — a devnet that sets either constant to zero — both reads happen
+// every cycle, which is what they did before the pacing existed.
+func TestZeroEpochKeepsThePerCycleReads(t *testing.T) {
+	node := newBudgetNode()
+	server := httptest.NewServer(node)
+	defer server.Close()
+
+	syncer, _ := budgetSyncerOver(t, server.URL, newFakeStore())
+	syncer.cfg.EpochDuration = 0
+
+	if r := syncer.Cycle(context.Background()); r.Err != nil {
+		t.Fatalf("cold start: %v", r.Err)
+	}
+	node.advance()
+	node.reset()
+	if r := syncer.Cycle(context.Background()); r.Err != nil {
+		t.Fatalf("quiet cycle: %v", r.Err)
+	}
+	if len(node.scanned()) == 0 {
+		t.Error("no operator scan with the pacing disabled")
+	}
+	if node.finalizedReads() != 1 {
+		t.Errorf("%d finalized reads, want 1 per cycle with the pacing disabled", node.finalizedReads())
+	}
+}
+
+// A restart is not a cold start. The question is asked of the database — one query for
+// the newest published version, whose row carries the per-module nonces the last cycle
+// observed — so a process that comes back up compares those against the chain and reads
+// no keys at all unless something actually moved. Worth pinning because the alternative
+// is invisible: re-reading 500 000 keys on every deploy would look like a slow start
+// rather than like a bug.
+func TestRestartWithAPopulatedStoreReadsNoKeys(t *testing.T) {
+	node := newBudgetNode()
+	server := httptest.NewServer(node)
+	defer server.Close()
+
+	syncer, store := budgetSyncer(t, server.URL)
+	if r := syncer.Cycle(context.Background()); r.Err != nil {
+		t.Fatalf("cold start: %v", r.Err)
+	}
+	if store.keyWrites != len(budgetModules) {
+		t.Fatalf("cold start read %d modules' keys, want all %d", store.keyWrites, len(budgetModules))
+	}
+	keysBefore := store.keyWrites
+
+	// The restart: a new Syncer and a new provider — no in-memory state survives — over
+	// the same store. Everything this cycle knows about the past comes from the database.
+	node.advance()
+	node.reset()
+	restarted, _ := budgetSyncerOver(t, server.URL, store)
+
+	r := restarted.Cycle(context.Background())
+	if r.Err != nil {
+		t.Fatalf("first cycle after the restart: %v", r.Err)
+	}
+	if r.Action != ActionExtend {
+		t.Fatalf("action %q (%s), want extend: nothing changed while the process was down", r.Action, r.Reason)
+	}
+	if store.keyWrites != keysBefore {
+		t.Errorf("%d modules had their keys re-read after a restart, want none", store.keyWrites-keysBefore)
+	}
+
+	// What a restart does cost, and it is worth stating rather than leaving to be
+	// discovered: one extra eth_call, because the staking router address is resolved
+	// before it can be verified against anything, and a wide event scan, because the
+	// scan mark is in memory and starts empty again.
+	if got := node.count("eth_call"); got != 3 {
+		t.Errorf("eth_call %d, want 3: a quiet cycle's 2 plus one to resolve the router cold", got)
+	}
+	for _, scan := range node.scanned() {
+		if scan[0] != store.latest.BlockNumber+1 {
+			t.Errorf("scanned %d..%d, want the range to restart at the published version's block %d",
+				scan[0], scan[1], store.latest.BlockNumber+1)
+		}
+	}
+
+	// And the cycle after that is an ordinary quiet cycle again.
+	node.advance()
+	node.reset()
+	if r := restarted.Cycle(context.Background()); r.Err != nil {
+		t.Fatalf("second cycle after the restart: %v", r.Err)
+	}
+	if got := node.count("eth_call"); got != 2 {
+		t.Errorf("eth_call %d, want 2: the router is cached from here on", got)
+	}
+}
+
+// A crash *during* the cold sync is the case that costs real money, and it is not
+// resumable: an unfinished version stays `building`, Latest only considers published and
+// stale ones, so the next start finds nothing and reads the whole registry again. A pod
+// that keeps dying before its first version lands therefore re-reads 500 000 keys every
+// time it comes up, which is how a provider's daily quota goes in an afternoon.
+//
+// Pinned rather than fixed. Resuming means deciding what a half-read version at a block
+// the chain has moved past is worth, and the answer is probably nothing — but the cost
+// of not resuming should be a measured statement rather than a surprise.
+func TestACrashDuringTheColdSyncStartsOver(t *testing.T) {
+	node := newBudgetNode()
+	server := httptest.NewServer(node)
+	defer server.Close()
+
+	store := newFakeStore()
+	syncer, _ := budgetSyncerOver(t, server.URL, store)
+
+	// The first cold sync dies partway through.
+	store.failOperators = true
+	r := syncer.Cycle(context.Background())
+	if r.Err == nil {
+		t.Fatal("want the cold sync to fail")
+	}
+	if store.latest != nil {
+		t.Fatal("an unfinished version must not be served")
+	}
+	keysAfterFailure := store.keyWrites
+	if keysAfterFailure == 0 {
+		t.Fatal("the failed sync should have read at least one module before dying")
+	}
+
+	// It comes back up. Nothing is inherited: every module's keys are read again.
+	store.failOperators = false
+	node.advance()
+	restarted, _ := budgetSyncerOver(t, server.URL, store)
+
+	next := restarted.Cycle(context.Background())
+	if next.Err != nil {
+		t.Fatalf("cold sync after the crash: %v", next.Err)
+	}
+	if next.Reason != "no published version" {
+		t.Errorf("reason %q, want a cold start: a building version is not resumed", next.Reason)
+	}
+	if got := store.keyWrites - keysAfterFailure; got != len(budgetModules) {
+		t.Errorf("%d modules had their keys read, want all %d read from scratch", got, len(budgetModules))
+	}
+}
+
+// The one case where a restart does re-read everything, and it is the periodic audit
+// rather than the restart: a published version whose own block is MAX_BLOCKS_OVERLAP
+// behind head. Downtime longer than that window puts any deployment here, which is the
+// thing to know before setting the window narrow.
+func TestRestartAfterLongDowntimeRunsTheAudit(t *testing.T) {
+	node := newBudgetNode()
+	server := httptest.NewServer(node)
+	defer server.Close()
+
+	syncer, store := budgetSyncerOverWithGap(t, server.URL, newFakeStore(), 100)
+	if r := syncer.Cycle(context.Background()); r.Err != nil {
+		t.Fatalf("cold start: %v", r.Err)
+	}
+	keysBefore := store.keyWrites
+
+	// Down for longer than the window.
+	for i := 0; i < 100; i++ {
+		node.advance()
+	}
+	restarted, _ := budgetSyncerOverWithGap(t, server.URL, store, 100)
+
+	r := restarted.Cycle(context.Background())
+	if r.Err != nil {
+		t.Fatalf("first cycle after a long gap: %v", r.Err)
+	}
+	if r.Action != ActionRebuild {
+		t.Fatalf("action %q (%s), want rebuild", r.Action, r.Reason)
+	}
+	if !strings.Contains(r.Reason, "block gap") {
+		t.Errorf("reason %q should name the block gap, not something else", r.Reason)
+	}
+	// Flagged as an audit, which is what lets the metric separate "re-read everything
+	// on a timer" from "re-read everything because a signal fired". Paired with
+	// KeysChanged it is the only check on the nonce assumption.
+	if !r.Audit {
+		t.Error("a block-gap rebuild should be marked as the audit")
+	}
+	if got := store.keyWrites - keysBefore; got != len(budgetModules) {
+		t.Errorf("%d modules had their keys re-read, want all %d: the audit trusts no signal", got, len(budgetModules))
+	}
+}
+
 // assertEveryModuleWritten checks that the rebuild was not scoped to a subset: a
 // provenance change invalidates every module row, and a scope would leave the modules
 // whose nonce happened not to move holding rows decoded the old way.
@@ -462,6 +844,18 @@ func TestWithdrawalCredentialsTypeFollowsTheContractVersion(t *testing.T) {
 
 func budgetSyncer(t *testing.T, url string) (*Syncer, *fakeStore) {
 	t.Helper()
+	return budgetSyncerOver(t, url, newFakeStore())
+}
+
+// budgetSyncerOver builds a syncer over an existing store, which is what a restart is:
+// the process keeps nothing, the database keeps everything.
+func budgetSyncerOver(t *testing.T, url string, store *fakeStore) (*Syncer, *fakeStore) {
+	t.Helper()
+	return budgetSyncerOverWithGap(t, url, store, 1000)
+}
+
+func budgetSyncerOverWithGap(t *testing.T, url string, store *fakeStore, gap int64) (*Syncer, *fakeStore) {
+	t.Helper()
 
 	client := eth.NewClient(url, eth.Options{
 		Concurrency: 4, BatchSize: 100,
@@ -471,8 +865,7 @@ func budgetSyncer(t *testing.T, url string) (*Syncer, *fakeStore) {
 		Multicall: false,
 	})
 	provider := lidocore.NewProvider(client, budgetLocator, lidocore.Options{})
-	store := newFakeStore()
-	return NewSyncer(provider, store, SyncConfig{MaxBlockGap: 1000}, nil), store
+	return NewSyncer(provider, store, SyncConfig{MaxBlockGap: gap}, nil), store
 }
 
 func assertRequests(t *testing.T, node *budgetNode, want map[string]int, total int) {
@@ -504,13 +897,25 @@ func assertRequests(t *testing.T, node *budgetNode, want map[string]int, total i
 type budgetNode struct {
 	mu       sync.Mutex
 	requests map[string]int
-	block    int64
-	router   string
-	version  int64
-	wcType   uint8
-	nonces   map[string]int64
-	logHits  map[string]bool
-	scans    [][2]int64
+	calls    map[string]int
+	// multicall makes the fake answer eth_getCode for the Multicall3 address and
+	// execute aggregate3, which is what the client probes for before aggregating.
+	multicall bool
+	block     int64
+	router    string
+	version   int64
+	wcType    uint8
+	nonces    map[string]int64
+	logHits   map[string]bool
+	scans     [][2]int64
+	finReads  int
+}
+
+// finalizedReads counts eth_getBlockByNumber("finalized") since the last reset.
+func (n *budgetNode) finalizedReads() int {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return n.finReads
 }
 
 // scanned returns the block ranges the node was asked about since the last reset.
@@ -548,6 +953,7 @@ const (
 func newBudgetNode() *budgetNode {
 	n := &budgetNode{
 		requests: map[string]int{},
+		calls:    map[string]int{},
 		block:    1000,
 		router:   budgetRouter,
 		version:  routerContractVersion,
@@ -599,7 +1005,29 @@ func (n *budgetNode) reset() {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	n.requests = map[string]int{}
+	n.calls = map[string]int{}
 	n.scans = nil
+	n.finReads = 0
+}
+
+// profile is every JSON-RPC call sent since the last reset, by method — the shape the
+// quota projection is built from.
+func (n *budgetNode) profile() callProfile {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	out := callProfile{calls: make(map[string]int, len(n.calls))}
+	for method, count := range n.calls {
+		out.calls[method] = count
+	}
+	return out
+}
+
+// billedCalls is the number of JSON-RPC objects sent, which is what a compute-unit
+// provider charges for. An aggregate counts as the one eth_call it is.
+func (n *budgetNode) billedCalls(method string) int {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return n.calls[method]
 }
 
 func (n *budgetNode) clearOperatorEvents() {
@@ -652,14 +1080,18 @@ func (n *budgetNode) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// One HTTP round trip is one request, whatever it carries: that is what an
-	// endpoint meters and what the client's own counter counts. A JSON-RPC batch
-	// mixing methods is recorded under the first one, the same label the client uses.
+	// Two different counts, because two different things get billed. One HTTP round
+	// trip is one request — what a provider charging per request bills, and what the
+	// client's own counter reports. The JSON-RPC objects inside it are what a provider
+	// charging compute units bills, and on dRPC that is the number that matters.
+	n.mu.Lock()
 	if len(reqs) > 0 {
-		n.mu.Lock()
 		n.requests[reqs[0].Method]++
-		n.mu.Unlock()
 	}
+	for _, req := range reqs {
+		n.calls[req.Method]++
+	}
+	n.mu.Unlock()
 
 	out := make([]json.RawMessage, 0, len(reqs))
 	for _, req := range reqs {
@@ -689,6 +1121,11 @@ func (n *budgetNode) answer(req budgetRequest) json.RawMessage {
 
 		var tag string
 		_ = json.Unmarshal(req.Params[0], &tag)
+		if tag == "finalized" {
+			n.mu.Lock()
+			n.finReads++
+			n.mu.Unlock()
+		}
 		block := head
 		if strings.HasPrefix(tag, "0x") {
 			asked, ok := new(big.Int).SetString(strings.TrimPrefix(tag, "0x"), 16)
@@ -706,6 +1143,15 @@ func (n *budgetNode) answer(req budgetRequest) json.RawMessage {
 		var hash string
 		_ = json.Unmarshal(req.Params[0], &hash)
 		return budgetResult(req.ID, budgetHeader(blockOfHash(hash)))
+
+	case "eth_getCode":
+		n.mu.Lock()
+		on := n.multicall
+		n.mu.Unlock()
+		if !on {
+			return budgetResult(req.ID, "0x")
+		}
+		return budgetResult(req.ID, "0x6000")
 
 	case "eth_getLogs":
 		var filter struct {
@@ -752,6 +1198,10 @@ func (n *budgetNode) answerCall(id int, to string, data []byte) json.RawMessage 
 	}
 	sel := string(data[:4])
 
+	if to == strings.ToLower(eth.MulticallAddress) {
+		return n.answerAggregate(id, data)
+	}
+
 	switch {
 	case to == budgetLocator && sel == selector(&eth.LocatorABI, "stakingRouter"):
 		return budgetResult(id, word(common.FromHex(router)))
@@ -788,6 +1238,49 @@ func (n *budgetNode) answerCall(id int, to string, data []byte) json.RawMessage 
 	default:
 		return budgetError(id, "unexpected call to "+to)
 	}
+}
+
+// answerAggregate executes an aggregate3 by dispatching each inner call through the
+// same answerCall the plain path uses, so an aggregated cycle and a plain one are
+// answered identically and only the billed-call count differs.
+func (n *budgetNode) answerAggregate(id int, data []byte) json.RawMessage {
+	type call3 struct {
+		Target       common.Address
+		AllowFailure bool
+		CallData     []byte
+	}
+	type call3Result struct {
+		Success    bool
+		ReturnData []byte
+	}
+
+	values, err := eth.MulticallABI.Methods["aggregate3"].Inputs.Unpack(data[4:])
+	if err != nil {
+		return budgetError(id, "bad aggregate3 input: "+err.Error())
+	}
+	inner := *abi.ConvertType(values[0], new([]call3)).(*[]call3)
+
+	results := make([]call3Result, 0, len(inner))
+	for _, c := range inner {
+		raw := n.answerCall(0, strings.ToLower(c.Target.Hex()), c.CallData)
+		var decoded struct {
+			Result string `json:"result"`
+			Error  *struct {
+				Message string `json:"message"`
+			} `json:"error"`
+		}
+		_ = json.Unmarshal(raw, &decoded)
+		if decoded.Error != nil {
+			return budgetError(id, "inner call failed: "+decoded.Error.Message)
+		}
+		results = append(results, call3Result{Success: true, ReturnData: common.FromHex(decoded.Result)})
+	}
+
+	packed, err := eth.MulticallABI.Methods["aggregate3"].Outputs.Pack(results)
+	if err != nil {
+		return budgetError(id, err.Error())
+	}
+	return budgetResult(id, "0x"+common.Bytes2Hex(packed))
 }
 
 func word(b []byte) string {

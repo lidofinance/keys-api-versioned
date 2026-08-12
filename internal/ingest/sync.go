@@ -40,6 +40,20 @@ type Syncer struct {
 	// job is saving requests.
 	scannedTo int64
 
+	// When the epoch-paced reads last happened. Zero means never, so the first cycle
+	// does both — a service that has just started knows nothing and should not wait an
+	// epoch to find out.
+	lastScanAt      time.Time
+	lastFinalizedAt time.Time
+	// finalized is the last answer, reused between reads. A pin that is one epoch stale
+	// is exactly as safe as a fresh one: it names a block that cannot be reorged away,
+	// and being conservative about which block that is costs nothing.
+	finalized model.ELBlockSnapshot
+
+	// now is the clock, injectable so that the epoch pacing can be tested without
+	// sleeping for an epoch.
+	now func() time.Time
+
 	// hooks let the app observe cycles without this package importing metrics.
 	OnCycle func(CycleResult)
 	// OnModule fires once per module a rebuild read, before the version is
@@ -89,6 +103,18 @@ type SyncConfig struct {
 	MaxBlockGap int64
 	// RetainVersions is the retention window. 0 disables pruning.
 	RetainVersions int
+	// EpochDuration is how long one beacon epoch lasts, and it paces the reads whose
+	// subject does not change faster than that: the operator event scan and the
+	// finalized block.
+	//
+	// Computed rather than fetched — seconds per slot times slots per epoch — because
+	// this service has no consensus client and does not want one for a constant. A
+	// devnet with a two-second slot says so in configuration; nothing here assumes
+	// mainnet.
+	//
+	// Zero disables the pacing and both reads happen every cycle, which is what they
+	// did before this existed.
+	EpochDuration time.Duration
 	// BuildAtFinalized reads the registry at the finalized block rather than at the
 	// head.
 	//
@@ -114,6 +140,10 @@ type CycleResult struct {
 	Action         Action
 	Reason         string
 	ChangedModules []string
+	// Audit is set when the block-gap rule triggered this cycle's rebuild. Paired with
+	// KeysChanged it is the check on the whole freshness mechanism: an audit that
+	// changed rows means the nonce missed something.
+	Audit bool
 	// Modules is the module set with the nonces this cycle read, empty on a cycle
 	// that failed before the cheap read.
 	Modules      []ModuleNonce
@@ -157,7 +187,7 @@ func NewSyncer(src source.Provider, store Store, cfg SyncConfig, log *slog.Logge
 	if log == nil {
 		log = slog.New(slog.NewTextHandler(io.Discard, nil))
 	}
-	return &Syncer{source: src, store: store, cfg: cfg, log: log}
+	return &Syncer{source: src, store: store, cfg: cfg, log: log, now: time.Now}
 }
 
 // Run cycles until the context is cancelled. A failing cycle is logged and
@@ -202,6 +232,37 @@ func (s *Syncer) Cycle(ctx context.Context) (result CycleResult) {
 	result.HeadBlock = head.BlockNumber
 	result.HeadTimestamp = head.Timestamp
 
+	latest, err := s.store.Latest(ctx)
+	if err != nil {
+		result.Err = err
+		return result
+	}
+
+	// The head has not moved, so nothing can have: no new block means no new state, and
+	// every signal below would be read at a point already accounted for. One request,
+	// then out.
+	//
+	// This is the canonical service's own trick — `Same blockHash, updating is not
+	// required` in keys-update.service.ts — and it is what makes its five-second default
+	// affordable: most polls of a twelve-second chain see the block they saw last time.
+	// Nothing is written either, which is right: extending a version to a head it is
+	// already recorded at would be a write that says nothing.
+	if latest != nil && head.BlockHash != "" && sameHash(head.BlockHash, latest.HeadBlockHash) {
+		result.Action = ActionExtend
+		result.Reason = fmt.Sprintf("head is still %d, nothing to confirm", head.BlockNumber)
+		result.VersionBlock = latest.BlockNumber
+		result.VersionTimestamp = latest.Timestamp
+		result.FinalizedBlock = s.finalized.BlockNumber
+		// Modules deliberately left empty. A gauge keeps its last value, so not setting
+		// the per-module nonces is the accurate statement — this cycle did not read them
+		// and the previous ones still hold. Reconstructing them from the version row
+		// would need module ids the row does not carry (it is keyed by address), and a
+		// zero id would collapse every module onto one series.
+		s.log.Debug("cycle: head unchanged, nothing to do",
+			"head", head.BlockNumber, "hash", head.BlockHash, "version", latest.BlockNumber)
+		return result
+	}
+
 	// One header read, and its only use is choosing among versions this service already
 	// built: `?snapshot=finalized` resolves to the newest published version at or below it.
 	// It is never a point registry state is read at — everything below stays pinned to
@@ -225,12 +286,6 @@ func (s *Syncer) Cycle(ctx context.Context) (result CycleResult) {
 
 	s.log.Debug("cycle: head", "block", head.BlockNumber, "hash", head.BlockHash,
 		"timestamp", head.Timestamp, "finalized", finalized, "reading_at", readAt.BlockNumber)
-
-	latest, err := s.store.Latest(ctx)
-	if err != nil {
-		result.Err = err
-		return result
-	}
 
 	// Nothing published yet: build everything. This is the cold start, and it is
 	// the only path that reads every module's keys unconditionally.
@@ -282,10 +337,23 @@ func (s *Syncer) Cycle(ctx context.Context) (result CycleResult) {
 
 	// Is the version still on the chain? A hash mismatch at its own height means
 	// the branch it was built on is gone.
-	reorged, forkPoint, err := s.detectReorg(ctx, *latest)
-	if err != nil {
-		result.Err = err
-		return result
+	//
+	// Skipped outright once the version's own block is finalized, which is not an
+	// optimisation with a trade in it: a finalized block cannot be reorged, so the probe
+	// can only ever confirm what finality already guarantees. And it is the common case
+	// rather than a corner — a version that nothing changed is never rewritten, so within
+	// about two epochs of the last rebuild it sits below the finalized block and stays
+	// there. `finalized` may itself be up to an epoch stale, which errs towards probing.
+	reorged, forkPoint := false, int64(0)
+	if finalized > 0 && latest.BlockNumber <= finalized {
+		s.log.Debug("reorg probe skipped: the version's block is finalized",
+			"version", latest.BlockNumber, "finalized", finalized)
+	} else {
+		reorged, forkPoint, err = s.detectReorg(ctx, *latest)
+		if err != nil {
+			result.Err = err
+			return result
+		}
 	}
 	if reorged {
 		// Every hash in the store disagreeing with the chain is what a reorg looks like,
@@ -373,7 +441,14 @@ func (s *Syncer) Cycle(ctx context.Context) (result CycleResult) {
 	// the canonical service's and worth keeping literal; what changes here is only when
 	// the input is fetched.
 	decision := Evaluate(latest.AsVersion(), state, s.cfg.MaxBlockGap)
-	if decision.Action == ActionExtend {
+	if decision.Action == ActionExtend && !s.dueForEpochRead(s.lastScanAt) {
+		// Not due. The signal is simply absent this cycle, which reads as "nothing
+		// changed" and leaves the version extended — and the scan mark stays where it
+		// is, so the blocks skipped here are covered by the next scan rather than lost.
+		s.log.Debug("operator event scan not due yet",
+			"last_scan", s.lastScanAt, "epoch", s.cfg.EpochDuration.String())
+	} else if decision.Action == ActionExtend {
+		s.lastScanAt = s.now()
 		from := s.scanFloor(latest.BlockNumber)
 		state.OperatorEvents, err = s.operatorEvents(ctx, modules, from, head.BlockNumber)
 		switch {
@@ -405,6 +480,7 @@ func (s *Syncer) Cycle(ctx context.Context) (result CycleResult) {
 	result.Action = decision.Action
 	result.Reason = decision.Reason
 	result.ChangedModules = decision.ChangedModules
+	result.Audit = decision.Audit
 	if result.ReorgFrom > 0 {
 		// The action stays whatever the incremental check decided, because that is what
 		// the cycle did. A reorg that ends in "extend" is the expected outcome on
@@ -452,6 +528,17 @@ func (s *Syncer) Cycle(ctx context.Context) (result CycleResult) {
 		}
 		result.VersionBlock = head.BlockNumber
 		result.VersionTimestamp = head.Timestamp
+
+		// The audit is the only check on the assumption every cheap signal rests on:
+		// that a module's nonce moves whenever its keys do. A healthy audit re-reads
+		// everything and writes nothing, which makes it a verifiable statement rather
+		// than a belief — and one that writes rows says a key was added or removed
+		// without the counter moving, which nothing else here would ever notice.
+		if decision.Audit && result.KeysChanged > 0 {
+			s.log.Error("the periodic audit changed key rows, so a module nonce did not report a change",
+				"rows_changed", result.KeysChanged, "keys_read", result.KeysStaged,
+				"version", latest.BlockNumber, "head", head.BlockNumber)
+		}
 	}
 
 	s.prune(ctx)
@@ -715,12 +802,43 @@ func (s *Syncer) finalizedBlock(ctx context.Context) model.ELBlockSnapshot {
 	if !ok {
 		return model.ELBlockSnapshot{}
 	}
+	if !s.dueForEpochRead(s.lastFinalizedAt) {
+		// Finality advances once per epoch, so between epochs this read can only return
+		// what it returned last time. Reusing the answer is not a staleness compromise:
+		// the block it names is still final, and naming an older final block is the
+		// conservative direction — `?snapshot=finalized` resolves to a version at or
+		// below it either way.
+		return s.finalized
+	}
 	block, err := reporter.FinalizedBlock(ctx)
 	if err != nil {
-		s.log.Warn("could not read the finalized block; the finalized pin stays unavailable this cycle", "err", err)
-		return model.ELBlockSnapshot{}
+		// The previous answer, not zero: a block that was final an epoch ago is final
+		// now, and dropping the pin because one read failed would take
+		// `?snapshot=finalized` away from consumers for no reason.
+		s.log.Warn("could not read the finalized block; keeping the previous one",
+			"previous", s.finalized.BlockNumber, "err", err)
+		return s.finalized
 	}
+	s.lastFinalizedAt = s.now()
+	s.finalized = block
 	return block
+}
+
+// dueForEpochRead reports whether an epoch-paced read should happen now.
+//
+// The reads it paces have subjects that do not move faster than an epoch — the finalized
+// block advances once per epoch by definition, and an operator rename is a months-apart
+// event — while the cycle runs every few seconds. Before this, both were read at the
+// cycle's rate, which on a metered provider is most of the bill for information that
+// could not have changed.
+//
+// A zero timestamp is always due: a process that has just started knows nothing, and
+// waiting an epoch to find out would be worse than the cost it saves.
+func (s *Syncer) dueForEpochRead(last time.Time) bool {
+	if s.cfg.EpochDuration <= 0 || last.IsZero() {
+		return true
+	}
+	return s.now().Sub(last) >= s.cfg.EpochDuration
 }
 
 // scanFloor is the block the next event scan starts above: the published version's own

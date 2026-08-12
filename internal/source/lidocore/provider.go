@@ -209,18 +209,14 @@ func (p *Provider) FinalizedBlock(ctx context.Context) (model.ELBlockSnapshot, e
 
 // Head returns the block a cycle should read at.
 func (p *Provider) Head(ctx context.Context) (model.ELBlockSnapshot, error) {
-	number, hash, err := p.client.Head(ctx)
-	if err != nil {
-		return model.ELBlockSnapshot{}, err
-	}
-	ts, err := p.client.BlockTimestamp(ctx, hash)
+	number, hash, timestamp, err := p.client.Head(ctx)
 	if err != nil {
 		return model.ELBlockSnapshot{}, err
 	}
 	return model.ELBlockSnapshot{
 		BlockNumber:          number.Int64(),
 		BlockHash:            hash,
-		Timestamp:            ts,
+		Timestamp:            timestamp,
 		LastChangedBlockHash: hash,
 	}, nil
 }

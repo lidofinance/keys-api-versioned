@@ -61,6 +61,12 @@ type Metrics struct {
 	RebuildsTotal prometheus.Counter
 	ReorgsTotal   prometheus.Counter
 
+	// The periodic audit and what it found. AuditsTotal counts them;
+	// AuditDivergenceTotal counts the key rows an audit had to change, which should
+	// stay at zero forever — see the help text.
+	AuditsTotal          prometheus.Counter
+	AuditDivergenceTotal prometheus.Counter
+
 	RequestDuration *prometheus.HistogramVec
 	ResponseBytes   *prometheus.CounterVec
 
@@ -69,6 +75,11 @@ type Metrics struct {
 	// a contract read and a request is a round trip.
 	RPCRequests *prometheus.CounterVec
 	RPCCalls    prometheus.Counter
+
+	// EndpointRequests is labelled by host, which rpc_requests_total deliberately is
+	// not: the question it answers is "which provider is actually serving us", and a
+	// fallback that quietly became the primary is the thing to alert on.
+	EndpointRequests *prometheus.CounterVec
 
 	RouterChanges  prometheus.Counter
 	RouterVersion  prometheus.Gauge
@@ -167,6 +178,14 @@ func New(namespace string) *Metrics {
 			Namespace: namespace, Name: "reorgs_total",
 			Help: "Reorgs that rolled versions back.",
 		}),
+		AuditsTotal: prometheus.NewCounter(prometheus.CounterOpts{
+			Namespace: namespace, Name: "audits_total",
+			Help: "Rebuilds triggered by the block-gap rule rather than by a signal. The audit re-reads everything on purpose, so this climbing steadily is healthy.",
+		}),
+		AuditDivergenceTotal: prometheus.NewCounter(prometheus.CounterOpts{
+			Namespace: namespace, Name: "audit_divergence_total",
+			Help: "Key rows an audit had to change. It should stay at zero: the audit trusts none of the cheap signals, so anything it finds is something a module nonce failed to report — a key added or removed without the counter moving. Alert on any increase; it invalidates the assumption the whole freshness mechanism rests on.",
+		}),
 		RequestDuration: prometheus.NewHistogramVec(prometheus.HistogramOpts{
 			Namespace: namespace, Name: "http_request_duration_seconds",
 			Help:    "Request duration by route and status.",
@@ -188,6 +207,10 @@ func New(namespace string) *Metrics {
 			Namespace: namespace, Name: "staking_router_changes_total",
 			Help: "Times the locator started answering with a different staking router. Non-zero means a protocol deploy replaced the router and this service followed it; it should agree with a deploy that actually happened.",
 		}),
+		EndpointRequests: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: namespace, Name: "rpc_endpoint_requests_total",
+			Help: "Execution-layer round trips by endpoint host and outcome. Success on a fallback host means the primary is refusing — a provider out of quota looks healthy from every other metric.",
+		}, []string{"endpoint", "result"}),
 		RouterVersion: prometheus.NewGauge(prometheus.GaugeOpts{
 			Namespace: namespace, Name: "staking_router_contract_version",
 			Help: "The staking router's own contract version, as read every cycle. It decides how the module tuple is interpreted, so an alert on a change is an alert on the registry being read differently.",
@@ -242,8 +265,9 @@ func New(namespace string) *Metrics {
 
 	reg.MustRegister(m.CyclesTotal, m.CycleDuration, m.KeysRead, m.KeysChanged,
 		m.VersionBlock, m.VersionAge, m.ConfirmedAge, m.HeadBlock, m.BlocksBehind, m.VersionStale,
-		m.RebuildsTotal, m.ReorgsTotal, m.RequestDuration, m.ResponseBytes,
-		m.RPCRequests, m.RPCCalls, m.RouterChanges, m.RouterVersion, m.VersionChanges,
+		m.RebuildsTotal, m.ReorgsTotal, m.AuditsTotal, m.AuditDivergenceTotal,
+		m.RequestDuration, m.ResponseBytes,
+		m.RPCRequests, m.RPCCalls, m.EndpointRequests, m.RouterChanges, m.RouterVersion, m.VersionChanges,
 		m.ELRPCDuration, m.CanonicalHTTP, m.BuildInfo, m.JobDuration, m.ModuleKeyUpdate,
 		m.LastUpdate, m.LastBlockNumber, m.Nonce, m.KeysByModuleAndOp)
 	return m
@@ -279,10 +303,13 @@ func (m *Metrics) BindRPCStats(namespace string, snapshot func() RPCStats) {
 // ObserveRPC records one execution-layer round trip, in both surfaces: ours, which
 // is labelled by method because "which call is the expensive one" is the question
 // that follows, and the canonical histogram, which is not.
-func (m *Metrics) ObserveRPC(method, result string, calls int, d time.Duration) {
+func (m *Metrics) ObserveRPC(method, result, endpoint string, calls int, d time.Duration) {
 	m.RPCRequests.WithLabelValues(method, result).Inc()
 	m.RPCCalls.Add(float64(calls))
 	m.ELRPCDuration.WithLabelValues(result).Observe(d.Seconds())
+	if endpoint != "" {
+		m.EndpointRequests.WithLabelValues(endpoint, result).Inc()
+	}
 }
 
 // ObserveJob records one sync cycle as the canonical job histogram.

@@ -69,6 +69,11 @@ type Decision struct {
 	Action         Action
 	Reason         string
 	ChangedModules []string
+	// Audit is set when this rebuild was triggered by the block-gap rule rather than by
+	// a signal. It exists to be measured: the audit trusts none of the cheap signals,
+	// so a healthy one writes nothing, and one that writes rows is the only evidence
+	// that a nonce did not move when it should have.
+	Audit bool
 	// Depth is how much of a module has to be read again, and it belongs with the
 	// reason rather than with the caller: what changed is what says what is stale.
 	// Every rebuild rewrites module rows regardless — that read is the module set,
@@ -170,6 +175,7 @@ func Evaluate(v Version, head HeadState, maxBlockGap int64) Decision {
 			Action: ActionRebuild,
 			Reason: fmt.Sprintf("block gap %d is at or above the limit %d",
 				head.BlockNumber-v.BlockNumber, maxBlockGap),
+			Audit: true,
 			// The audit exists to catch a signal that lied, so it trusts none of them.
 			Depth: DepthKeys,
 		}

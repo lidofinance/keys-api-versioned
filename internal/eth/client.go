@@ -109,6 +109,7 @@ type Client struct {
 	// Multicall3 aggregation: whether it was asked for, where it lives, what the
 	// presence probe found, and how much of it the endpoint turned out to tolerate.
 	multicall  bool
+	metered    bool
 	mcAddress  string
 	mcMaxCalls int
 	mcMaxCost  atomic.Int64
@@ -139,6 +140,9 @@ type Options struct {
 	// MulticallAddress overrides the standard deployment address. Only a chain that
 	// has Multicall3 somewhere else needs this.
 	MulticallAddress string
+	// Metered says the endpoints bill per call rather than per round trip, which
+	// inverts when aggregation is worth using — see shouldAggregate.
+	Metered bool
 	// MulticallMaxCalls caps how many reads go into one aggregate, and
 	// MulticallMaxCost caps their total Cost — the one that binds in practice, since
 	// an aggregate's inner calls share a single gas budget. A read whose own cost is
@@ -168,6 +172,11 @@ type RequestInfo struct {
 	// fetch middleware uses.
 	Result   string
 	Duration time.Duration
+	// Endpoint is the host that answered, without the path — a hosted provider carries
+	// its API key there. It exists so that silently running on the fallback is
+	// observable: the failure mode of a fallback list is nobody noticing the first
+	// entry died until the second one does too.
+	Endpoint string
 }
 
 // stats counts what the client sent. Round trips are the figure the ingest
@@ -241,6 +250,7 @@ func NewClient(urls string, o Options) *Client {
 		batchSz:    o.BatchSize,
 		log:        o.Log,
 		multicall:  o.Multicall,
+		metered:    o.Metered,
 		mcAddress:  strings.ToLower(o.MulticallAddress),
 		mcMaxCalls: o.MulticallMaxCalls,
 		observe:    o.Observe,
@@ -304,7 +314,7 @@ func (c *Client) do(ctx context.Context, reqs []rpcRequest) ([]json.RawMessage, 
 		c.stats.requests.Add(1)
 		resp, err := c.http.Do(req)
 		if err != nil {
-			c.observed(method, len(reqs), "error", time.Since(started))
+			c.observed(method, len(reqs), "error", hostOf(url), time.Since(started))
 			lastErr = err
 			// An endpoint failing is worth a line at warn: the fallback hides it from
 			// everything else, and a node quietly out of the rotation is the kind of
@@ -316,13 +326,25 @@ func (c *Client) do(ctx context.Context, reqs []rpcRequest) ([]json.RawMessage, 
 
 		var out []rpcResponse
 		err = json.NewDecoder(resp.Body).Decode(&out)
+		status := resp.StatusCode
 		resp.Body.Close()
 		took := time.Since(started)
 		if err != nil {
-			c.observed(method, len(reqs), "error", took)
+			c.observed(method, len(reqs), "error", hostOf(url), took)
 			lastErr = fmt.Errorf("decode: %w", err)
 			c.log.Warn("rpc response could not be decoded",
-				"endpoint", hostOf(url), "method", method, "err", err)
+				"endpoint", hostOf(url), "method", method, "status", status, "err", err)
+			continue
+		}
+
+		// A gateway that rate-limits with a 429 and a body that happens to parse would
+		// otherwise be read as a valid empty answer. The status is about the endpoint by
+		// definition, so it fails over.
+		if status < 200 || status >= 300 {
+			c.observed(method, len(reqs), "error", hostOf(url), took)
+			lastErr = fmt.Errorf("http %d from %s", status, hostOf(url))
+			c.log.Warn("rpc endpoint answered with a non-2xx status, trying the next one",
+				"endpoint", hostOf(url), "method", method, "status", status)
 			continue
 		}
 
@@ -337,10 +359,16 @@ func (c *Client) do(ctx context.Context, reqs []rpcRequest) ([]json.RawMessage, 
 		}
 
 		results := make([]json.RawMessage, len(reqs))
+		var (
+			callErr error
+			refused bool
+			refusal string
+			refCode int
+		)
 		for i, r := range reqs {
 			got, ok := byID[r.ID]
 			if !ok {
-				c.observed(method, len(reqs), "error", took)
+				c.observed(method, len(reqs), "error", hostOf(url), took)
 				return nil, fmt.Errorf("no response for id %d (%s)", r.ID, r.Method)
 			}
 			if got.Error != nil {
@@ -348,24 +376,49 @@ func (c *Client) do(ctx context.Context, reqs []rpcRequest) ([]json.RawMessage, 
 				// error for the same reason the canonical service's middleware does: a node
 				// answering "out of gas" to every aggregate is a broken endpoint, and a
 				// success rate that ignores it says the RPC surface is fine.
-				c.observed(method, len(reqs), "error", took)
-				return nil, fmt.Errorf("%s: rpc error %d: %s", r.Method, got.Error.Code, got.Error.Message)
+				c.observed(method, len(reqs), "error", hostOf(url), took)
+				err := fmt.Errorf("%s: rpc error %d: %s", r.Method, got.Error.Code, got.Error.Message)
+
+				// An error about the endpoint means the next endpoint is worth trying; one
+				// about the call means every endpoint would answer the same. See rpcerror.go
+				// — the distinction is the difference between degrading and stopping.
+				if endpointFailure(got.Error.Code, got.Error.Message) {
+					refused, refusal, refCode = true, got.Error.Message, got.Error.Code
+					lastErr = err
+				} else {
+					callErr = err
+				}
+				break
 			}
 			results[i] = got.Result
 		}
-		c.observed(method, len(reqs), "success", took)
+		if callErr != nil {
+			return nil, callErr
+		}
+		if refused {
+			c.log.Warn("rpc endpoint refused the request, trying the next one",
+				"endpoint", hostOf(url), "method", method, "calls", len(reqs),
+				"code", refCode, "err", refusal)
+			continue
+		}
+		c.observed(method, len(reqs), "success", hostOf(url), took)
 		return results, nil
 	}
 
-	return nil, fmt.Errorf("all endpoints failed: %w", lastErr)
+	// Naming the endpoints is the point: "all endpoints failed" on its own sends someone
+	// to the wrong place, and the usual shape of this is one provider out of quota while
+	// the rest of the list was never configured.
+	return nil, fmt.Errorf("all %d endpoint(s) failed, last: %w", len(c.urls), lastErr)
 }
 
 // observed hands one round trip to the hook, if there is one.
-func (c *Client) observed(method string, calls int, result string, d time.Duration) {
+func (c *Client) observed(method string, calls int, result, endpoint string, d time.Duration) {
 	if c.observe == nil {
 		return
 	}
-	c.observe(RequestInfo{Method: method, Calls: calls, Result: result, Duration: d})
+	c.observe(RequestInfo{
+		Method: method, Calls: calls, Result: result, Duration: d, Endpoint: endpoint,
+	})
 }
 
 // hostOf trims an endpoint to its host, so a log line stays readable and a URL with
@@ -403,28 +456,38 @@ func (b BlockRef) param() any {
 }
 
 // Head returns the current head block number and hash.
-func (c *Client) Head(ctx context.Context) (*big.Int, string, error) {
+func (c *Client) Head(ctx context.Context) (*big.Int, string, int64, error) {
 	res, err := c.do(ctx, []rpcRequest{{
 		JSONRPC: "2.0", ID: c.id(), Method: "eth_getBlockByNumber",
 		Params: []any{"latest", false},
 	}})
 	if err != nil {
-		return nil, "", err
+		return nil, "", 0, err
 	}
 
+	// The timestamp comes back in this same header, and reading it here is what removes
+	// a second round trip per cycle: the caller used to follow up with
+	// eth_getBlockByHash for a field it had already been sent. On a provider that bills
+	// per call that was a fifth of a quiet cycle's bill, paid for nothing.
 	var block struct {
-		Number string `json:"number"`
-		Hash   string `json:"hash"`
+		Number    string `json:"number"`
+		Hash      string `json:"hash"`
+		Timestamp string `json:"timestamp"`
 	}
 	if err := json.Unmarshal(res[0], &block); err != nil {
-		return nil, "", err
+		return nil, "", 0, err
 	}
 
 	n, ok := new(big.Int).SetString(strings.TrimPrefix(block.Number, "0x"), 16)
 	if !ok {
-		return nil, "", fmt.Errorf("bad block number %q", block.Number)
+		return nil, "", 0, fmt.Errorf("bad block number %q", block.Number)
 	}
-	return n, block.Hash, nil
+	ts, _ := new(big.Int).SetString(strings.TrimPrefix(block.Timestamp, "0x"), 16)
+	var seconds int64
+	if ts != nil {
+		seconds = ts.Int64()
+	}
+	return n, block.Hash, seconds, nil
 }
 
 // FinalizedBlock returns the newest finalized block — number, hash and timestamp — or a
@@ -642,7 +705,7 @@ func (c *Client) CallBatch(ctx context.Context, at BlockRef, calls []Call) ([][]
 	c.stats.calls.Add(int64(len(calls)))
 
 	out := make([][]any, len(calls))
-	if len(calls) > c.batchSz && c.aggregateReady(ctx, at) {
+	if c.shouldAggregate(len(calls)) && c.aggregateReady(ctx, at) {
 		if err := c.callAggregate(ctx, at, calls, out); err != nil {
 			return nil, err
 		}
@@ -652,6 +715,30 @@ func (c *Client) CallBatch(ctx context.Context, at BlockRef, calls []Call) ([][]
 		return nil, err
 	}
 	return out, nil
+}
+
+// shouldAggregate decides between one aggregate3 and N plain eth_calls, and the answer
+// depends on what the endpoint charges for.
+//
+// A node of our own bills nothing, so the only currency is time, and there the plain
+// path wins whenever a JSON-RPC batch can carry the whole group: the node answers each
+// read directly instead of executing a dispatching contract for it. Measured on the
+// steady-state cycle — 0.87 s plain against 0.99 s aggregated. Hence the default rule:
+// aggregate only when the batch cannot hold the group.
+//
+// A metered provider bills the *call*, and then the same comparison comes out the other
+// way round: eleven getters in one JSON-RPC batch is one round trip and eleven billed
+// calls, while one aggregate is one round trip and one. On dRPC that is 220 compute
+// units against 20, on a per-cycle read that runs forever — which is how a 2 000 000
+// CU daily budget went in five hours.
+//
+// A group of one is never aggregated: it would cost the same call and add the
+// dispatcher on top.
+func (c *Client) shouldAggregate(calls int) bool {
+	if c.metered {
+		return calls > 1
+	}
+	return calls > c.batchSz
 }
 
 // callPlain sends the reads as JSON-RPC batches, one eth_call per read.

@@ -233,6 +233,24 @@ Hoodi also gives the cleanest measurement of what aggregation is for, because th
 
 Nothing about this needs configuring per endpoint. Presence of the contract is probed once (devnets have none), a refused aggregate is bisected and the budget lowered to what worked, and an endpoint that refuses even a single aggregated read turns aggregation off for the process. `PROVIDER_MULTICALL=false` is the manual escape hatch.
 
+### The endpoint list is a fallback list, and it has to behave like one
+
+`PROVIDERS_URLS` takes several endpoints, and until recently the second one was decoration. A dRPC key hit its daily compute-unit limit and answered every call with `Your key daily limit exceeded` — **inside a 200 OK**, because that is where JSON-RPC errors live. The fallback loop advanced only on transport failures, so the healthy Alchemy endpoint behind it was never asked, and both contours sat dead for a day with a working provider one line away in the config.
+
+What a failed call has to answer is not "did it fail" but "is this about the endpoint or about the call":
+
+| About the endpoint → try the next one | About the call → return it |
+|---|---|
+| `daily limit exceeded`, rate limits, quotas | `execution reverted` |
+| `Batch of more than 3 requests are not allowed on free plan` | `out of gas` |
+| expired or invalid key, `unauthorized` | `gas required exceeds allowance` |
+| method or archive state the node does not serve | `intrinsic gas too low` |
+| a non-2xx HTTP status, whatever the body says | anything unrecognised |
+
+`out of gas` staying in the right-hand column is load bearing rather than tidy: the Multicall3 bisect is driven by seeing it, so failing over would break the aggregation described above. Unrecognised wording also stays on the right — a wrongly-retried call spends a request on every provider and still fails, while a wrongly-returned one fails the cycle and is retried on the next tick anyway.
+
+`keys_api_rpc_endpoint_requests_total{endpoint,result}` makes the failover visible, which matters because the hazard of a fallback list is not noticing the first entry died.
+
 ### What a quiet cycle costs, and what the canonical service's costs
 
 A cold sync is a few hundred requests once. The poll runs every `UPDATE_KEYS_INTERVAL_MS` forever, so on a metered endpoint it is the poll that decides the bill — and the number nobody had was how many requests one iteration makes. `keys_api_rpc_requests_total{method,result}` now answers it from the service instead of from arithmetic; the counts below are that arithmetic, read off both implementations at four mainnet modules with nothing changed.
@@ -240,18 +258,20 @@ A cold sync is a few hundred requests once. The poll runs every `UPDATE_KEYS_INT
 | | this service | canonical |
 |---|---|---|
 | head | 1 `eth_getBlockByNumber(latest)` | 1 `eth_getBlockByNumber(latest)` |
-| head timestamp | 1 `eth_getBlockByHash` | — (taken from the header it already has) |
+| head timestamp | — (taken from the header it already has) | — (same) |
 | finality pin | 1 `eth_getBlockByNumber(finalized)` | — (no finalized pin) |
 | staking router | in the module-set request | 1 `stakingRouter` on the locator, every iteration |
 | contract version | in the module-set request | 1 `getContractVersion` |
 | module set | 1 request: locator + version + `getStakingModules` | 1 `getStakingModules` |
 | module types | in the nonce batch | 4 `getType`, concurrent, so 1 batched request |
 | nonces | 1 batched request, 8 calls | 4 sequential `getCurrentNonce`, so 4 requests |
-| reorg check | 1 `eth_getBlockByNumber(versionBlock)` | 2 `getFullBlock` + the range, per module: ~12 |
+| reorg check | — while the version's block is finalized | 2 `getFullBlock` + the range, per module: ~12 |
 | operator events | 1 `eth_getLogs` per module family: 2 | 4 `eth_getLogs`, one per module |
-| **total** | **8** | **~25** |
+| **total** | **6**, and **1** when the head has not moved | **~25**, and **1** when the head has not moved |
 
 Both are one poll of one registry, so the gap is entirely in how the requests are shaped. Three things account for most of it: the reorg check re-fetches the same two blocks for every module because a negative answer is not memoised; the nonce reads are sequential `await`s, so the batching the provider is configured for never engages; and the locator is resolved on every iteration to get an address that changes about once a year. The canonical iteration also short-circuits after the first request when the head hash has not moved, which at a 12-second poll on a 12-second chain saves roughly every other iteration — the 25 is the cost of the iterations that do run.
+
+**A poll that finds the head it already has stops after one request.** No new block means no new state, so every signal below would be read at a point already accounted for — and nothing is written either, since extending a version to a head it is already recorded at is a write that says nothing. This is the canonical service's own short-circuit (`Same blockHash, updating is not required`), and it is what makes its five-second default affordable: most polls of a twelve-second chain see the block they saw last time. The consequence is that the bill is set by *blocks observed* rather than by polls, so lowering the interval below the slot time buys phase and almost no cost.
 
 Two of our own eight are worth calling out. `eth_getBlockByHash` fetches a timestamp that was already in the header from the request before it, and is removable. The pair of `eth_getLogs` was four until the scan was grouped by module family; `address` in a filter takes a list, and the loop only ever wants one boolean, so asking per contract paid a round trip per contract for no extra information. The range those two filters cover is now only the blocks that arrived since the last scan said there was nothing. It used to start at the published version's own block, and a version that nothing changed is never rewritten, so the window grew until `MAX_BLOCKS_OVERLAP` forced a rebuild — the same blocks re-read five times a minute for up to three hours, on the method a metered provider bills hardest. The mark does not move when a scan *finds* something: that signal is discharged by a rebuild which re-reads operators, a rebuild can fail, and advancing first would answer "no events" next cycle to a question nothing had acted on. A reorg drops the mark, because the blocks it covered were scanned on a branch that is gone.
 
@@ -259,7 +279,30 @@ Both services re-read the locator and the router's contract version every iterat
 
 Two savings came out of writing the budget down rather than reasoning about it. The event scan used to run before the freshness decision, so a cycle where a nonce had already moved spent both `eth_getLogs` computing a boolean the rebuild had made irrelevant — it is now asked for only when every cheaper signal says nothing changed. And the locator read stopped being its own request: it travels as a second call in the module-set batch, which is what makes it affordable to re-check every cycle rather than pinning the router for the life of the process.
 
-`TestQuietCycleRequestBudget` asserts these counts per method against a fake node. Exactly, not with headroom: a cycle makes whole requests, so any new round trip fails the test and either goes away or changes one number in a diff a reviewer can argue with.
+**A restart is not a cold start.** The state a cycle needs comes from the database: one query for the newest published version, whose row carries the per-module nonces the last cycle observed. A process that comes back up compares those against the chain and reads no keys unless something moved. It pays two things once — an extra `eth_call`, because the router address is resolved before there is anything to verify it against, and one wide event scan, because the scan mark lives in memory — and is back to the ordinary budget on its second cycle.
+
+Two exceptions, both worth knowing before setting `MAX_BLOCKS_OVERLAP` narrow. A published version more than that many blocks behind head triggers the audit, which trusts no signal and re-reads everything — so downtime longer than the window costs a full read. And a crash *during* the cold sync is not resumable: an unfinished version stays `building`, `Latest` considers only published and stale ones, so the next start reads the whole registry again. A pod that keeps dying before its first version lands re-reads every key every time it comes up, which is how a daily provider quota goes in an afternoon. All three behaviours are pinned by tests in `internal/ingest/rpc_budget_test.go`; the last one is recorded rather than fixed, because resuming means deciding what a half-read version at a block the chain has moved past is worth.
+
+**Two things about that table are accidents rather than decisions, and both are now fixed.**
+
+The first is that every read ran at the fastest read's cadence. The cycle polls the head every twelve seconds because that is how often the head moves; the finalized block advances once per epoch by definition, and an operator rename is a months-apart event — yet both were read on every tick. They are now paced by the epoch, computed as `SECONDS_PER_SLOT × SLOTS_PER_EPOCH` (12 × 32 by default) rather than fetched, since what the loop wants is a duration and not a consensus client. A fresh process still does both on its first cycle: waiting an epoch to learn anything would cost more than it saves. Because a compute-unit provider bills the *call* and not the block range, scanning once per epoch over a 32-slot range costs what one per-cycle scan cost — so this is a division of the bill, not a trade against freshness of anything that moves.
+
+The second is aggregation. `PROVIDER_MULTICALL` wraps reads into one `Multicall3.aggregate3` only when a JSON-RPC batch cannot carry the group, which is right for a node of our own — measured above, the plain path is faster because the node answers reads directly instead of executing a dispatcher. On a metered provider the comparison inverts: eleven getters in one batch is one round trip and *eleven billed calls*, where one aggregate is one of each. `PROVIDER_METERED=true` aggregates any multi-call read, taking a quiet cycle from eleven billed calls to two — two rather than one because the module addresses the second step reads come out of the first, so the dependency is real. A flag rather than a list of known provider hosts: the list would go stale, and a deployment knows what it pays for.
+
+Together, against dRPC's published weights — `eth_call` at 20 CU, `eth_getLogs` at 75 — the two contours go from roughly 6.5M compute units a day to about 1.15M at the current twelve-second interval, and to ~230k at sixty seconds. The 2 000 000 daily budget that used to last five hours then lasts days.
+
+Two tests hold this, and they answer different questions. `TestQuietCycleRequestBudget` asserts the counts per method exactly — a cycle makes whole requests, so any new round trip fails it and either goes away or changes one number in a diff a reviewer can argue with. `TestADayOfPollingFitsTheProviderQuota` takes the profile it measures from real cycles, prices it against the provider's published compute-unit weights, projects a day of it at the deployed interval and fails when it no longer fits the 2 000 000 daily limit. Both are worth having: one added call often still fits, and the day it stops fitting is not the day it was added.
+
+The projection reports what it is made of, so a failure names the method that grew:
+
+```
+projected 1583740 CU/day for 2 contour(s) at a 5s interval, quota 2000000 (79% used)
+  eth_call                   14400 calls      288000 CU
+  eth_getBlockByNumber       17505 calls      420120 CU
+  eth_getLogs                  450 calls       33750 CU
+```
+
+The weights are the provider's and are marked as such; where the published figure is unclear the pessimistic value is used, so the test fails early rather than passing wrongly. Verified against three regressions it has to catch: un-pacing the operator scan (184 % of quota), removing the head-unchanged short-circuit (120 %), and turning off metered aggregation (209 %).
 
 ### Paging and diffs
 
