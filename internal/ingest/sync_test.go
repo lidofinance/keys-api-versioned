@@ -372,6 +372,8 @@ type fakeStore struct {
 
 	keyWrites       int
 	keyWriteModules []int32
+	operatorWrites  []int32
+	moduleWrites    []int32
 	extends         int
 	staled          int
 	supersededFrom  int64
@@ -461,7 +463,8 @@ func (b *fakeBuild) Keys(_ context.Context, m model.StakingModule) (ModuleKeys, 
 	return &fakeModuleKeys{}, nil
 }
 
-func (b *fakeBuild) Operators(context.Context, model.StakingModule, []model.Operator) (int, error) {
+func (b *fakeBuild) Operators(_ context.Context, m model.StakingModule, _ []model.Operator) (int, error) {
+	b.store.operatorWrites = append(b.store.operatorWrites, m.ID)
 	return 0, nil
 }
 
@@ -470,6 +473,7 @@ func (b *fakeBuild) Module(_ context.Context, m model.StakingModule, _ bool) err
 		b.nonces = map[string]int64{}
 	}
 	b.nonces[m.RawAddress()] = int64(m.Nonce)
+	b.store.moduleWrites = append(b.store.moduleWrites, m.ID)
 	return nil
 }
 

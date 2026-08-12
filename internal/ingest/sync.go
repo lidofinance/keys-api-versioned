@@ -57,6 +57,9 @@ type ModuleResult struct {
 	Address  string
 	Nonce    int32
 	KeysRead int64
+	// KeysReread says whether the keys were read at all. An operators-only rebuild
+	// reports zero keys, which is not the same statement as a module that has none.
+	KeysReread bool
 	// Duration is the key read alone, which is the thing that takes tens of seconds
 	// and the thing the canonical histogram measures.
 	Duration  time.Duration
@@ -225,7 +228,7 @@ func (s *Syncer) Cycle(ctx context.Context) (result CycleResult) {
 		// A cold start reads every module and takes minutes, so it says so up front
 		// rather than after the first module lands.
 		s.log.Info("cold start: no published version, reading every module", "head", head.BlockNumber)
-		if err := s.rebuild(ctx, readAt, nil, finalized, &result); err != nil {
+		if err := s.rebuild(ctx, readAt, nil, DepthKeys, finalized, &result); err != nil {
 			result.Err = err
 		} else {
 			// Same as the ordinary rebuild path below. Without it a cold start
@@ -317,7 +320,7 @@ func (s *Syncer) Cycle(ctx context.Context) (result CycleResult) {
 			result.Action = ActionSupersede
 			result.Reason = fmt.Sprintf("reorg below the whole retained window (fork at %d): rebuilding from scratch", forkPoint)
 			s.log.Warn("reorg left no version to build on, rebuilding from scratch", "fork_point", forkPoint)
-			if err := s.rebuild(ctx, readAt, nil, finalized, &result); err != nil {
+			if err := s.rebuild(ctx, readAt, nil, DepthKeys, finalized, &result); err != nil {
 				result.Err = err
 			} else {
 				result.VersionBlock = head.BlockNumber
@@ -333,6 +336,14 @@ func (s *Syncer) Cycle(ctx context.Context) (result CycleResult) {
 		BlockNumber:  readAt.BlockNumber,
 		BlockHash:    readAt.BlockHash,
 		ModuleNonces: nonceMap(modules),
+	}
+	// Asked after the module read, because that read is where a source notices it is
+	// reading from somewhere else — and consumed here, so one deploy causes one
+	// rebuild rather than one per cycle.
+	if reporter, ok := s.source.(source.SourceChangeReporter); ok {
+		if reason, changed := reporter.SourceChanged(); changed {
+			state.SourceChange = reason
+		}
 	}
 
 	// The event scan is the last signal Evaluate consults, so it is only asked for when
@@ -388,7 +399,7 @@ func (s *Syncer) Cycle(ctx context.Context) (result CycleResult) {
 	case ActionRebuild, ActionSupersede:
 		// A rebuild is the expensive path, so say why it started. Quiet cycles stay
 		// silent — they are the common case and the metrics cover them.
-		s.log.Info("rebuild starting", "reason", decision.Reason,
+		s.log.Info("rebuild starting", "reason", decision.Reason, "reads", decision.Depth.String(),
 			"changed_modules", decision.ChangedModules, "version", latest.BlockNumber, "head", head.BlockNumber)
 
 		// The version being replaced is marked stale first, so that if the rebuild
@@ -398,13 +409,11 @@ func (s *Syncer) Cycle(ctx context.Context) (result CycleResult) {
 			result.Err = err
 			return result
 		}
-		scope := decision.ChangedModules
-		if state.OperatorEvents && len(scope) == 0 {
-			// Operators moved with no nonce change: re-read them everywhere, but
-			// leave keys alone. Passing an empty scope would mean "everything".
-			scope = allModuleAddresses(modules)
-		}
-		if err := s.rebuild(ctx, readAt, scope, finalized, &result); err != nil {
+		// The scope says which modules, the depth says how much of them — so "operators
+		// moved somewhere, re-read operators everywhere and leave keys alone" is now
+		// expressible, which it was not when scope was the only axis: the old code widened
+		// the scope to every module and then read every key, against its own comment.
+		if err := s.rebuild(ctx, readAt, decision.ChangedModules, decision.Depth, finalized, &result); err != nil {
 			result.Err = err
 			break
 		}
@@ -418,10 +427,12 @@ func (s *Syncer) Cycle(ctx context.Context) (result CycleResult) {
 
 // rebuild writes a new version and publishes it.
 //
-// scope names the modules whose keys must be re-read; nil means all of them.
-// Everything outside the scope is inherited from the previous version at no cost,
-// because its rows are simply still open.
-func (s *Syncer) rebuild(ctx context.Context, head model.ELBlockSnapshot, scope []string, finalized int64, result *CycleResult) error {
+// scope names the modules the depth applies to; nil means all of them. Everything
+// outside it is inherited from the previous version at no cost, because its rows are
+// simply still open — and so is everything the depth does not reach. Module rows are
+// always written: the module set is a read the cycle has already paid for, and the
+// store compares fields, so a module whose metadata did not change writes nothing.
+func (s *Syncer) rebuild(ctx context.Context, head model.ELBlockSnapshot, scope []string, depth ReadDepth, finalized int64, result *CycleResult) error {
 	at := source.Ref{BlockHash: head.BlockHash, BlockNumber: head.BlockNumber}
 
 	modules, err := s.source.Modules(ctx, at)
@@ -455,51 +466,66 @@ func (s *Syncer) rebuild(ctx context.Context, head model.ELBlockSnapshot, scope 
 
 	inScope := scopeSet(scope)
 	for _, m := range modules {
-		contentChanged := false
+		read := depth
+		if inScope != nil && !inScope[m.RawAddress()] {
+			read = DepthModule
+		}
+		if read == DepthModule {
+			s.log.Debug("module: metadata only, contents inherited",
+				"module", m.ID, "nonce", m.Nonce)
+			if err := build.Module(ctx, m, false); err != nil {
+				return err
+			}
+			continue
+		}
 
-		if inScope == nil || inScope[m.RawAddress()] {
-			// Announced before the work, not after: reading one mainnet module takes
-			// tens of seconds and this is the line that says which one is running.
-			s.log.Info("module: reading", "module", m.ID, "type", m.Type,
-				"nonce", m.Nonce, "address", m.RawAddress())
+		// Announced before the work, not after: reading one mainnet module takes tens
+		// of seconds and this is the line that says which one is running.
+		s.log.Info("module: reading", "module", m.ID, "type", m.Type,
+			"nonce", m.Nonce, "address", m.RawAddress(), "reads", read.String())
 
+		var (
+			contentChanged bool
+			diff           KeyDiff
+			keysTook       time.Duration
+		)
+		if read.reads(DepthKeys) {
 			moduleStarted := time.Now()
-			diff, err := s.writeModuleKeys(ctx, build, at, m)
+			diff, err = s.writeModuleKeys(ctx, build, at, m)
 			if err != nil {
 				return err
 			}
-			keysTook := time.Since(moduleStarted)
+			keysTook = time.Since(moduleStarted)
 			result.KeysStaged += diff.Staged
 			result.KeysChanged += diff.Opened + diff.Closed
 			contentChanged = diff.Changed()
+		}
 
-			operatorsStarted := time.Now()
-			operators, err := s.source.Operators(ctx, at, m)
-			if err != nil {
-				return fmt.Errorf("read operators of module %d: %w", m.ID, err)
-			}
-			changed, err := build.Operators(ctx, m, operators)
-			if err != nil {
-				return err
-			}
-			contentChanged = contentChanged || changed > 0
+		operatorsStarted := time.Now()
+		operators, err := s.source.Operators(ctx, at, m)
+		if err != nil {
+			return fmt.Errorf("read operators of module %d: %w", m.ID, err)
+		}
+		changed, err := build.Operators(ctx, m, operators)
+		if err != nil {
+			return err
+		}
+		contentChanged = contentChanged || changed > 0
 
-			s.log.Info("module written",
-				"module", m.ID, "type", m.Type, "nonce", m.Nonce,
-				"keys_read", diff.Staged, "keys_opened", diff.Opened, "keys_closed", diff.Closed,
-				"keys_unchanged", diff.Unchanged,
-				"operators", len(operators), "operators_changed", changed,
-				"keys_took", keysTook.Round(time.Millisecond).String(),
-				"operators_took", time.Since(operatorsStarted).Round(time.Millisecond).String())
+		s.log.Info("module written",
+			"module", m.ID, "type", m.Type, "nonce", m.Nonce, "reads", read.String(),
+			"keys_read", diff.Staged, "keys_opened", diff.Opened, "keys_closed", diff.Closed,
+			"keys_unchanged", diff.Unchanged,
+			"operators", len(operators), "operators_changed", changed,
+			"keys_took", keysTook.Round(time.Millisecond).String(),
+			"operators_took", time.Since(operatorsStarted).Round(time.Millisecond).String())
 
-			if s.OnModule != nil {
-				s.OnModule(ModuleResult{
-					ModuleID: m.ID, Address: m.RawAddress(), Nonce: m.Nonce,
-					KeysRead: diff.Staged, Duration: keysTook, Operators: operators,
-				})
-			}
-		} else {
-			s.log.Debug("module: inherited unchanged", "module", m.ID, "nonce", m.Nonce)
+		if s.OnModule != nil {
+			s.OnModule(ModuleResult{
+				ModuleID: m.ID, Address: m.RawAddress(), Nonce: m.Nonce,
+				KeysReread: read.reads(DepthKeys), KeysRead: diff.Staged,
+				Duration: keysTook, Operators: operators,
+			})
 		}
 
 		if err := build.Module(ctx, m, contentChanged); err != nil {
@@ -737,14 +763,6 @@ func nonceMap(modules []model.StakingModule) map[string]int64 {
 	out := make(map[string]int64, len(modules))
 	for _, m := range modules {
 		out[m.RawAddress()] = int64(m.Nonce)
-	}
-	return out
-}
-
-func allModuleAddresses(modules []model.StakingModule) []string {
-	out := make([]string, 0, len(modules))
-	for _, m := range modules {
-		out = append(out, m.RawAddress())
 	}
 	return out
 }

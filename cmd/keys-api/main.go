@@ -477,7 +477,11 @@ func observeCanonicalCycle(m *metrics.Metrics, r ingest.CycleResult, outcome str
 
 // observeModule fills the canonical per-module series from a rebuild.
 func observeModule(m *metrics.Metrics, r ingest.ModuleResult) {
-	m.ObserveModuleUpdate(r.Address, r.KeysRead, r.Duration)
+	// Only when the keys were actually read: an operators-only rebuild would otherwise
+	// record a key update of zero keys, which reads as a module that has none.
+	if r.KeysReread {
+		m.ObserveModuleUpdate(r.Address, r.KeysRead, r.Duration)
+	}
 	for _, op := range r.Operators {
 		unused := op.TotalSigningKeys - op.UsedSigningKeys
 		if unused < 0 {

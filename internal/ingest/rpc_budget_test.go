@@ -107,10 +107,10 @@ func TestNonceChangeSkipsTheOperatorScan(t *testing.T) {
 	}
 }
 
-// The locator re-check is the reason a router replacement is noticed without a
-// restart, and the reason it costs nothing is that it rides in the module read. If it
-// ever becomes its own request, the quiet cycle grows by one and this says so.
-func TestLocatorRecheckCostsNoExtraRequest(t *testing.T) {
+// Watching the locator and the contract version is free while nothing changes: both
+// reads ride in the module-set request. If either ever becomes a request of its own,
+// the quiet cycle grows and this says so.
+func TestWatchingTheContractsCostsNothingWhileTheyHoldStill(t *testing.T) {
 	node := newBudgetNode()
 	server := httptest.NewServer(node)
 	defer server.Close()
@@ -120,44 +120,88 @@ func TestLocatorRecheckCostsNoExtraRequest(t *testing.T) {
 		t.Fatalf("cold start: %v", r.Err)
 	}
 
+	for i := 0; i < 3; i++ {
+		node.advance()
+		node.reset()
+		r := syncer.Cycle(context.Background())
+		if r.Err != nil {
+			t.Fatalf("quiet cycle %d: %v", i, r.Err)
+		}
+		if r.Action != ActionExtend {
+			t.Fatalf("quiet cycle %d: action %q (%s), want extend", i, r.Action, r.Reason)
+		}
+		if got := node.count("eth_call"); got != 2 {
+			t.Fatalf("quiet cycle %d: eth_call %d, want 2 — the locator and the version travel with the module set", i, got)
+		}
+	}
+}
+
+// Noticing that the router moved is only half of it: the module rows in the published
+// version were read from a contract the protocol no longer uses, so they have to be
+// written again. The case that makes this a rule rather than a nicety is the one below —
+// the replacement reports the same modules with the same nonces, so every other signal
+// says nothing changed.
+//
+// What it does *not* do is re-read keys. Keys and operators come from the module
+// contracts, whose addresses are unchanged here; only the module tuple came from the
+// router. If a replacement reports different module addresses, the nonce rule notices
+// that and scopes a key read to those modules — which is the same mechanism as always,
+// not a special case.
+func TestRouterChangeRewritesModulesWithoutRereadingKeys(t *testing.T) {
+	node := newBudgetNode()
+	server := httptest.NewServer(node)
+	defer server.Close()
+
+	syncer, store := budgetSyncer(t, server.URL)
+	if r := syncer.Cycle(context.Background()); r.Err != nil {
+		t.Fatalf("cold start: %v", r.Err)
+	}
 	node.advance()
-	node.reset()
 	if r := syncer.Cycle(context.Background()); r.Err != nil {
 		t.Fatalf("quiet cycle: %v", r.Err)
 	}
-	quiet := node.count("eth_call")
+	keysBefore, modulesBefore := store.keyWrites, len(store.moduleWrites)
 
-	// Now the locator answers with a different router. The module set just read came
-	// from the old one, so it is discarded and re-read: exactly one extra eth_call, in
-	// this cycle only.
 	node.advance()
 	node.setRouter("0x00000000000000000000000000000000000000ff")
-	node.reset()
 
 	r := syncer.Cycle(context.Background())
 	if r.Err != nil {
 		t.Fatalf("cycle after the router moved: %v", r.Err)
 	}
-	if got := node.count("eth_call"); got != quiet+1 {
-		t.Errorf("eth_call %d, want %d: following the locator should cost one re-read", got, quiet+1)
+	if r.Action != ActionRebuild {
+		t.Fatalf("action %q (%s), want rebuild: the module rows came from a router nobody uses", r.Action, r.Reason)
+	}
+	if !strings.Contains(r.Reason, "locator") {
+		t.Errorf("reason %q should say the locator moved", r.Reason)
+	}
+	assertEveryModuleWritten(t, store, modulesBefore)
+	if store.keyWrites != keysBefore {
+		t.Errorf("%d modules had their keys re-read, want none: the keys are in the module contracts and did not move",
+			store.keyWrites-keysBefore)
 	}
 
-	// And the cycle after it is back to the quiet budget against the new router.
+	// And the reason is consumed, so one deploy is one rebuild rather than a rebuild
+	// every cycle from here on.
+	modulesBefore = len(store.moduleWrites)
 	node.advance()
-	node.reset()
-	if r := syncer.Cycle(context.Background()); r.Err != nil {
-		t.Fatalf("cycle after adopting the new router: %v", r.Err)
+	next := syncer.Cycle(context.Background())
+	if next.Err != nil {
+		t.Fatalf("cycle after the rebuild: %v", next.Err)
 	}
-	if got := node.count("eth_call"); got != quiet {
-		t.Errorf("eth_call %d, want %d: the new router should be cached like the old one", got, quiet)
+	if next.Action != ActionExtend {
+		t.Fatalf("action %q (%s), want extend once the new router has been read", next.Action, next.Reason)
+	}
+	if len(store.moduleWrites) != modulesBefore {
+		t.Errorf("%d module rows written after the rebuild, want none", len(store.moduleWrites)-modulesBefore)
 	}
 }
 
-// The router's contract version says how to read the module tuple, so a service that
-// reads it once at startup reads a v4 registry with v3 assumptions after an upgrade —
-// wrong in a way that looks like data. It is re-read every cycle, and like the locator
-// it rides in the module-set request rather than paying for a round trip of its own.
-func TestContractVersionIsWatchedWithoutAnExtraRequest(t *testing.T) {
+// A contract version bump changes what the same tuple means — below v4 there is no
+// withdrawal credentials type — so the module rows were decoded under an assumption
+// that no longer holds, and no nonce moves to say so. Rewriting them is the whole fix:
+// the version says nothing about keys.
+func TestContractVersionChangeRewritesModulesWithoutRereadingKeys(t *testing.T) {
 	node := newBudgetNode()
 	server := httptest.NewServer(node)
 	defer server.Close()
@@ -169,7 +213,8 @@ func TestContractVersionIsWatchedWithoutAnExtraRequest(t *testing.T) {
 			changes = append(changes, [2]int64{previous, current})
 		},
 	})
-	syncer := NewSyncer(provider, newFakeStore(), SyncConfig{MaxBlockGap: 1000}, nil)
+	store := newFakeStore()
+	syncer := NewSyncer(provider, store, SyncConfig{MaxBlockGap: 1000}, nil)
 
 	if r := syncer.Cycle(context.Background()); r.Err != nil {
 		t.Fatalf("cold start: %v", r.Err)
@@ -177,29 +222,105 @@ func TestContractVersionIsWatchedWithoutAnExtraRequest(t *testing.T) {
 	if len(changes) != 1 || changes[0] != [2]int64{0, routerContractVersion} {
 		t.Fatalf("version reports %v, want one first read of %d", changes, routerContractVersion)
 	}
-
 	node.advance()
-	node.reset()
 	if r := syncer.Cycle(context.Background()); r.Err != nil {
 		t.Fatalf("quiet cycle: %v", r.Err)
 	}
-	quiet := node.count("eth_call")
 	if len(changes) != 1 {
-		t.Errorf("version reports %v, want no report when the version has not moved", changes)
+		t.Fatalf("version reports %v, want no report while the version holds still", changes)
 	}
+	keysBefore, modulesBefore := store.keyWrites, len(store.moduleWrites)
 
-	// An upgrade under a running service.
+	// An upgrade under a running service, with every nonce untouched.
 	node.advance()
 	node.setVersion(routerContractVersion+1, 1)
-	node.reset()
-	if r := syncer.Cycle(context.Background()); r.Err != nil {
+
+	r := syncer.Cycle(context.Background())
+	if r.Err != nil {
 		t.Fatalf("cycle after the upgrade: %v", r.Err)
+	}
+	if r.Action != ActionRebuild {
+		t.Fatalf("action %q (%s), want rebuild: the tuple is decoded differently now", r.Action, r.Reason)
+	}
+	if !strings.Contains(r.Reason, "contract version") {
+		t.Errorf("reason %q should say the contract version changed", r.Reason)
 	}
 	if len(changes) != 2 || changes[1] != [2]int64{routerContractVersion, routerContractVersion + 1} {
 		t.Fatalf("version reports %v, want the upgrade reported with its previous value", changes)
 	}
-	if got := node.count("eth_call"); got != quiet {
-		t.Errorf("eth_call %d, want %d: watching the version must not cost a request", got, quiet)
+	assertEveryModuleWritten(t, store, modulesBefore)
+	if store.keyWrites != keysBefore {
+		t.Errorf("%d modules had their keys re-read, want none: a contract version says nothing about keys",
+			store.keyWrites-keysBefore)
+	}
+
+	modulesBefore = len(store.moduleWrites)
+	node.advance()
+	next := syncer.Cycle(context.Background())
+	if next.Err != nil {
+		t.Fatalf("cycle after the rebuild: %v", next.Err)
+	}
+	if next.Action != ActionExtend {
+		t.Fatalf("action %q (%s), want extend once the new version has been read", next.Action, next.Reason)
+	}
+	if len(store.moduleWrites) != modulesBefore {
+		t.Errorf("%d module rows written after the rebuild, want none", len(store.moduleWrites)-modulesBefore)
+	}
+}
+
+// Operator events are the third depth, and the one that used to be wrong: the code
+// widened the scope to every module and then read every key, against a comment on the
+// same line saying keys were left alone.
+func TestOperatorEventsRereadOperatorsAndNotKeys(t *testing.T) {
+	node := newBudgetNode()
+	server := httptest.NewServer(node)
+	defer server.Close()
+
+	syncer, store := budgetSyncer(t, server.URL)
+	if r := syncer.Cycle(context.Background()); r.Err != nil {
+		t.Fatalf("cold start: %v", r.Err)
+	}
+	node.advance()
+	if r := syncer.Cycle(context.Background()); r.Err != nil {
+		t.Fatalf("quiet cycle: %v", r.Err)
+	}
+	keysBefore, operatorsBefore := store.keyWrites, len(store.operatorWrites)
+
+	// A rename on a curated module: no nonce moves, the log filter sees the event.
+	node.advance()
+	node.emitOperatorEvent(budgetModules[0].address)
+
+	r := syncer.Cycle(context.Background())
+	if r.Err != nil {
+		t.Fatalf("cycle with operator events: %v", r.Err)
+	}
+	if r.Action != ActionRebuild {
+		t.Fatalf("action %q (%s), want rebuild", r.Action, r.Reason)
+	}
+	if store.keyWrites != keysBefore {
+		t.Errorf("%d modules had their keys re-read, want none: a rename is not a key change",
+			store.keyWrites-keysBefore)
+	}
+	if got := len(store.operatorWrites) - operatorsBefore; got != len(budgetModules) {
+		t.Errorf("%d modules had their operators re-read, want all %d: names live off the nonce, so which module changed is unknown",
+			got, len(budgetModules))
+	}
+}
+
+// assertEveryModuleWritten checks that the rebuild was not scoped to a subset: a
+// provenance change invalidates every module row, and a scope would leave the modules
+// whose nonce happened not to move holding rows decoded the old way.
+func assertEveryModuleWritten(t *testing.T, store *fakeStore, before int) {
+	t.Helper()
+
+	written := map[int32]bool{}
+	for _, id := range store.moduleWrites[before:] {
+		written[id] = true
+	}
+	for _, m := range budgetModules {
+		if !written[int32(m.id)] {
+			t.Errorf("module %d was not written again", m.id)
+		}
 	}
 }
 
@@ -293,6 +414,7 @@ type budgetNode struct {
 	version  int64
 	wcType   uint8
 	nonces   map[string]int64
+	logHits  map[string]bool
 }
 
 type budgetModule struct {
@@ -345,6 +467,17 @@ func (n *budgetNode) setVersion(version int64, wcType uint8) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	n.version, n.wcType = version, wcType
+}
+
+// emitOperatorEvent makes the next log filter covering this address report a hit,
+// which is what a rename looks like to the cycle.
+func (n *budgetNode) emitOperatorEvent(address string) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	if n.logHits == nil {
+		n.logHits = map[string]bool{}
+	}
+	n.logHits[strings.ToLower(address)] = true
 }
 
 func (n *budgetNode) setRouter(addr string) {
@@ -465,6 +598,19 @@ func (n *budgetNode) answer(req budgetRequest) json.RawMessage {
 		return budgetResult(req.ID, budgetHeader(blockOfHash(hash)))
 
 	case "eth_getLogs":
+		var filter struct {
+			Address []string `json:"address"`
+		}
+		_ = json.Unmarshal(req.Params[0], &filter)
+
+		n.mu.Lock()
+		hits := n.logHits
+		n.mu.Unlock()
+		for _, address := range filter.Address {
+			if hits[strings.ToLower(address)] {
+				return budgetResult(req.ID, []any{map[string]any{"address": address}})
+			}
+		}
 		return budgetResult(req.ID, []any{})
 
 	case "eth_call":

@@ -58,6 +58,35 @@ type Provider struct {
 	// onVersion is called with every contract version observed, so an upgrade is a
 	// metric rather than a line in a log.
 	onVersion func(previous, current int64)
+
+	// sourceChange holds the reason the last read came from somewhere else, until the
+	// sync loop consumes it. Both changes it records — a replaced router, a new
+	// contract version — can leave every nonce untouched, so this is the only thing
+	// that makes the loop re-read.
+	changeMu     sync.Mutex
+	sourceChange string
+}
+
+// SourceChanged reports and clears the reason the registry's provenance changed.
+func (p *Provider) SourceChanged() (string, bool) {
+	p.changeMu.Lock()
+	defer p.changeMu.Unlock()
+	reason := p.sourceChange
+	p.sourceChange = ""
+	return reason, reason != ""
+}
+
+// noteSourceChange records a reason for the next cycle to act on. Several in one
+// cycle are joined rather than overwritten: a deploy that replaces the router usually
+// changes the contract version too, and the log line should say both happened.
+func (p *Provider) noteSourceChange(reason string) {
+	p.changeMu.Lock()
+	defer p.changeMu.Unlock()
+	if p.sourceChange == "" {
+		p.sourceChange = reason
+		return
+	}
+	p.sourceChange += "; " + reason
 }
 
 // ModuleReader reads one family of module contracts: operators, keys, and the
@@ -368,6 +397,8 @@ func (p *Provider) readModules(ctx context.Context, ref eth.BlockRef) (string, a
 	previous, _ := p.adoptRouter(current)
 	p.log.Warn("the locator now points at a different staking router, re-reading the module set",
 		"locator", p.locator, "previous", previous, "current", current)
+	p.noteSourceChange(fmt.Sprintf(
+		"the locator now points at staking router %s instead of %s", current, previous))
 	if p.onRouterChange != nil {
 		p.onRouterChange(previous, current)
 	}
@@ -422,6 +453,8 @@ func (p *Provider) adoptVersion(raw any) error {
 	p.log.Warn("the staking router contract version changed under a running service",
 		"previous", previous, "current", current,
 		"withdrawal_credentials_type_from_contract", current >= srVersionWithWCType)
+	p.noteSourceChange(fmt.Sprintf(
+		"the staking router contract version went from %d to %d", previous, current))
 	return p.reportVersion(previous, current)
 }
 
@@ -613,5 +646,6 @@ var (
 	_ source.Provider               = (*Provider)(nil)
 	_ source.OperatorWatcher        = (*Provider)(nil)
 	_ source.GroupedOperatorWatcher = (*Provider)(nil)
+	_ source.SourceChangeReporter   = (*Provider)(nil)
 	_ source.ChainIdentifier        = (*Provider)(nil)
 )

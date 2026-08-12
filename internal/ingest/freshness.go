@@ -52,6 +52,15 @@ type HeadState struct {
 	ModuleNonces map[string]int64
 	// OperatorEvents reports operator changes in (version block, head block].
 	OperatorEvents bool
+	// SourceChange names a change in what the registry is being read from — a
+	// different staking router, or a contract version that makes the same tuple mean
+	// something else — and is empty when there was none.
+	//
+	// It is not covered by any of the other signals, which is the reason it exists. A
+	// replacement router can report the same modules with the same nonces, and then
+	// every cheap signal says nothing changed while the module rows in the published
+	// version came from a contract nobody uses any more.
+	SourceChange string
 }
 
 // Decision carries the action and why it was taken, so the reason can be logged
@@ -60,7 +69,46 @@ type Decision struct {
 	Action         Action
 	Reason         string
 	ChangedModules []string
+	// Depth is how much of a module has to be read again, and it belongs with the
+	// reason rather than with the caller: what changed is what says what is stale.
+	// Every rebuild rewrites module rows regardless — that read is the module set,
+	// which the cycle already has.
+	Depth ReadDepth
 }
+
+// ReadDepth is how much of a module a rebuild re-reads.
+type ReadDepth int
+
+const (
+	// DepthKeys re-reads keys and operators: a nonce moved, or nothing is trusted.
+	//
+	// First, so that it is the zero value. A decision that forgot to say how much is
+	// stale then reads too much rather than too little — the failure that costs
+	// requests instead of the one that serves wrong data.
+	DepthKeys ReadDepth = iota
+	// DepthOperators re-reads operators and no keys. Operator metadata moves without a
+	// nonce, and a rename is not a reason to read half a million keys.
+	DepthOperators
+	// DepthModule re-reads neither: the module set already in hand is written and
+	// everything else is inherited. What a replaced staking router or a changed
+	// contract version needs — the tuple is decoded differently, while the keys behind
+	// it live in the module contracts and are untouched.
+	DepthModule
+)
+
+func (d ReadDepth) String() string {
+	switch d {
+	case DepthModule:
+		return "modules"
+	case DepthOperators:
+		return "operators"
+	default:
+		return "keys"
+	}
+}
+
+// reads reports whether this depth includes that one.
+func (d ReadDepth) reads(what ReadDepth) bool { return d <= what }
 
 // Evaluate applies the rules in the same order the canonical updater does.
 //
@@ -77,7 +125,17 @@ type Decision struct {
 // verifiable statement that the cheap signals were telling the truth.
 func Evaluate(v Version, head HeadState, maxBlockGap int64) Decision {
 	if head.Reorg {
-		return Decision{Action: ActionSupersede, Reason: "reorg detected"}
+		return Decision{Action: ActionSupersede, Reason: "reorg detected", Depth: DepthKeys}
+	}
+
+	// Above the nonce rule, because it is not about a module's contents. The module rows
+	// were decoded from a contract that is no longer the one in use, or
+	// under a version that no longer applies, so they are rewritten from the set just
+	// read. Keys and operators live in the module contracts and are not implicated: if
+	// a replacement router reports different module addresses, the nonce rule below is
+	// what notices, and it scopes the key read to those modules.
+	if head.SourceChange != "" {
+		return Decision{Action: ActionRebuild, Reason: head.SourceChange, Depth: DepthModule}
 	}
 
 	var changed []string
@@ -103,6 +161,7 @@ func Evaluate(v Version, head HeadState, maxBlockGap int64) Decision {
 			Action:         ActionRebuild,
 			Reason:         "nonce changed for " + strings.Join(changed, ", "),
 			ChangedModules: changed,
+			Depth:          DepthKeys,
 		}
 	}
 
@@ -111,15 +170,18 @@ func Evaluate(v Version, head HeadState, maxBlockGap int64) Decision {
 			Action: ActionRebuild,
 			Reason: fmt.Sprintf("block gap %d is at or above the limit %d",
 				head.BlockNumber-v.BlockNumber, maxBlockGap),
+			// The audit exists to catch a signal that lied, so it trusts none of them.
+			Depth: DepthKeys,
 		}
 	}
 
 	if head.OperatorEvents {
-		return Decision{Action: ActionRebuild, Reason: "operator events in range"}
+		return Decision{Action: ActionRebuild, Reason: "operator events in range", Depth: DepthOperators}
 	}
 
 	return Decision{
 		Action: ActionExtend,
 		Reason: fmt.Sprintf("no change up to block %d", head.BlockNumber),
+		Depth:  DepthModule,
 	}
 }

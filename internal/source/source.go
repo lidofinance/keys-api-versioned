@@ -102,6 +102,26 @@ type GroupedOperatorWatcher interface {
 	OperatorsChangedAny(ctx context.Context, modules []model.StakingModule, fromBlock, toBlock int64) (bool, error)
 }
 
+// SourceChangeReporter is an optional Provider capability: report that the most
+// recent read came from different contracts, or from contracts that have to be
+// interpreted differently, than the one before it.
+//
+// It exists because no other signal covers it. A staking router replaced by a
+// protocol deploy can report the same modules with the same nonces, and a contract
+// version bump changes what a module tuple means without changing a single counter —
+// so every cheap signal says the published version is current while it was in fact
+// read from somewhere that no longer applies. The sync loop treats a report as a
+// reason to re-read everything.
+//
+// The report is consumed: it describes what changed since the last call, and reading
+// it clears it. A provider whose source cannot change under it — a file — does not
+// implement this.
+type SourceChangeReporter interface {
+	// SourceChanged returns a human-readable reason and true when something changed,
+	// and clears it.
+	SourceChanged() (string, bool)
+}
+
 // ChainIdentifier is an optional Provider capability: the chain id to report in
 // /v1/status. A provider without one leaves the configured value alone.
 type ChainIdentifier interface {
