@@ -233,6 +233,34 @@ Hoodi also gives the cleanest measurement of what aggregation is for, because th
 
 Nothing about this needs configuring per endpoint. Presence of the contract is probed once (devnets have none), a refused aggregate is bisected and the budget lowered to what worked, and an endpoint that refuses even a single aggregated read turns aggregation off for the process. `PROVIDER_MULTICALL=false` is the manual escape hatch.
 
+### What a quiet cycle costs, and what the canonical service's costs
+
+A cold sync is a few hundred requests once. The poll runs every `UPDATE_KEYS_INTERVAL_MS` forever, so on a metered endpoint it is the poll that decides the bill — and the number nobody had was how many requests one iteration makes. `keys_api_rpc_requests_total{method,result}` now answers it from the service instead of from arithmetic; the counts below are that arithmetic, read off both implementations at four mainnet modules with nothing changed.
+
+| | this service | canonical |
+|---|---|---|
+| head | 1 `eth_getBlockByNumber(latest)` | 1 `eth_getBlockByNumber(latest)` |
+| head timestamp | 1 `eth_getBlockByHash` | — (taken from the header it already has) |
+| finality pin | 1 `eth_getBlockByNumber(finalized)` | — (no finalized pin) |
+| staking router | in the module-set request | 1 `stakingRouter` on the locator, every iteration |
+| contract version | in the module-set request | 1 `getContractVersion` |
+| module set | 1 request: locator + version + `getStakingModules` | 1 `getStakingModules` |
+| module types | in the nonce batch | 4 `getType`, concurrent, so 1 batched request |
+| nonces | 1 batched request, 8 calls | 4 sequential `getCurrentNonce`, so 4 requests |
+| reorg check | 1 `eth_getBlockByNumber(versionBlock)` | 2 `getFullBlock` + the range, per module: ~12 |
+| operator events | 1 `eth_getLogs` per module family: 2 | 4 `eth_getLogs`, one per module |
+| **total** | **8** | **~25** |
+
+Both are one poll of one registry, so the gap is entirely in how the requests are shaped. Three things account for most of it: the reorg check re-fetches the same two blocks for every module because a negative answer is not memoised; the nonce reads are sequential `await`s, so the batching the provider is configured for never engages; and the locator is resolved on every iteration to get an address that changes about once a year. The canonical iteration also short-circuits after the first request when the head hash has not moved, which at a 12-second poll on a 12-second chain saves roughly every other iteration — the 25 is the cost of the iterations that do run.
+
+Two of our own eight are worth calling out. `eth_getBlockByHash` fetches a timestamp that was already in the header from the request before it, and is removable. The pair of `eth_getLogs` was four until the scan was grouped by module family; `address` in a filter takes a list, and the loop only ever wants one boolean, so asking per contract paid a round trip per contract for no extra information. What is *not* fixed here: the scan range runs from the published version's block to head, and a version that nothing changed is not rewritten, so the same blocks are rescanned every cycle until `MAX_BLOCKS_OVERLAP` forces a rebuild. Tracking the last scanned block would make each cycle's filter cover only new blocks.
+
+Both services re-read the locator and the router's contract version every iteration, and for the same reason: a deploy replaces the router or changes the tuple's shape under a service that is already running, and one that resolved those once at startup keeps reading a router nobody uses or reads a v4 registry with v3 assumptions — silent, and healthy-looking from every other metric. The difference is only that here they are two more calls in a request that was going out anyway, so watching them costs nothing per cycle. `keys_api_staking_router_changes_total` and `keys_api_staking_router_contract_version` are what make either event visible without reading a log.
+
+Two savings came out of writing the budget down rather than reasoning about it. The event scan used to run before the freshness decision, so a cycle where a nonce had already moved spent both `eth_getLogs` computing a boolean the rebuild had made irrelevant — it is now asked for only when every cheaper signal says nothing changed. And the locator read stopped being its own request: it travels as a second call in the module-set batch, which is what makes it affordable to re-check every cycle rather than pinning the router for the life of the process.
+
+`TestQuietCycleRequestBudget` asserts these counts per method against a fake node. Exactly, not with headroom: a cycle makes whole requests, so any new round trip fails the test and either goes away or changes one number in a diff a reviewer can argue with.
+
 ### Paging and diffs
 
 | | |

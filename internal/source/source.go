@@ -90,6 +90,18 @@ type OperatorWatcher interface {
 	OperatorsChanged(ctx context.Context, module model.StakingModule, fromBlock, toBlock int64) (bool, error)
 }
 
+// GroupedOperatorWatcher answers the same question as OperatorWatcher for every
+// module at once.
+//
+// The distinction is round trips, not semantics: the sync loop only ever wants one
+// boolean per cycle — did operator metadata move anywhere — and asking module by
+// module pays a request per module for an answer that is already known after the
+// first "yes". A provider implementing this is asked once per cycle instead, and
+// the per-module method stays for the providers that have nothing cheaper.
+type GroupedOperatorWatcher interface {
+	OperatorsChangedAny(ctx context.Context, modules []model.StakingModule, fromBlock, toBlock int64) (bool, error)
+}
+
 // ChainIdentifier is an optional Provider capability: the chain id to report in
 // /v1/status. A provider without one leaves the configured value alone.
 type ChainIdentifier interface {

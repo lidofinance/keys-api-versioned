@@ -29,6 +29,38 @@ type Syncer struct {
 
 	// hooks let the app observe cycles without this package importing metrics.
 	OnCycle func(CycleResult)
+	// OnModule fires once per module a rebuild read, before the version is
+	// published. It exists because the per-module numbers the canonical service
+	// exports — how long a module's key update took, how many keys each operator
+	// holds — are known here and nowhere else: by the time OnCycle runs, the cycle
+	// is one aggregate.
+	OnModule func(ModuleResult)
+}
+
+// ModuleNonce is a module's identity and the nonce a cycle read for it. It is what
+// the canonical `nonce_value` gauge is labelled by, and the cheap read every cycle
+// makes anyway.
+type ModuleNonce struct {
+	ID      int32
+	Address string
+	Nonce   int32
+}
+
+// ModuleResult is what a rebuild did for one module.
+//
+// Operators are carried rather than counted because the canonical service exports a
+// gauge per operator (used and unused keys), and this is the only place they are in
+// memory. A cycle that rebuilds nothing produces none of these, which is correct:
+// the numbers cannot have changed.
+type ModuleResult struct {
+	ModuleID int32
+	Address  string
+	Nonce    int32
+	KeysRead int64
+	// Duration is the key read alone, which is the thing that takes tens of seconds
+	// and the thing the canonical histogram measures.
+	Duration  time.Duration
+	Operators []model.Operator
 }
 
 // SyncConfig configures the loop.
@@ -66,8 +98,11 @@ type CycleResult struct {
 	Action         Action
 	Reason         string
 	ChangedModules []string
-	HeadBlock      int64
-	VersionBlock   int64
+	// Modules is the module set with the nonces this cycle read, empty on a cycle
+	// that failed before the cheap read.
+	Modules      []ModuleNonce
+	HeadBlock    int64
+	VersionBlock int64
 	// VersionTimestamp is the published version's own block time: how old the data
 	// is. It legitimately climbs while the chain is quiet.
 	VersionTimestamp int64
@@ -227,6 +262,7 @@ func (s *Syncer) Cycle(ctx context.Context) (result CycleResult) {
 		result.Err = fmt.Errorf("read modules: %w", err)
 		return result
 	}
+	result.Modules = moduleNonces(modules)
 
 	// Is the version still on the chain? A hash mismatch at its own height means
 	// the branch it was built on is gone.
@@ -298,15 +334,26 @@ func (s *Syncer) Cycle(ctx context.Context) (result CycleResult) {
 		BlockHash:    readAt.BlockHash,
 		ModuleNonces: nonceMap(modules),
 	}
-	state.OperatorEvents, err = s.operatorEvents(ctx, modules, latest.BlockNumber, head.BlockNumber)
-	if err != nil {
-		// A log filter failing is not a reason to stop syncing; it is a reason to
-		// treat operator metadata as possibly stale, which is what a rebuild does.
-		s.log.Warn("operator event scan failed, assuming a change", "err", err)
-		state.OperatorEvents = true
-	}
 
+	// The event scan is the last signal Evaluate consults, so it is only asked for when
+	// the ones above it said nothing changed. Scanning first — which is what this did —
+	// spent an eth_getLogs per module family to compute a boolean that a nonce
+	// difference had already made irrelevant: the rebuild was decided either way.
+	//
+	// Evaluated twice rather than reordering Evaluate, because the order of the rules is
+	// the canonical service's and worth keeping literal; what changes here is only when
+	// the input is fetched.
 	decision := Evaluate(latest.AsVersion(), state, s.cfg.MaxBlockGap)
+	if decision.Action == ActionExtend {
+		state.OperatorEvents, err = s.operatorEvents(ctx, modules, latest.BlockNumber, head.BlockNumber)
+		if err != nil {
+			// A log filter failing is not a reason to stop syncing; it is a reason to
+			// treat operator metadata as possibly stale, which is what a rebuild does.
+			s.log.Warn("operator event scan failed, assuming a change", "err", err)
+			state.OperatorEvents = true
+		}
+		decision = Evaluate(latest.AsVersion(), state, s.cfg.MaxBlockGap)
+	}
 	s.log.Debug("cycle: decision", "action", decision.Action, "reason", decision.Reason,
 		"changed_modules", decision.ChangedModules, "version", latest.BlockNumber,
 		"head", head.BlockNumber, "behind", head.BlockNumber-latest.BlockNumber,
@@ -384,6 +431,11 @@ func (s *Syncer) rebuild(ctx context.Context, head model.ELBlockSnapshot, scope 
 	if len(modules) == 0 {
 		return errors.New("source returned no modules")
 	}
+	// The cold start reads the module set here rather than in the caller, so this is
+	// where its nonces become visible to metrics.
+	if len(result.Modules) == 0 {
+		result.Modules = moduleNonces(modules)
+	}
 
 	build, err := s.store.Begin(ctx, head)
 	if errors.Is(err, ErrVersionExists) {
@@ -439,6 +491,13 @@ func (s *Syncer) rebuild(ctx context.Context, head model.ELBlockSnapshot, scope 
 				"operators", len(operators), "operators_changed", changed,
 				"keys_took", keysTook.Round(time.Millisecond).String(),
 				"operators_took", time.Since(operatorsStarted).Round(time.Millisecond).String())
+
+			if s.OnModule != nil {
+				s.OnModule(ModuleResult{
+					ModuleID: m.ID, Address: m.RawAddress(), Nonce: m.Nonce,
+					KeysRead: diff.Staged, Duration: keysTook, Operators: operators,
+				})
+			}
 		} else {
 			s.log.Debug("module: inherited unchanged", "module", m.ID, "nonce", m.Nonce)
 		}
@@ -608,9 +667,20 @@ func (s *Syncer) finalizedBlock(ctx context.Context) model.ELBlockSnapshot {
 // operatorEvents asks the source whether operator metadata moved in the range.
 // A source that cannot answer cheaply does not implement the capability, and the
 // signal is simply absent.
+//
+// A provider that can answer for every module at once is asked that way: the loop
+// wants one boolean per cycle, and on mainnet the per-module path spends one
+// eth_getLogs per module to compute it.
 func (s *Syncer) operatorEvents(ctx context.Context, modules []model.StakingModule, fromBlock, toBlock int64) (bool, error) {
+	if fromBlock >= toBlock {
+		return false, nil
+	}
+	if grouped, ok := s.source.(source.GroupedOperatorWatcher); ok {
+		return grouped.OperatorsChangedAny(ctx, modules, fromBlock+1, toBlock)
+	}
+
 	watcher, ok := s.source.(source.OperatorWatcher)
-	if !ok || fromBlock >= toBlock {
+	if !ok {
 		return false, nil
 	}
 	for _, m := range modules {
@@ -653,6 +723,14 @@ func (s *Syncer) prune(ctx context.Context) {
 			"keeping", s.cfg.RetainVersions, "oldest_kept_block", pruned.OldestKept,
 			"versions_dropped", pruned.Versions, "rows_dropped", pruned.Rows)
 	}
+}
+
+func moduleNonces(modules []model.StakingModule) []ModuleNonce {
+	out := make([]ModuleNonce, 0, len(modules))
+	for _, m := range modules {
+		out = append(out, ModuleNonce{ID: m.ID, Address: m.RawAddress(), Nonce: m.Nonce})
+	}
+	return out
 }
 
 func nonceMap(modules []model.StakingModule) map[string]int64 {

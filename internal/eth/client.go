@@ -116,6 +116,8 @@ type Client struct {
 	mcProbed   bool
 	mcPresent  bool
 
+	observe func(RequestInfo)
+
 	stats stats
 
 	nextID int
@@ -147,6 +149,25 @@ type Options struct {
 	// only place that shows what a long sync is actually waiting on, which matters
 	// because a cold sync spends minutes inside these calls and says nothing.
 	Log *slog.Logger
+	// Observe is called once per HTTP round trip, including the ones that failed and
+	// were retried on the next endpoint. It is how the RPC surface becomes a metric
+	// without this package importing the metrics one, and it is the answer to "how
+	// many requests does a cycle actually make" — a question that was arithmetic on
+	// the source until it was a counter.
+	Observe func(RequestInfo)
+}
+
+// RequestInfo describes one HTTP round trip to an endpoint.
+type RequestInfo struct {
+	// Method is the JSON-RPC method, or "batch" when one request carried several
+	// different ones. Calls is how many calls travelled in it, which is what says
+	// whether packing is working.
+	Method string
+	Calls  int
+	// Result is "success" or "error", matching the label the canonical service's
+	// fetch middleware uses.
+	Result   string
+	Duration time.Duration
 }
 
 // stats counts what the client sent. Round trips are the figure the ingest
@@ -222,6 +243,7 @@ func NewClient(urls string, o Options) *Client {
 		multicall:  o.Multicall,
 		mcAddress:  strings.ToLower(o.MulticallAddress),
 		mcMaxCalls: o.MulticallMaxCalls,
+		observe:    o.Observe,
 	}
 	c.mcMaxCost.Store(int64(o.MulticallMaxCost))
 	return c
@@ -282,6 +304,7 @@ func (c *Client) do(ctx context.Context, reqs []rpcRequest) ([]json.RawMessage, 
 		c.stats.requests.Add(1)
 		resp, err := c.http.Do(req)
 		if err != nil {
+			c.observed(method, len(reqs), "error", time.Since(started))
 			lastErr = err
 			// An endpoint failing is worth a line at warn: the fallback hides it from
 			// everything else, and a node quietly out of the rotation is the kind of
@@ -296,6 +319,7 @@ func (c *Client) do(ctx context.Context, reqs []rpcRequest) ([]json.RawMessage, 
 		resp.Body.Close()
 		took := time.Since(started)
 		if err != nil {
+			c.observed(method, len(reqs), "error", took)
 			lastErr = fmt.Errorf("decode: %w", err)
 			c.log.Warn("rpc response could not be decoded",
 				"endpoint", hostOf(url), "method", method, "err", err)
@@ -316,17 +340,32 @@ func (c *Client) do(ctx context.Context, reqs []rpcRequest) ([]json.RawMessage, 
 		for i, r := range reqs {
 			got, ok := byID[r.ID]
 			if !ok {
+				c.observed(method, len(reqs), "error", took)
 				return nil, fmt.Errorf("no response for id %d (%s)", r.ID, r.Method)
 			}
 			if got.Error != nil {
+				// The round trip succeeded and the call inside it did not. Counted as an
+				// error for the same reason the canonical service's middleware does: a node
+				// answering "out of gas" to every aggregate is a broken endpoint, and a
+				// success rate that ignores it says the RPC surface is fine.
+				c.observed(method, len(reqs), "error", took)
 				return nil, fmt.Errorf("%s: rpc error %d: %s", r.Method, got.Error.Code, got.Error.Message)
 			}
 			results[i] = got.Result
 		}
+		c.observed(method, len(reqs), "success", took)
 		return results, nil
 	}
 
 	return nil, fmt.Errorf("all endpoints failed: %w", lastErr)
+}
+
+// observed hands one round trip to the hook, if there is one.
+func (c *Client) observed(method string, calls int, result string, d time.Duration) {
+	if c.observe == nil {
+		return
+	}
+	c.observe(RequestInfo{Method: method, Calls: calls, Result: result, Duration: d})
 }
 
 // hostOf trims an endpoint to its host, so a log line stays readable and a URL with
@@ -483,6 +522,28 @@ func (c *Client) BlockHashByNumber(ctx context.Context, number *big.Int) (string
 // HasLogs reports whether an address emitted any of the named events in a block
 // range. It asks for one log, because the answer is only ever used as a flag.
 func (c *Client) HasLogs(ctx context.Context, address string, eventNames []string, fromBlock, toBlock int64) (bool, error) {
+	return c.HasAnyLogs(ctx, []string{address}, eventNames, fromBlock, toBlock)
+}
+
+// HasAnyLogs reports whether any of the addresses emitted any of the events in the
+// range, in one request.
+//
+// `address` in a filter takes a list, and the answer wanted here is a single
+// boolean over the whole set — so asking per contract is one round trip per
+// contract for no extra information. On mainnet that is the difference between
+// four eth_getLogs per cycle and one per module family, and eth_getLogs is the
+// most expensive method a metered provider bills.
+//
+// The topics are the union across the addresses passed in, which is why the
+// grouping in the caller is by module family rather than by anything cheaper: a
+// union across families would ask each contract about events it cannot emit.
+// Harmless for correctness — the result is still "did anything change" — but it
+// would make a false positive from one family look like a change in another.
+func (c *Client) HasAnyLogs(ctx context.Context, addresses []string, eventNames []string, fromBlock, toBlock int64) (bool, error) {
+	if len(addresses) == 0 || len(eventNames) == 0 {
+		return false, nil
+	}
+
 	topics := make([]string, 0, len(eventNames))
 	for _, name := range eventNames {
 		topic, err := EventTopic(name)
@@ -495,7 +556,7 @@ func (c *Client) HasLogs(ctx context.Context, address string, eventNames []strin
 	res, err := c.do(ctx, []rpcRequest{{
 		JSONRPC: "2.0", ID: c.id(), Method: "eth_getLogs",
 		Params: []any{map[string]any{
-			"address":   address,
+			"address":   addresses,
 			"fromBlock": "0x" + big.NewInt(fromBlock).Text(16),
 			"toBlock":   "0x" + big.NewInt(toBlock).Text(16),
 			"topics":    []any{topics},
