@@ -38,6 +38,10 @@
 //	KEYS_READ_CONCURRENCY             request groups in flight per module read
 //	                                  (defaults to PROVIDER_CONCURRENT_REQUESTS)
 //	PROVIDER_MULTICALL                pack reads into Multicall3 (default true)
+//	PROVIDER_METERED                  the endpoints bill per call, not per round trip
+//	                                  (default false); aggregates every multi-call read
+//	SECONDS_PER_SLOT                  slot time, for the epoch length (default 12)
+//	SLOTS_PER_EPOCH                   slots in an epoch, for the epoch length (default 32)
 //	PROVIDER_MULTICALL_ADDRESS        override the standard deployment address
 //	PROVIDER_MULTICALL_MAX_CALLS      reads per aggregate (default 200)
 //	PROVIDER_MULTICALL_MAX_KEYS       keys one aggregate may return (default 1000)
@@ -221,6 +225,11 @@ func run(log *slog.Logger) error {
 			// this is what a deployment does when it wants data that cannot be reorged
 			// away and can afford to be a finality behind.
 			BuildAtFinalized: envBool("KEYS_API_BUILD_AT_FINALIZED", false),
+			// One epoch, computed rather than fetched: this service has no consensus
+			// client, and it needs a duration rather than a head. Mainnet's 12 × 32 is
+			// the default; a devnet with a shorter slot says so, and either way the
+			// number in the log is the one being used.
+			EpochDuration: epochDuration(),
 		}, log)
 		syncer.OnCycle = func(r ingest.CycleResult) { observeCycle(m, r) }
 		syncer.OnModule = func(r ingest.ModuleResult) { observeModule(m, r) }
@@ -233,7 +242,12 @@ func run(log *slog.Logger) error {
 			log.Info("ingest starting",
 				"source", envOr("KEYS_API_SOURCE", "lido-core"),
 				"interval_ms", envInt("UPDATE_KEYS_INTERVAL_MS", 5000),
-				"retain_versions", envInt("RETAIN_VERSIONS", 20))
+				"retain_versions", envInt("RETAIN_VERSIONS", 20),
+				// Logged because it paces two reads and is derived from two other
+				// variables: "why has it not scanned for six minutes" should be
+				// answerable from the startup line.
+				"epoch", epochDuration().String(),
+				"metered", envBool("PROVIDER_METERED", false))
 			errs <- syncer.Run(ctx)
 		}()
 	}
@@ -313,10 +327,16 @@ func buildSource(ctx context.Context, chainID int64, log *slog.Logger, m *metric
 		}
 
 		client := eth.NewClient(urls, eth.Options{
-			Concurrency:       envInt("PROVIDER_CONCURRENT_REQUESTS", 8),
-			BatchSize:         envInt("PROVIDER_JSON_RPC_MAX_BATCH_SIZE", 100),
-			Timeout:           time.Duration(envInt("PROVIDER_TIMEOUT_MS", 120_000)) * time.Millisecond,
-			Multicall:         envBool("PROVIDER_MULTICALL", true),
+			Concurrency: envInt("PROVIDER_CONCURRENT_REQUESTS", 8),
+			BatchSize:   envInt("PROVIDER_JSON_RPC_MAX_BATCH_SIZE", 100),
+			Timeout:     time.Duration(envInt("PROVIDER_TIMEOUT_MS", 120_000)) * time.Millisecond,
+			Multicall:   envBool("PROVIDER_MULTICALL", true),
+			// Metered flips the aggregation rule: a provider that bills per call makes one
+			// aggregate3 cheaper than a JSON-RPC batch of the same reads, which against a
+			// node of our own is the slower of the two. A flag rather than a list of known
+			// provider hosts — the list would go stale, and a deployment knows what it
+			// pays for.
+			Metered:           envBool("PROVIDER_METERED", false),
 			MulticallAddress:  envOr("PROVIDER_MULTICALL_ADDRESS", eth.MulticallAddress),
 			MulticallMaxCalls: envInt("PROVIDER_MULTICALL_MAX_CALLS", 0),
 			MulticallMaxCost:  envInt("PROVIDER_MULTICALL_MAX_KEYS", 0),
@@ -327,7 +347,7 @@ func buildSource(ctx context.Context, chainID int64, log *slog.Logger, m *metric
 			// "what is this sync waiting on" for someone watching; this answers "how
 			// many requests is this deployment spending" for someone who was not.
 			Observe: func(r eth.RequestInfo) {
-				m.ObserveRPC(r.Method, r.Result, r.Calls, r.Duration)
+				m.ObserveRPC(r.Method, r.Result, r.Endpoint, r.Calls, r.Duration)
 			},
 		})
 		m.BindRPCStats(metricsNamespace, func() metrics.RPCStats {
@@ -382,6 +402,24 @@ func buildSource(ctx context.Context, chainID int64, log *slog.Logger, m *metric
 
 // observeCycle turns a cycle result into metrics. It lives here rather than in the
 // ingest package so that package keeps no metrics dependency.
+// epochDuration is one beacon epoch: slot time times slots per epoch.
+//
+// Multiplied here rather than read from a consensus API because what the loop wants is a
+// duration, not a head — and adding a CL dependency to obtain two constants would be the
+// larger cost. Both are the chain's own parameters, so a devnet with a two-second slot
+// configures them and nothing else changes.
+//
+// Zero from either variable disables the epoch pacing, which restores the previous
+// behaviour of reading the finalized block and scanning operator events on every cycle.
+func epochDuration() time.Duration {
+	seconds := envInt("SECONDS_PER_SLOT", 12)
+	slots := envInt("SLOTS_PER_EPOCH", 32)
+	if seconds <= 0 || slots <= 0 {
+		return 0
+	}
+	return time.Duration(seconds*slots) * time.Second
+}
+
 func observeCycle(m *metrics.Metrics, r ingest.CycleResult) {
 	outcome := "ok"
 	if r.Err != nil {
@@ -426,6 +464,17 @@ func observeCycle(m *metrics.Metrics, r ingest.CycleResult) {
 	}
 	if r.Rebuilt {
 		m.RebuildsTotal.Inc()
+	}
+	// The audit is the only check on the assumption every cheap signal rests on — that a
+	// module's nonce moves whenever its keys do. A healthy audit re-reads half a million
+	// keys and writes nothing, which is a verifiable statement rather than a belief; one
+	// that writes rows says a key was added or removed without the counter moving, and
+	// nothing else in the service would ever notice.
+	if r.Audit {
+		m.AuditsTotal.Inc()
+		if r.KeysChanged > 0 {
+			m.AuditDivergenceTotal.Add(float64(r.KeysChanged))
+		}
 	}
 	if r.ReorgFrom > 0 || r.Action == ingest.ActionSupersede {
 		m.ReorgsTotal.Inc()

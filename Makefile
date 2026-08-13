@@ -54,9 +54,12 @@ bench: build
 # Unit and component tests need nothing; the rest need a database they may create and
 # drop schemas in, and no chain — the writer is driven directly, so the whole suite is
 # hermetic.
+# -p 1: both packages share one database, and the lease-sensitive tests take
+# testpg.Exclusive to be alone in it — a process-local mutex, while advisory locks are
+# visible database-wide. Two package binaries at once break that assumption.
 test:
 	go test ./...
-	TEST_DATABASE_URL="$(subst keys_api_app,keys_api_test,$(DSN))" go test ./internal/ingest/ ./internal/e2e/ -count=1
+	TEST_DATABASE_URL="$(subst keys_api_app,keys_api_test,$(DSN))" go test ./internal/ingest/ ./internal/e2e/ -count=1 -p 1
 
 test-e2e:
 	TEST_DATABASE_URL="$(subst keys_api_app,keys_api_test,$(DSN))" go test ./internal/e2e/ -count=1 -v

@@ -412,3 +412,69 @@ func (n *revertingNode) patch(req rpcRequest, resp rpcResponse) (rpcResponse, bo
 	}
 	return result(req.ID, "0x"+common.Bytes2Hex(packed)), true
 }
+
+// On a metered endpoint the billed unit is the call, not the round trip, so the
+// aggregation rule inverts: a group that fits one JSON-RPC batch should still be
+// aggregated. This is the difference between eleven billed calls per cycle and one, on
+// a read that runs for the life of the deployment.
+func TestMeteredAggregatesGroupsThatFitOneBatch(t *testing.T) {
+	for _, tc := range []struct {
+		name           string
+		metered        bool
+		wantAggregates []int
+		wantPlain      int
+	}{
+		// Eight getters, batch size 100: the plain path carries them in one request, so
+		// the default rule leaves them alone.
+		{"own node keeps the plain path", false, nil, 8},
+		{"metered wraps them into one aggregate", true, []int{8}, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			node := &fakeNode{code: []byte{0x60, 0x00}}
+			server := httptest.NewServer(node)
+			defer server.Close()
+
+			client := NewClient(server.URL, Options{
+				Concurrency: 1, BatchSize: 100, Multicall: true, Metered: tc.metered,
+			})
+
+			if _, err := client.CallBatch(context.Background(), BlockRef{Tag: "latest"}, nonceCalls(8)); err != nil {
+				t.Fatalf("CallBatch: %v", err)
+			}
+
+			_, plain, aggregates := node.counts()
+			if plain != tc.wantPlain {
+				t.Errorf("%d plain calls, want %d", plain, tc.wantPlain)
+			}
+			if len(aggregates) != len(tc.wantAggregates) {
+				t.Fatalf("aggregates %v, want %v", aggregates, tc.wantAggregates)
+			}
+			for i, want := range tc.wantAggregates {
+				if aggregates[i] != want {
+					t.Errorf("aggregate %d carried %d calls, want %d", i, aggregates[i], want)
+				}
+			}
+		})
+	}
+}
+
+// A lone read is never wrapped, metered or not: it would cost the same call and add the
+// dispatcher on top of it.
+func TestMeteredDoesNotWrapASingleCall(t *testing.T) {
+	node := &fakeNode{code: []byte{0x60, 0x00}}
+	server := httptest.NewServer(node)
+	defer server.Close()
+
+	client := NewClient(server.URL, Options{
+		Concurrency: 1, BatchSize: 100, Multicall: true, Metered: true,
+	})
+
+	if _, err := client.CallBatch(context.Background(), BlockRef{Tag: "latest"}, nonceCalls(1)); err != nil {
+		t.Fatalf("CallBatch: %v", err)
+	}
+
+	_, plain, aggregates := node.counts()
+	if plain != 1 || len(aggregates) != 0 {
+		t.Errorf("plain=%d aggregates=%v, want one plain call and no aggregate", plain, aggregates)
+	}
+}

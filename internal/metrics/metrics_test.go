@@ -19,7 +19,7 @@ func TestScrapeCarriesTheCanonicalNames(t *testing.T) {
 	m.SetOperatorKeys(1, 7, 100, 5)
 	m.ObserveJob("Update Staking Router Modules keys", "success", time.Second)
 	m.ObserveModuleUpdate("0xdead", 1000, 2*time.Second)
-	m.ObserveRPC("eth_getLogs", "success", 1, 20*time.Millisecond)
+	m.ObserveRPC("eth_getLogs", "success", "lb.drpc.org", 1, 20*time.Millisecond)
 	m.ObserveRequest("GET", "/v1/keys", 200, 4096, 30*time.Millisecond)
 	m.BindRPCStats("keys_api", func() RPCStats {
 		return RPCStats{Requests: 10, Calls: 200, Aggregates: 2, Splits: 1, Fallbacks: 3}
@@ -41,6 +41,7 @@ func TestScrapeCarriesTheCanonicalNames(t *testing.T) {
 		// Ours: the request counter is the one to watch on a metered endpoint.
 		`keys_api_rpc_requests_total{method="eth_getLogs",result="success"} 1`,
 		`keys_api_rpc_calls_total 1`,
+		`keys_api_rpc_endpoint_requests_total{endpoint="lb.drpc.org",result="success"} 1`,
 		`keys_api_rpc_aggregates_total 2`,
 		`keys_api_rpc_splits_total 1`,
 		`keys_api_rpc_fallbacks_total 3`,

@@ -205,6 +205,12 @@ func (db *DB) Block(offset int64) int64 { return db.base + offset }
 // move state that is per-database rather than per-schema: LeasedVersions reports every
 // advisory lock in the database, and retention lowers its boundary to any leased block
 // below it, so a lease taken by another test would show up as this one's.
+//
+// It only serialises within one test binary — it is a mutex in this process, while the
+// state it guards is in Postgres. Two packages sharing TEST_DATABASE_URL therefore break
+// the assumption, and each sees the other's advisory locks; `-p 1` in the Makefile and in
+// .github/workflows/test.yaml is what keeps them apart. The alternative, if that flag
+// ever becomes inconvenient, is a database per package rather than a shared one.
 func Exclusive(tb testing.TB) {
 	tb.Helper()
 	exclusive.Lock()

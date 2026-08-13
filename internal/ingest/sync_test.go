@@ -485,10 +485,19 @@ func (b *fakeBuild) Module(_ context.Context, m model.StakingModule, _ bool) err
 }
 
 func (b *fakeBuild) Publish(_ context.Context, label string, finalized int64) error {
+	// The head fields start out equal to the version's own block, exactly as the real
+	// store's INSERT does ($1, $2, $3 reused for both). They matter: the cycle compares
+	// the observed head hash against HeadBlockHash to decide whether anything can have
+	// changed, and a fake that left it empty would never exercise that path.
 	v := StoredVersion{
 		ID:                   b.id,
 		BlockNumber:          b.at.BlockNumber,
 		BlockHash:            b.at.BlockHash,
+		HeadBlockNumber:      b.at.BlockNumber,
+		HeadBlockHash:        b.at.BlockHash,
+		HeadTimestamp:        b.at.Timestamp,
+		Timestamp:            b.at.Timestamp,
+		LastChangedBlockHash: b.at.BlockHash,
 		Label:                label,
 		Status:               StatusPublished,
 		FinalizedBlockNumber: finalized,
