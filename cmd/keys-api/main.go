@@ -39,7 +39,9 @@
 //	                                  (defaults to PROVIDER_CONCURRENT_REQUESTS)
 //	PROVIDER_MULTICALL                pack reads into Multicall3 (default true)
 //	PROVIDER_METERED                  the endpoints bill per call, not per round trip
-//	                                  (default false); aggregates every multi-call read
+//	                                  (default true); aggregates every multi-call read.
+//	                                  Set false only against a node of our own, where the
+//	                                  plain path is marginally faster
 //	SECONDS_PER_SLOT                  slot time, for the epoch length (default 12)
 //	SLOTS_PER_EPOCH                   slots in an epoch, for the epoch length (default 32)
 //	PROVIDER_MULTICALL_ADDRESS        override the standard deployment address
@@ -247,7 +249,7 @@ func run(log *slog.Logger) error {
 				// variables: "why has it not scanned for six minutes" should be
 				// answerable from the startup line.
 				"epoch", epochDuration().String(),
-				"metered", envBool("PROVIDER_METERED", false))
+				"metered", meteredEndpoints())
 			errs <- syncer.Run(ctx)
 		}()
 	}
@@ -336,7 +338,14 @@ func buildSource(ctx context.Context, chainID int64, log *slog.Logger, m *metric
 			// node of our own is the slower of the two. A flag rather than a list of known
 			// provider hosts — the list would go stale, and a deployment knows what it
 			// pays for.
-			Metered:           envBool("PROVIDER_METERED", false),
+			//
+			// Default true, because the two mistakes cost differently. Forgetting it on a
+			// hosted provider spends five times the compute units on every cycle forever,
+			// which is what emptied a 2 000 000/day key five hours into the day and took
+			// both writers down with it. Leaving it on against a node of our own costs the
+			// dispatcher: 0.99 s against 0.87 s on a quiet cycle, measured. One is an
+			// outage, the other is 120 ms.
+			Metered:           meteredEndpoints(),
 			MulticallAddress:  envOr("PROVIDER_MULTICALL_ADDRESS", eth.MulticallAddress),
 			MulticallMaxCalls: envInt("PROVIDER_MULTICALL_MAX_CALLS", 0),
 			MulticallMaxCost:  envInt("PROVIDER_MULTICALL_MAX_KEYS", 0),
@@ -402,6 +411,21 @@ func buildSource(ctx context.Context, chainID int64, log *slog.Logger, m *metric
 
 // observeCycle turns a cycle result into metrics. It lives here rather than in the
 // ingest package so that package keeps no metrics dependency.
+// meteredEndpoints reports whether the endpoints bill per call rather than per round
+// trip, which is what decides between one aggregate3 and N plain eth_calls.
+//
+// Default true, because the two mistakes cost differently. Forgetting it on a hosted
+// provider spends five times the compute units on every cycle forever — that is what
+// emptied a 2 000 000/day key five hours into the day and took both writers down with
+// it. Leaving it on against a node of our own costs the dispatcher it executes instead
+// of answering directly: 0.99 s against 0.87 s on a quiet cycle, measured. One of those
+// is an outage and the other is 120 ms.
+//
+// A function rather than two envBool calls, because there were two and they disagreed:
+// the startup line said metered=false while the client was built metered. A log that
+// contradicts the behaviour is worse than no log.
+func meteredEndpoints() bool { return envBool("PROVIDER_METERED", true) }
+
 // epochDuration is one beacon epoch: slot time times slots per epoch.
 //
 // Multiplied here rather than read from a consensus API because what the loop wants is a
