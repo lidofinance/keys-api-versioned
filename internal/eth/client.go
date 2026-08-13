@@ -141,7 +141,9 @@ type Options struct {
 	// has Multicall3 somewhere else needs this.
 	MulticallAddress string
 	// Metered says the endpoints bill per call rather than per round trip, which
-	// inverts when aggregation is worth using — see shouldAggregate.
+	// inverts when aggregation is worth using — see shouldAggregate. The binary
+	// defaults it to true; this struct does not, so a caller that says nothing gets the
+	// behaviour that is right for a node it owns.
 	Metered bool
 	// MulticallMaxCalls caps how many reads go into one aggregate, and
 	// MulticallMaxCost caps their total Cost — the one that binds in practice, since
