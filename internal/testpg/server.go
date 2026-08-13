@@ -82,10 +82,24 @@ func NewServerWithExtPin(tb testing.TB, s store.Store, extPin string) *Server {
 // Client is a client that does not time out — some of these responses are held open on
 // purpose — and whose socket read buffer is small.
 //
-// The small buffer is load-bearing for any test that blocks a reader mid-response: the
-// server buffers 256 KiB, net/http adds its own, and loopback socket autotuning can
-// add megabytes, so without this the server could finish a whole module while the test
-// believes it is still inside one.
+// The small receive buffer is load-bearing for any test that blocks a reader
+// mid-response: the server buffers 256 KiB, net/http adds its own, and loopback socket
+// autotuning can add megabytes, so without it the server could finish a whole module
+// while the test believes it is still inside one.
+//
+// 64 KiB rather than 4 KiB, and the difference is the whole reason this comment is long.
+// Linux honours SO_RCVBUF exactly and turns receive-window autotuning off for the socket,
+// so at 4 KiB a 20 MB dump crawls: measured at roughly 30 KB/s — ten minutes for the
+// streaming fixture, against 0.4 s at 64 KiB. macOS effectively ignores a buffer that
+// small, which is why every one of these tests passed locally for as long as they
+// existed and the first CI run on Linux hung until it was killed. The Postgres read was
+// never involved: instrumented, the same stream spent 7 ms in the database and 70 s in
+// the socket write.
+//
+// 64 KiB is still small enough for the property the held tests need. The server fills
+// its own 256 KiB buffer before the first flush, so it blocks after roughly 320 KB —
+// three orders of magnitude short of the fixture, which is all "still mid-response" has
+// to mean here.
 func (s *Server) Client() *http.Client {
 	dialer := &net.Dialer{}
 	return &http.Client{
@@ -96,7 +110,7 @@ func (s *Server) Client() *http.Client {
 					return nil, err
 				}
 				if tcp, ok := conn.(*net.TCPConn); ok {
-					_ = tcp.SetReadBuffer(4096)
+					_ = tcp.SetReadBuffer(64 << 10)
 				}
 				return conn, nil
 			},

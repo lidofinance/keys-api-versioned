@@ -89,6 +89,13 @@ jobs:
       # -timeout turns the hang into a goroutine dump instead of a wait for the default ten
       # minutes.
       #
+      # That is how this workflow paid for itself on its first run. The e2e suite hung for
+      # four minutes with no output; per-package steps and -v named the test, and the
+      # goroutine dump plus /proc/net/tcp turned it into a one-line fix in
+      # internal/testpg/server.go — a 4 KiB SO_RCVBUF that Linux honours exactly and macOS
+      # effectively ignores, which crawled a 20 MB dump at 30 KB/s. Every one of those
+      # tests had passed locally for as long as they had existed.
+      #
       # -p 1 is separate from that and worth keeping either way: both packages share one
       # database, and the tests that assert on retention leases take testpg.Exclusive to be
       # alone in it — which is a mutex in one process, while advisory locks are visible
