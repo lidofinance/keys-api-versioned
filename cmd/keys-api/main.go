@@ -356,9 +356,10 @@ func run(log *slog.Logger) error {
 // several callers hold connections, so picking it up without a restart also means not
 // diverging between them. Anything else in the file was read once through the environment.
 //
-// A key that needs a restart is deliberately not recorded as applied: the next poll reports
-// it again and the counter keeps climbing for as long as the process runs on a credential
-// the file no longer holds. That climb is the only signal that a restart is owed.
+// A key that needs a restart is deliberately not recorded as applied, so every later
+// rotation reports it again for as long as the process runs on a credential the file no
+// longer holds. It is not re-reported between rotations — the file is re-read only when its
+// mtime changes — so the thing to alert on is an increase over a window, not a level.
 func applyRotatedSecrets(
 	values, applied map[string]string,
 	setEndpoints func(string) error,
