@@ -14,6 +14,12 @@
 //	CHAIN_ID                          reported in /v1/status; verified against the node,
 //	                                  and names the schema the store lives in
 //	DATABASE_URL                      Postgres DSN
+//	SECRETS_FILE_PATH                 JSON file the OpenBao agent renders credentials to
+//	                                  (default /vault/secrets/config). Present: it wins over
+//	                                  the environment, and PROVIDERS_URLS is re-read from it
+//	                                  when it rotates. Absent: environment only, which is how
+//	                                  the compose deployment runs
+//	SECRETS_POLL_INTERVAL_IN_SECONDS  how often that path is stat'ed (default 10)
 //	PORT                              listen port (default 3000)
 //	KEYS_API_MODE                     all (default) | server | ingest
 //	KEYS_API_SOURCE                   lido-core (default) | static
@@ -86,6 +92,7 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"sort"
 	"strconv"
 	"strings"
 	"syscall"
@@ -95,6 +102,7 @@ import (
 	"github.com/lidofinance/keys-api-versioned/internal/eth"
 	"github.com/lidofinance/keys-api-versioned/internal/ingest"
 	"github.com/lidofinance/keys-api-versioned/internal/metrics"
+	"github.com/lidofinance/keys-api-versioned/internal/secrets"
 	"github.com/lidofinance/keys-api-versioned/internal/source"
 	"github.com/lidofinance/keys-api-versioned/internal/source/lidocore"
 	"github.com/lidofinance/keys-api-versioned/internal/source/static"
@@ -121,6 +129,24 @@ func main() {
 func run(log *slog.Logger) error {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
+
+	// Before anything reads the environment: in Kubernetes the credentials arrive as a file,
+	// and this makes that file the source for every envOr below. A broken render is logged
+	// and then ignored — the environment still holds a working configuration, and refusing
+	// to start would turn one bad template into an outage.
+	secretsPath := envOr("SECRETS_FILE_PATH", secrets.DefaultPath)
+	appliedSecrets, err := secrets.LoadIntoEnv(secretsPath)
+	if err != nil {
+		log.Error("secrets file unusable, reading configuration from the environment", "path", secretsPath, "err", err)
+	}
+	if len(appliedSecrets) > 0 {
+		log.Info("configuration: secrets file over the environment", "path", secretsPath)
+	} else {
+		log.Info("configuration: the environment", "path", secretsPath, "reason", "no secrets file")
+	}
+
+	// Set once the source is built, if that source has endpoints to re-point.
+	var setEndpoints func(string) error
 
 	mode := envOr("KEYS_API_MODE", "all")
 	if mode != "all" && mode != "server" && mode != "ingest" {
@@ -203,10 +229,11 @@ func run(log *slog.Logger) error {
 
 	var syncer *ingest.Syncer
 	if mode != "server" {
-		provider, err := buildSource(ctx, chainID, log, m)
+		provider, rotateEndpoints, err := buildSource(ctx, chainID, log, m)
 		if err != nil {
 			return err
 		}
+		setEndpoints = rotateEndpoints
 
 		// A node on the wrong chain is the failure worth catching at startup: every
 		// key it returns would be plausible and wrong.
@@ -287,6 +314,20 @@ func run(log *slog.Logger) error {
 		}()
 	}
 
+	// Rotation, once everything that could consume a credential exists.
+	if len(appliedSecrets) > 0 {
+		interval := time.Duration(envInt("SECRETS_POLL_INTERVAL_IN_SECONDS", int(secrets.DefaultPollInterval/time.Second))) * time.Second
+		watcher := secrets.NewWatcher(secretsPath, interval,
+			func(values map[string]string) error {
+				return applyRotatedSecrets(values, appliedSecrets, setEndpoints, log, m)
+			},
+			func(err error) {
+				log.Error("secrets rotation", "err", err)
+				m.SecretsReloads.WithLabelValues("failure").Inc()
+			})
+		go watcher.Run(ctx)
+	}
+
 	select {
 	case <-ctx.Done():
 		log.Info("shutting down")
@@ -307,14 +348,69 @@ func run(log *slog.Logger) error {
 	return nil
 }
 
+// applyRotatedSecrets applies what can be applied while running, and says plainly what
+// cannot.
+//
+// PROVIDERS_URLS can: the client copies its endpoint list per request, so a replacement
+// takes effect from the next one. DATABASE_URL cannot — the pool is built from it and
+// several callers hold connections, so picking it up without a restart also means not
+// diverging between them. Anything else in the file was read once through the environment.
+//
+// A key that needs a restart is deliberately not recorded as applied: the next poll reports
+// it again and the counter keeps climbing for as long as the process runs on a credential
+// the file no longer holds. That climb is the only signal that a restart is owed.
+func applyRotatedSecrets(
+	values, applied map[string]string,
+	setEndpoints func(string) error,
+	log *slog.Logger,
+	m *metrics.Metrics,
+) error {
+	var live, needRestart []string
+	for key, value := range values {
+		if value == applied[key] {
+			continue
+		}
+		if key == "PROVIDERS_URLS" && setEndpoints != nil {
+			if err := setEndpoints(value); err != nil {
+				return fmt.Errorf("PROVIDERS_URLS: %w", err)
+			}
+			applied[key] = value
+			// The environment is updated too, so that anything reading it later — a
+			// diagnostic, a future reader — agrees with the client.
+			if err := os.Setenv(key, value); err != nil {
+				return err
+			}
+			live = append(live, key)
+			continue
+		}
+		needRestart = append(needRestart, key)
+	}
+
+	if len(live) > 0 {
+		sort.Strings(live)
+		log.Info("applied rotated secrets", "keys", strings.Join(live, ","))
+		m.SecretsReloads.WithLabelValues("success").Inc()
+	}
+	if len(needRestart) > 0 {
+		sort.Strings(needRestart)
+		log.Warn("rotated secrets need a restart to take effect", "keys", strings.Join(needRestart, ","))
+		m.SecretsReloads.WithLabelValues("restart_required").Inc()
+	}
+	return nil
+}
+
 // buildSource picks the registry reader. This is the one place that knows which
 // implementations exist; everything downstream sees source.Provider.
-func buildSource(ctx context.Context, chainID int64, log *slog.Logger, m *metrics.Metrics) (source.Provider, error) {
+//
+// The second return value re-points the execution endpoints, for when the credentials in
+// them are rotated. It is nil for a source that has none — the static file source — because
+// "rotation did nothing" and "there was nothing to rotate" are different answers.
+func buildSource(ctx context.Context, chainID int64, log *slog.Logger, m *metrics.Metrics) (source.Provider, func(string) error, error) {
 	switch name := envOr("KEYS_API_SOURCE", "lido-core"); name {
 	case "lido-core":
 		urls := envOr("PROVIDERS_URLS", "")
 		if urls == "" {
-			return nil, errors.New("PROVIDERS_URLS is required for KEYS_API_SOURCE=lido-core")
+			return nil, nil, errors.New("PROVIDERS_URLS is required for KEYS_API_SOURCE=lido-core")
 		}
 
 		// No per-chain defaults in the binary. An address compiled in means a redeploy
@@ -323,7 +419,7 @@ func buildSource(ctx context.Context, chainID int64, log *slog.Logger, m *metric
 		// is used on most. It comes from the environment, or the service refuses to start.
 		locator := envOr("LIDO_LOCATOR", "")
 		if locator == "" {
-			return nil, fmt.Errorf("LIDO_LOCATOR is required for KEYS_API_SOURCE=lido-core "+
+			return nil, nil, fmt.Errorf("LIDO_LOCATOR is required for KEYS_API_SOURCE=lido-core "+
 				"(chain %d): the Lido Locator address is what everything else is resolved from, "+
 				"and the deployed-contracts page at docs.lido.fi is the reference", chainID)
 		}
@@ -390,22 +486,22 @@ func buildSource(ctx context.Context, chainID int64, log *slog.Logger, m *metric
 		})
 		log.Info("source: lido core",
 			"locator", locator, "module_types", strings.Join(provider.SupportedTypes(), ","))
-		return provider, nil
+		return provider, client.SetURLs, nil
 
 	case "static":
 		path := envOr("KEYS_API_STATIC_FILE", "")
 		if path == "" {
-			return nil, errors.New("KEYS_API_STATIC_FILE is required for KEYS_API_SOURCE=static")
+			return nil, nil, errors.New("KEYS_API_STATIC_FILE is required for KEYS_API_SOURCE=static")
 		}
 		provider := static.New(path)
 		if _, err := provider.Head(ctx); err != nil {
-			return nil, fmt.Errorf("static source: %w", err)
+			return nil, nil, fmt.Errorf("static source: %w", err)
 		}
 		log.Info("source: static file", "path", path)
-		return provider, nil
+		return provider, nil, nil
 
 	default:
-		return nil, fmt.Errorf("unknown KEYS_API_SOURCE %q", name)
+		return nil, nil, fmt.Errorf("unknown KEYS_API_SOURCE %q", name)
 	}
 }
 

@@ -74,7 +74,12 @@ type Metrics struct {
 	// cycle make"; RPCCalls against it is how much packing is buying, since a call is
 	// a contract read and a request is a round trip.
 	RPCRequests *prometheus.CounterVec
-	RPCCalls    prometheus.Counter
+
+	// SecretsReloads counts rotated secrets picked up from the secrets file, by outcome. A
+	// rotation that did not reach the process is otherwise indistinguishable from a healthy
+	// one: the old endpoint answers until the provider revokes the credential.
+	SecretsReloads *prometheus.CounterVec
+	RPCCalls       prometheus.Counter
 
 	// EndpointRequests is labelled by host, which rpc_requests_total deliberately is
 	// not: the question it answers is "which provider is actually serving us", and a
@@ -195,6 +200,10 @@ func New(namespace string) *Metrics {
 			Namespace: namespace, Name: "http_response_bytes_total",
 			Help: "Response bytes by route. Dumps are the reason this matters.",
 		}, []string{"route"}),
+		SecretsReloads: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: namespace, Name: "secrets_reloads_total",
+			Help: "Rotated secrets picked up from the secrets file, by outcome (success, failure, restart_required). Zero forever on a deployment whose secrets are environment variables; a climbing restart_required means the file holds a credential this process is not using.",
+		}, []string{"status"}),
 		RPCRequests: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Namespace: namespace, Name: "rpc_requests_total",
 			Help: "Execution-layer HTTP round trips by JSON-RPC method and outcome, including the failed ones a fallback endpoint hid. This is what a provider meters.",
@@ -267,7 +276,7 @@ func New(namespace string) *Metrics {
 		m.VersionBlock, m.VersionAge, m.ConfirmedAge, m.HeadBlock, m.BlocksBehind, m.VersionStale,
 		m.RebuildsTotal, m.ReorgsTotal, m.AuditsTotal, m.AuditDivergenceTotal,
 		m.RequestDuration, m.ResponseBytes,
-		m.RPCRequests, m.RPCCalls, m.EndpointRequests, m.RouterChanges, m.RouterVersion, m.VersionChanges,
+		m.SecretsReloads, m.RPCRequests, m.RPCCalls, m.EndpointRequests, m.RouterChanges, m.RouterVersion, m.VersionChanges,
 		m.ELRPCDuration, m.CanonicalHTTP, m.BuildInfo, m.JobDuration, m.ModuleKeyUpdate,
 		m.LastUpdate, m.LastBlockNumber, m.Nonce, m.KeysByModuleAndOp)
 	return m
