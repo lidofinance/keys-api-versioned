@@ -1,0 +1,178 @@
+package secrets
+
+import (
+	"errors"
+	"os"
+	"path/filepath"
+	"testing"
+	"time"
+)
+
+// render writes the way the OpenBao agent does: a temp file renamed over the path. The
+// rename is what makes the update atomic, and it is also what gives the file a new inode
+// every time — the reason Watcher stats the path instead of watching the file.
+func render(t *testing.T, path, contents string) {
+	t.Helper()
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, []byte(contents), 0o600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		t.Fatalf("rename: %v", err)
+	}
+	// The mtime has nanosecond resolution on Linux but only second resolution on some
+	// filesystems; nudge it forward so a change is detectable in a test that runs in
+	// microseconds. The production interval is ten seconds.
+	future := time.Now().Add(time.Second)
+	if err := os.Chtimes(path, future, future); err != nil {
+		t.Fatalf("chtimes: %v", err)
+	}
+}
+
+func TestReadAbsentFileIsNotAnError(t *testing.T) {
+	values, err := Read(filepath.Join(t.TempDir(), "nothing-here"))
+	if err != nil {
+		t.Fatalf("absent file should read as no values, got %v", err)
+	}
+	if len(values) != 0 {
+		t.Fatalf("expected no values, got %v", values)
+	}
+}
+
+func TestReadStringifiesValues(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config")
+	render(t, path, `{"PROVIDERS_URLS":"http://el:8545","PROVIDER_TIMEOUT_MS":1500,"EMPTY":null}`)
+
+	values, err := Read(path)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if values["PROVIDERS_URLS"] != "http://el:8545" {
+		t.Fatalf("urls: %q", values["PROVIDERS_URLS"])
+	}
+	// A number in the secret must not reach a parser as a number, and a null must not
+	// reach one as the string "null".
+	if values["PROVIDER_TIMEOUT_MS"] != "1500" {
+		t.Fatalf("timeout: %q", values["PROVIDER_TIMEOUT_MS"])
+	}
+	if _, ok := values["EMPTY"]; ok {
+		t.Fatalf("a null value should be dropped, got %q", values["EMPTY"])
+	}
+}
+
+func TestReadRejectsWhatIsNotAJSONObject(t *testing.T) {
+	for name, contents := range map[string]string{
+		"not json":   "nope",
+		"json array": `["http://el:8545"]`,
+		"json null":  "null",
+	} {
+		t.Run(name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "config")
+			render(t, path, contents)
+			if _, err := Read(path); err == nil {
+				t.Fatal("expected an error rather than silent acceptance")
+			}
+		})
+	}
+}
+
+func TestWatcherSeesARenameOverThePath(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config")
+	render(t, path, `{"PROVIDERS_URLS":"http://one:8545"}`)
+
+	var got map[string]string
+	w := NewWatcher(path, time.Minute, func(values map[string]string) error {
+		got = values
+		return nil
+	}, nil)
+
+	if w.CheckOnce() {
+		t.Fatal("an unchanged file is not a rotation")
+	}
+
+	render(t, path, `{"PROVIDERS_URLS":"http://two:8545"}`)
+	if !w.CheckOnce() {
+		t.Fatal("a rename over the path should be seen")
+	}
+	if got["PROVIDERS_URLS"] != "http://two:8545" {
+		t.Fatalf("applied %v", got)
+	}
+}
+
+func TestWatcherKeepsPreviousValuesOnABadRender(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config")
+	render(t, path, `{"PROVIDERS_URLS":"http://one:8545"}`)
+
+	applied := 0
+	reported := 0
+	w := NewWatcher(path, time.Minute,
+		func(map[string]string) error { applied++; return nil },
+		func(error) { reported++ })
+
+	render(t, path, "")
+	if w.CheckOnce() {
+		t.Fatal("a broken render must not count as applied")
+	}
+	if applied != 0 {
+		t.Fatalf("onChange ran %d times", applied)
+	}
+	if reported != 1 {
+		t.Fatalf("expected one report, got %d", reported)
+	}
+
+	// The mtime is remembered even for a bad render: otherwise one broken template would
+	// report the same error every interval for as long as the process ran.
+	if w.CheckOnce() || reported != 1 {
+		t.Fatalf("a bad render should be reported once, got %d reports", reported)
+	}
+}
+
+func TestWatcherKeepsPreviousValuesWhenApplyFails(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config")
+	render(t, path, `{"PROVIDERS_URLS":"http://one:8545"}`)
+
+	reported := 0
+	w := NewWatcher(path, time.Minute,
+		func(map[string]string) error { return errors.New("cannot apply") },
+		func(error) { reported++ })
+
+	render(t, path, `{"PROVIDERS_URLS":"http://two:8545"}`)
+	if w.CheckOnce() {
+		t.Fatal("a failed apply must not count as applied")
+	}
+	if reported != 1 {
+		t.Fatalf("expected the failure to be reported once, got %d", reported)
+	}
+}
+
+func TestLoadIntoEnvPutsTheFileOverTheEnvironment(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config")
+	render(t, path, `{"KEYS_API_TEST_URLS":"http://from-file:8545"}`)
+	t.Setenv("KEYS_API_TEST_URLS", "http://from-env:8545")
+
+	values, err := LoadIntoEnv(path)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if len(values) != 1 {
+		t.Fatalf("expected the applied values back, got %v", values)
+	}
+	if os.Getenv("KEYS_API_TEST_URLS") != "http://from-file:8545" {
+		t.Fatalf("environment not overridden: %q", os.Getenv("KEYS_API_TEST_URLS"))
+	}
+}
+
+func TestLoadIntoEnvLeavesTheEnvironmentAloneWithoutAFile(t *testing.T) {
+	t.Setenv("KEYS_API_TEST_URLS", "http://from-env:8545")
+
+	values, err := LoadIntoEnv(filepath.Join(t.TempDir(), "nothing-here"))
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if len(values) != 0 {
+		t.Fatalf("expected no values, got %v", values)
+	}
+	if os.Getenv("KEYS_API_TEST_URLS") != "http://from-env:8545" {
+		t.Fatalf("environment changed: %q", os.Getenv("KEYS_API_TEST_URLS"))
+	}
+}

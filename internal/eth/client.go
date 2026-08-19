@@ -13,6 +13,7 @@ import (
 	"context"
 	"embed"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -100,6 +101,10 @@ func EventTopic(name string) (common.Hash, error) {
 // are in flight, because the nodes are shared and the ingest is the one thing
 // here capable of hammering them.
 type Client struct {
+	// urls is replaced when the secrets file rotates, and read on every request, so it is
+	// guarded rather than fixed at construction. The lock is its own: the client's `mu`
+	// serialises JSON-RPC id allocation, which every request also takes.
+	urlsMu  sync.RWMutex
 	urls    []string
 	http    *http.Client
 	sem     chan struct{}
@@ -123,6 +128,33 @@ type Client struct {
 
 	nextID int
 	mu     sync.Mutex
+}
+
+// endpoints is the current fallback list. Copied under the lock: the loop that walks it
+// makes network calls, and holding a read lock for the duration of a sync would block a
+// rotation behind whatever a hung endpoint is doing.
+func (c *Client) endpoints() []string {
+	c.urlsMu.RLock()
+	defer c.urlsMu.RUnlock()
+	out := make([]string, len(c.urls))
+	copy(out, c.urls)
+	return out
+}
+
+// SetURLs replaces the fallback list, for when the credentials in it are rotated.
+//
+// Requests already in flight finish against the endpoints they started with; the next one
+// uses the new list. An empty list is refused — a rotation that renders to nothing must
+// leave a working client alone rather than produce one with nowhere to send.
+func (c *Client) SetURLs(urls string) error {
+	list := splitURLs(urls)
+	if len(list) == 0 {
+		return errors.New("no usable endpoints")
+	}
+	c.urlsMu.Lock()
+	defer c.urlsMu.Unlock()
+	c.urls = list
+	return nil
 }
 
 // Options configure request pacing.
@@ -214,6 +246,18 @@ func (c *Client) Stats() Stats {
 }
 
 // NewClient builds a client over a comma-separated endpoint list.
+// splitURLs turns a comma-separated list into endpoints, dropping empties. Shared by
+// NewClient and SetURLs so a rotated list is parsed exactly like the one at startup.
+func splitURLs(urls string) []string {
+	var list []string
+	for _, u := range strings.Split(urls, ",") {
+		if u = strings.TrimSpace(u); u != "" {
+			list = append(list, u)
+		}
+	}
+	return list
+}
+
 func NewClient(urls string, o Options) *Client {
 	if o.Concurrency <= 0 {
 		o.Concurrency = 4
@@ -234,12 +278,7 @@ func NewClient(urls string, o Options) *Client {
 		o.MulticallMaxCost = defaultMulticallMaxCost
 	}
 
-	var list []string
-	for _, u := range strings.Split(urls, ",") {
-		if u = strings.TrimSpace(u); u != "" {
-			list = append(list, u)
-		}
-	}
+	list := splitURLs(urls)
 
 	if o.Log == nil {
 		o.Log = slog.New(slog.NewTextHandler(io.Discard, nil))
@@ -305,7 +344,8 @@ func (c *Client) do(ctx context.Context, reqs []rpcRequest) ([]json.RawMessage, 
 	}
 
 	var lastErr error
-	for i, url := range c.urls {
+	endpoints := c.endpoints()
+	for i, url := range endpoints {
 		req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
 		if err != nil {
 			return nil, err
@@ -410,7 +450,7 @@ func (c *Client) do(ctx context.Context, reqs []rpcRequest) ([]json.RawMessage, 
 	// Naming the endpoints is the point: "all endpoints failed" on its own sends someone
 	// to the wrong place, and the usual shape of this is one provider out of quota while
 	// the rest of the list was never configured.
-	return nil, fmt.Errorf("all %d endpoint(s) failed, last: %w", len(c.urls), lastErr)
+	return nil, fmt.Errorf("all %d endpoint(s) failed, last: %w", len(endpoints), lastErr)
 }
 
 // observed hands one round trip to the hook, if there is one.
