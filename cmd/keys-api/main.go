@@ -14,11 +14,9 @@
 //	CHAIN_ID                          reported in /v1/status; verified against the node,
 //	                                  and names the schema the store lives in
 //	DATABASE_URL                      Postgres DSN
-//	SECRETS_FILE_PATH                 JSON file the OpenBao agent renders credentials to
-//	                                  (default /vault/secrets/config). Present: it wins over
-//	                                  the environment, and PROVIDERS_URLS is re-read from it
-//	                                  when it rotates. Absent: environment only, which is how
-//	                                  the compose deployment runs
+//	SECRETS_FILE_PATH                 JSON file the credentials are read from. Present: it
+//	                                  wins over the environment, and PROVIDERS_URLS is
+//	                                  re-read when it changes. Absent: environment only
 //	SECRETS_POLL_INTERVAL_IN_SECONDS  how often that path is stat'ed (default 10)
 //	PORT                              listen port (default 3000)
 //	KEYS_API_MODE                     all (default) | server | ingest
@@ -130,10 +128,8 @@ func run(log *slog.Logger) error {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	// Before anything reads the environment: in Kubernetes the credentials arrive as a file,
-	// and this makes that file the source for every envOr below. A broken render is logged
-	// and then ignored — the environment still holds a working configuration, and refusing
-	// to start would turn one bad template into an outage.
+	// Before anything reads the environment, so the file is the source for every envOr below.
+	// A broken file is logged and ignored: the environment still holds a working configuration.
 	secretsPath := envOr("SECRETS_FILE_PATH", secrets.DefaultPath)
 	appliedSecrets, err := secrets.LoadIntoEnv(secretsPath)
 	if err != nil {
@@ -348,18 +344,11 @@ func run(log *slog.Logger) error {
 	return nil
 }
 
-// applyRotatedSecrets applies what can be applied while running, and says plainly what
-// cannot.
+// applyRotatedSecrets applies what can be applied while running, and logs what cannot.
 //
-// PROVIDERS_URLS can: the client copies its endpoint list per request, so a replacement
-// takes effect from the next one. DATABASE_URL cannot — the pool is built from it and
-// several callers hold connections, so picking it up without a restart also means not
-// diverging between them. Anything else in the file was read once through the environment.
-//
-// A key that needs a restart is deliberately not recorded as applied, so every later
-// rotation reports it again for as long as the process runs on a credential the file no
-// longer holds. It is not re-reported between rotations — the file is re-read only when its
-// mtime changes — so the thing to alert on is an increase over a window, not a level.
+// PROVIDERS_URLS can: the client copies its endpoint list per request. DATABASE_URL cannot,
+// because the pool is built from it and several callers hold connections. A key that needs a
+// restart is not recorded as applied, so later changes report it again until one happens.
 func applyRotatedSecrets(
 	values, applied map[string]string,
 	setEndpoints func(string) error,

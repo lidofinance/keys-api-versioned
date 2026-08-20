@@ -75,9 +75,7 @@ type Metrics struct {
 	// a contract read and a request is a round trip.
 	RPCRequests *prometheus.CounterVec
 
-	// SecretsReloads counts rotated secrets picked up from the secrets file, by outcome. A
-	// rotation that did not reach the process is otherwise indistinguishable from a healthy
-	// one: the old endpoint answers until the provider revokes the credential.
+	// SecretsReloads counts changes picked up from the secrets file, by outcome.
 	SecretsReloads *prometheus.CounterVec
 	RPCCalls       prometheus.Counter
 
@@ -202,7 +200,7 @@ func New(namespace string) *Metrics {
 		}, []string{"route"}),
 		SecretsReloads: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Namespace: namespace, Name: "secrets_reloads_total",
-			Help: "Rotated secrets picked up from the secrets file, by outcome (success, failure, restart_required). Zero forever on a deployment whose secrets are environment variables; a climbing restart_required means the file holds a credential this process is not using.",
+			Help: "Secrets picked up from the file, by outcome (success, failure, restart_required). A rising restart_required means the file holds a value this process is not using.",
 		}, []string{"status"}),
 		RPCRequests: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Namespace: namespace, Name: "rpc_requests_total",
