@@ -20,8 +20,7 @@ func TestSetURLsReplacesTheFallbackList(t *testing.T) {
 func TestSetURLsRefusesAnEmptyList(t *testing.T) {
 	c := NewClient("http://one:8545", Options{})
 
-	// A render that produced nothing must leave a working client alone rather than turn it
-	// into one with nowhere to send.
+	// A config that produced nothing must leave a working client alone.
 	for _, urls := range []string{"", "  ", ",", ", ,"} {
 		if err := c.SetURLs(urls); err == nil {
 			t.Fatalf("%q was accepted", urls)
@@ -33,8 +32,7 @@ func TestSetURLsRefusesAnEmptyList(t *testing.T) {
 }
 
 func TestEndpointsIsACopy(t *testing.T) {
-	// The request loop walks the returned slice while making network calls; if it aliased
-	// the client's own slice, a rotation would mutate a list mid-sync.
+	// The caller walks the returned slice while making calls, so it must not alias the field.
 	c := NewClient("http://one:8545", Options{})
 	got := c.endpoints()
 	got[0] = "http://mutated:8545"

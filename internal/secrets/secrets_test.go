@@ -8,9 +8,8 @@ import (
 	"time"
 )
 
-// render writes the way the OpenBao agent does: a temp file renamed over the path. The
-// rename is what makes the update atomic, and it is also what gives the file a new inode
-// every time — the reason Watcher stats the path instead of watching the file.
+// render replaces the file the way the real writer does: a temp file renamed over the path,
+// which gives it a new inode every time.
 func render(t *testing.T, path, contents string) {
 	t.Helper()
 	tmp := path + ".tmp"
@@ -20,9 +19,7 @@ func render(t *testing.T, path, contents string) {
 	if err := os.Rename(tmp, path); err != nil {
 		t.Fatalf("rename: %v", err)
 	}
-	// The mtime has nanosecond resolution on Linux but only second resolution on some
-	// filesystems; nudge it forward so a change is detectable in a test that runs in
-	// microseconds. The production interval is ten seconds.
+	// Nudge the mtime forward: some filesystems keep only second resolution.
 	future := time.Now().Add(time.Second)
 	if err := os.Chtimes(path, future, future); err != nil {
 		t.Fatalf("chtimes: %v", err)
@@ -120,8 +117,7 @@ func TestWatcherKeepsPreviousValuesOnABadRender(t *testing.T) {
 		t.Fatalf("expected one report, got %d", reported)
 	}
 
-	// The mtime is remembered even for a bad render: otherwise one broken template would
-	// report the same error every interval for as long as the process ran.
+	// The mtime is remembered even for a bad file, so it is reported once, not every interval.
 	if w.CheckOnce() || reported != 1 {
 		t.Fatalf("a bad render should be reported once, got %d reports", reported)
 	}

@@ -144,9 +144,8 @@ func (w *Watcher) CheckOnce() bool {
 		return false
 	}
 	if len(values) == 0 {
-		// A rotation that renders to nothing is not something to apply over working values.
-		// The mtime is remembered anyway — otherwise one broken template would report the
-		// same error every interval, forever.
+		// Nothing usable: keep the values already in force. The mtime is remembered anyway,
+		// so a broken file is reported once rather than every interval.
 		w.reportError(fmt.Errorf("secrets file %s changed but has no usable values, keeping the previous ones", w.path))
 		return false
 	}

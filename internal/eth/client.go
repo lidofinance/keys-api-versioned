@@ -101,9 +101,8 @@ func EventTopic(name string) (common.Hash, error) {
 // are in flight, because the nodes are shared and the ingest is the one thing
 // here capable of hammering them.
 type Client struct {
-	// urls is replaced when the secrets file rotates, and read on every request, so it is
-	// guarded rather than fixed at construction. The lock is its own: the client's `mu`
-	// serialises JSON-RPC id allocation, which every request also takes.
+	// Replaced when the config changes and read on every request, so it is guarded. Its own
+	// lock, because `mu` serialises id allocation and every request takes that one.
 	urlsMu  sync.RWMutex
 	urls    []string
 	http    *http.Client
@@ -130,9 +129,8 @@ type Client struct {
 	mu     sync.Mutex
 }
 
-// endpoints is the current fallback list. Copied under the lock: the loop that walks it
-// makes network calls, and holding a read lock for the duration of a sync would block a
-// rotation behind whatever a hung endpoint is doing.
+// endpoints is the current fallback list, copied under the lock: the caller walks it while
+// making network calls, and holding the lock that long would block a replacement.
 func (c *Client) endpoints() []string {
 	c.urlsMu.RLock()
 	defer c.urlsMu.RUnlock()
@@ -141,11 +139,9 @@ func (c *Client) endpoints() []string {
 	return out
 }
 
-// SetURLs replaces the fallback list, for when the credentials in it are rotated.
-//
-// Requests already in flight finish against the endpoints they started with; the next one
-// uses the new list. An empty list is refused — a rotation that renders to nothing must
-// leave a working client alone rather than produce one with nowhere to send.
+// SetURLs replaces the fallback list. Requests in flight finish against the endpoints they
+// started with; the next one uses the new list. An empty list is refused, so a bad config
+// leaves a working client alone.
 func (c *Client) SetURLs(urls string) error {
 	list := splitURLs(urls)
 	if len(list) == 0 {
