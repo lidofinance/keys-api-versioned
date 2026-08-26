@@ -19,6 +19,7 @@ import (
 	"log/slog"
 	"math/big"
 	"net/http"
+	neturl "net/url"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -353,12 +354,14 @@ func (c *Client) do(ctx context.Context, reqs []rpcRequest) ([]json.RawMessage, 
 		resp, err := c.http.Do(req)
 		if err != nil {
 			c.observed(method, len(reqs), "error", hostOf(url), time.Since(started))
-			lastErr = err
+			// Do's *url.Error embeds the full request URL — key in the path included —
+			// so it is redacted in place before anything logs or wraps it.
+			lastErr = redactErr(err)
 			// An endpoint failing is worth a line at warn: the fallback hides it from
 			// everything else, and a node quietly out of the rotation is the kind of
 			// thing that only shows up as "the sync got slower".
 			c.log.Warn("rpc endpoint failed, trying the next one",
-				"endpoint", hostOf(url), "method", method, "calls", len(reqs), "err", err)
+				"endpoint", hostOf(url), "method", method, "calls", len(reqs), "err", lastErr)
 			continue
 		}
 
@@ -457,6 +460,25 @@ func (c *Client) observed(method string, calls int, result, endpoint string, d t
 	c.observe(RequestInfo{
 		Method: method, Calls: calls, Result: result, Duration: d, Endpoint: endpoint,
 	})
+}
+
+// redactErr strips the path — where providers put the API key — from the URL a
+// *url.Error carries, in place: the type and the wrapped cause survive, so
+// errors.Is(err, context.Canceled) keeps working up the chain.
+func redactErr(err error) error {
+	var uerr *neturl.Error
+	if errors.As(err, &uerr) {
+		uerr.URL = schemeHostOf(uerr.URL)
+	}
+	return err
+}
+
+func schemeHostOf(raw string) string {
+	scheme := "http://"
+	if strings.HasPrefix(raw, "https://") {
+		scheme = "https://"
+	}
+	return scheme + hostOf(raw)
 }
 
 // hostOf trims an endpoint to its host, so a log line stays readable and a URL with
