@@ -1,0 +1,10 @@
+.git
+.github
+.gitignore
+.env
+.env.*
+bin
+testdata
+docker-compose.yml
+Makefile
+README.md
