@@ -1,6 +1,5 @@
-// Command bench measures dump latency, throughput and the server's resident
-// set while the load runs. It replaces a k6 dependency for the numbers this PoC
-// needs, and can point at either implementation.
+// Command bench measures dump latency, throughput and server RSS under load, against either
+// implementation.
 package main
 
 import (

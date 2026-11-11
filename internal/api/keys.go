@@ -11,12 +11,10 @@ import (
 	"github.com/lidofinance/keys-api-versioned/internal/store"
 )
 
-// streamBufferSize is the write buffer for dump endpoints. Large enough to
-// amortize syscalls on multi-hundred-megabyte responses, small enough that
-// concurrent dumps do not dominate the resident set.
+// Large enough to amortize syscalls on multi-hundred-MiB dumps, small enough that concurrent
+// dumps do not dominate RSS.
 const streamBufferSize = 256 << 10
 
-// parseFilter reads the query filters, rejecting the same inputs as canonical.
 func parseFilter(r *http.Request, withAddresses bool) (model.KeysFilter, error) {
 	var f model.KeysFilter
 	q := r.URL.Query()
@@ -59,10 +57,7 @@ type errBadRequest struct{ messages []string }
 
 func (e errBadRequest) Error() string { return strings.Join(e.messages, ", ") }
 
-// handleKeys streams every key of every module.
-//
-// Framing is byte-identical to the canonical service, including whitespace:
-// `{ "meta": {...}, "data": [` … `]}`.
+// handleKeys framing is byte-identical to canonical, whitespace included.
 func (s *Server) handleKeys(w http.ResponseWriter, r *http.Request) {
 	filter, err := parseFilter(r, true)
 	if err != nil {
@@ -70,7 +65,6 @@ func (s *Server) handleKeys(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Paging is opt-in: without limit or cursor this is the canonical full dump.
 	page, err := parsePage(r)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err.(errBadRequest).messages)
@@ -130,7 +124,6 @@ func (s *Server) handleKeys(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// handleModuleKeys streams keys of a single module.
 func (s *Server) handleModuleKeys(w http.ResponseWriter, r *http.Request) {
 	filter, err := parseFilter(r, false)
 	if err != nil {
@@ -194,16 +187,8 @@ func (s *Server) handleModuleKeys(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// handleGroupedKeys returns keys grouped by module.
-//
-// Streamed, unlike the canonical service, which builds the whole response in memory
-// and dies at a 512 MiB limit on mainnet data. Ours did too for one commit: an
-// earlier version collected every key into a slice, which only looked survivable
-// while a bug left the hex strings empty — 511 877 keys with their pubkeys and
-// signatures materialised is around half a gigabyte of strings.
-//
-// The bytes are identical to the collected version, envelope and property order
-// included; only the memory is different.
+// handleGroupedKeys streams; canonical builds it in memory and dies at a 512 MiB limit on mainnet
+// (~512k keys materialised as strings is about half a gigabyte).
 func (s *Server) handleGroupedKeys(w http.ResponseWriter, r *http.Request) {
 	filter, err := parseFilter(r, false)
 	if err != nil {
@@ -270,19 +255,10 @@ type meta struct {
 	ELBlockSnapshot *model.ELBlockSnapshot `json:"elBlockSnapshot"`
 }
 
-// Pubkey validation, and why it is here rather than left to the lookup.
-//
-// The canonical service validates the shape before it looks anything up, so a malformed
-// pubkey is a 400 and a well-formed unknown one is a 404. Without this, both were 404
-// here: "there are no keys with not-a-pubkey in db" for a string that could never be a
-// pubkey. A consumer that retries a 404 and gives up on a 400 — the sensible reading —
-// would retry forever. Found by comparing the error surface against a running canonical
-// service.
-//
-// The message is canonical's own, because the whole point is to be indistinguishable.
+// Shape is validated before lookup, as canonical does: malformed is 400, well-formed unknown is
+// 404. The message is canonical's own.
 const badPubkeyMessage = "Each pubkey must be a valid 0x-prefixed 48-byte hex string"
 
-// validPubkey reports whether a string is a 0x-prefixed 48-byte hex value.
 func validPubkey(s string) bool {
 	if !strings.HasPrefix(s, "0x") || len(s) != 2+2*48 {
 		return false
@@ -296,7 +272,6 @@ func validPubkey(s string) bool {
 	return true
 }
 
-// handleKeyByPubkey returns every key matching one pubkey across modules.
 func (s *Server) handleKeyByPubkey(w http.ResponseWriter, r *http.Request) {
 	pubkey := strings.ToLower(r.PathValue("pubkey"))
 	if !validPubkey(pubkey) {
@@ -306,13 +281,8 @@ func (s *Server) handleKeyByPubkey(w http.ResponseWriter, r *http.Request) {
 	s.findKeys(w, r, []string{pubkey}, true)
 }
 
-// handleKeysFind returns keys matching a pubkey list across modules.
-//
-// The body is validated the way the canonical service validates it, down to reporting
-// every failed constraint at once — that is what class-validator does there, and a
-// consumer reading `message[0]` should see the same thing. Before this, an empty list and
-// a body with the wrong field name both answered 200 with no keys, which reads as "none
-// of your pubkeys exist" rather than "your request is wrong".
+// handleKeysFind validates like canonical's class-validator, reporting every failed constraint at
+// once; an empty list or wrong field used to answer 200 with no keys.
 func (s *Server) handleKeysFind(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		Pubkeys *[]string `json:"pubkeys"`
@@ -390,7 +360,6 @@ func (s *Server) findKeys(w http.ResponseWriter, r *http.Request, pubkeys []stri
 	}
 }
 
-// handleModuleKeysFind returns keys of one module matching a pubkey list.
 func (s *Server) handleModuleKeysFind(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		Pubkeys []string `json:"pubkeys"`

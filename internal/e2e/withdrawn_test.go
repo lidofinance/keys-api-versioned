@@ -11,13 +11,10 @@ import (
 	"github.com/lidofinance/keys-api-versioned/internal/testreg"
 )
 
-// totalWithdrawnKeys is a canonical field since 5.0.0, so unlike groupId it is on
-// both surfaces: null for a curated module, a number for a CSM-shaped one, and
-// always right after depositableValidatorsCount — byte order is part of parity.
+// totalWithdrawnKeys is canonical since 5.0.0: on both surfaces, null for curated modules, and right
+// after depositableValidatorsCount, since byte order is part of parity.
 
-// withdrawnRegistry is two modules: module 1 curated (no counter), module 2 CSM-shaped
-// with operator i holding i withdrawn keys — operator 0 is the genuine 0 — and groups,
-// so the extended surface can show where groupId goes.
+// Operator i of module 2 holds i withdrawn keys, so operator 0 is a genuine 0.
 func withdrawnRegistry(withdrawnBase int32) testreg.Spec {
 	spec := testreg.Spec{Modules: 2, OperatorsPerModule: 3, KeysPerOperator: 5}
 	spec = spec.WithWithdrawn(func(module, operator int) *int32 {
@@ -44,9 +41,8 @@ func TestTotalWithdrawnKeysIsServedOnBothSurfaces(t *testing.T) {
 	srv := testpg.NewServer(t, db.Reader(t, "latest", 3))
 
 	for _, tc := range []struct {
-		path string
-		want []string
-		// absent must not occur anywhere in the body.
+		path   string
+		want   []string
 		absent string
 	}{
 		{"/v1/modules/1/operators", []string{`"depositableValidatorsCount":5,"totalWithdrawnKeys":null}`}, "groupId"},
@@ -58,8 +54,7 @@ func TestTotalWithdrawnKeysIsServedOnBothSurfaces(t *testing.T) {
 		{"/v1/operators", []string{`"totalWithdrawnKeys":null}`, `"totalWithdrawnKeys":2}`}, "groupId"},
 		{"/v1/modules/2/operators/keys", []string{`"totalWithdrawnKeys":0}`}, "groupId"},
 		{"/v2/modules/operators/keys", []string{`"totalWithdrawnKeys":null}`, `"totalWithdrawnKeys":2}`}, "groupId"},
-		// The extended surface keeps the canonical fields in canonical order and only
-		// then adds its own.
+		// Canonical fields in canonical order first, extensions after.
 		{"/ext/v1/modules/1/operators", []string{`"totalWithdrawnKeys":null}`}, "groupId"},
 		{"/ext/v1/modules/2/operators", []string{`"totalWithdrawnKeys":0,"groupId":9}`}, ""},
 		{"/ext/v1/modules/operators/keys", []string{`"totalWithdrawnKeys":2,"groupId":9}`}, ""},
@@ -80,8 +75,7 @@ func TestTotalWithdrawnKeysIsServedOnBothSurfaces(t *testing.T) {
 	}
 }
 
-// A change in the counter alone moves no key and no other operator field; the
-// writer still has to close the old row, or the new value is never served.
+// The counter alone changes no key or other field; the writer must still close the old row.
 func TestAChangeInTotalWithdrawnKeysAloneIsWritten(t *testing.T) {
 	db := testpg.New(t)
 	ctx := context.Background()
@@ -100,8 +94,6 @@ func TestAChangeInTotalWithdrawnKeysAloneIsWritten(t *testing.T) {
 	}
 }
 
-// Cache-Control follows the canonical service: public on a successful read, absent on
-// an error, no-store on probes.
 func TestCacheControlFollowsCanonical(t *testing.T) {
 	db := testpg.New(t)
 	ctx := context.Background()

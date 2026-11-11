@@ -12,11 +12,8 @@ import (
 	"github.com/lidofinance/keys-api-versioned/internal/testreg"
 )
 
-// A diff is two queries — what became visible, and what stopped being visible — so
-// retention landing between them would drop one side of it whole. That failure is worse
-// than an error: a diff missing its removals applies cleanly and leaves the consumer
-// holding keys the chain no longer has. The lease on the older end is what prevents it,
-// and the control below is what shows the risk was real.
+// A diff is two queries; retention landing between them drops the removals, which still apply
+// cleanly and leave stale keys. The lease on the older end prevents it.
 func TestPruneDuringADiffCannotDropRemovals(t *testing.T) {
 	testpg.Exclusive(t)
 
@@ -27,8 +24,6 @@ func TestPruneDuringADiffCannotDropRemovals(t *testing.T) {
 	from := testreg.At(db.Block(0))
 	spec.Publish(ctx, t, db.Writer, from)
 
-	// Every key of module 1 changes, so the diff has a substantial removed side — the
-	// side retention would be able to delete.
 	next := spec.WithSalt(spec.Salt + 1)
 	to := testreg.At(db.Block(1))
 	next.PublishModules(ctx, t, db.Writer, to, 1)
@@ -42,8 +37,7 @@ func TestPruneDuringADiffCannotDropRemovals(t *testing.T) {
 	)
 	meta, err := reader.DiffKeys(ctx, fmt.Sprint(from.BlockNumber), "latest", "",
 		func(kind store.DiffKind, _ *model.Key) error {
-			// Retention runs from inside the diff, on its first key: keeping one version
-			// makes the older end of this diff a candidate for deletion.
+			// Retention runs from inside the diff, on its first key.
 			if removed+added == 0 {
 				pruned, pruneErr = db.Writer.Prune(ctx, 1)
 				if pruneErr != nil {
@@ -75,9 +69,7 @@ func TestPruneDuringADiffCannotDropRemovals(t *testing.T) {
 	}
 }
 
-// The control for the test above: with the older end's rows deleted the way retention
-// would delete them, the diff has to come back short. If it does not, the lease
-// assertion above is not proving anything.
+// Control: if this does not come back short, the lease test above proves nothing.
 func TestADiffWhoseOlderEndWasDeletedComesBackShort(t *testing.T) {
 	testpg.Exclusive(t)
 
@@ -92,8 +84,7 @@ func TestADiffWhoseOlderEndWasDeletedComesBackShort(t *testing.T) {
 	to := testreg.At(db.Block(1))
 	next.PublishModules(ctx, t, db.Writer, to, 1)
 
-	// Exactly what Prune does to rows of a version that left the window, done directly so
-	// no lease can stop it.
+	// What Prune does to rows that left the window, done directly so no lease can stop it.
 	tag, err := db.Admin().Exec(ctx,
 		`delete from key_version where to_block is not null and to_block <= $1`, to.BlockNumber)
 	if err != nil {
@@ -126,9 +117,6 @@ func TestADiffWhoseOlderEndWasDeletedComesBackShort(t *testing.T) {
 	}
 }
 
-// Applying a diff to the version it starts from has to produce the version it ends at.
-// This is the property that lets a consumer stop pulling the whole dump, and it is
-// stated as an acceptance criterion in docs/next-steps.md.
 func TestApplyingADiffToTheOlderVersionEqualsTheNewerOne(t *testing.T) {
 	db := testpg.New(t)
 	ctx := context.Background()
@@ -137,8 +125,6 @@ func TestApplyingADiffToTheOlderVersionEqualsTheNewerOne(t *testing.T) {
 	from := testreg.At(db.Block(0))
 	spec.Publish(ctx, t, db.Writer, from)
 
-	// One module rewritten, one key deposited elsewhere: a diff that covers both shapes
-	// of change the writer can record.
 	next := spec.
 		WithSalt(spec.Salt + 1).
 		WithUsed(func(module, _, index int) bool { return module == 2 && index == 3 })
@@ -147,7 +133,6 @@ func TestApplyingADiffToTheOlderVersionEqualsTheNewerOne(t *testing.T) {
 
 	reader := db.Reader(t, "latest", 3)
 
-	// Start from the older version, read as a map keyed by identity.
 	held := map[string]model.Key{}
 	older := db.Reader(t, fmt.Sprint(from.BlockNumber), 2)
 	if err := older.Snapshot(ctx, func(snap store.Snapshot) error {
@@ -165,7 +150,6 @@ func TestApplyingADiffToTheOlderVersionEqualsTheNewerOne(t *testing.T) {
 		t.Fatalf("read the older version: %v", err)
 	}
 
-	// Apply the diff: removals then additions, keyed by identity.
 	if _, err := reader.DiffKeys(ctx, fmt.Sprint(from.BlockNumber), "latest", "",
 		func(kind store.DiffKind, k *model.Key) error {
 			if kind == store.DiffRemoved {
@@ -178,9 +162,7 @@ func TestApplyingADiffToTheOlderVersionEqualsTheNewerOne(t *testing.T) {
 		t.Fatalf("diff: %v", err)
 	}
 
-	// What is held now must be the newer version, key for key. Module 3 was not part of
-	// that version's rebuild, so it is still the generation it was written at — inherited
-	// rows are the cheap half of a scoped rebuild, and a diff must not pretend they moved.
+	// Module 3 was not rebuilt, so its rows are inherited at the old salt; a diff must not move them.
 	verifier := testreg.NewVerifier(next).Expect(3, spec.Salt)
 	for _, k := range held {
 		key := k
@@ -193,8 +175,7 @@ func TestApplyingADiffToTheOlderVersionEqualsTheNewerOne(t *testing.T) {
 	}
 }
 
-// keyID is a key's identity in the store's terms: module, operator, index. Deliberately
-// not the pubkey — pubkeys are not unique on a real chain, as Hoodi's CSM shows.
+// Not the pubkey: pubkeys are not unique on a real chain (Hoodi's CSM has duplicates).
 func keyID(k *model.Key) string {
 	return fmt.Sprintf("%s/%d/%d", k.ModuleAddress, k.OperatorIndex, k.Index)
 }

@@ -27,7 +27,6 @@ func TestRedactErrStripsKeyKeepsCause(t *testing.T) {
 	if !errors.Is(got, context.Canceled) {
 		t.Fatal("wrapped cause lost: errors.Is(context.Canceled) is false")
 	}
-	// The wrap the fallback loop applies must stay redacted and unwrappable too.
 	wrapped := fmt.Errorf("all 2 endpoint(s) failed, last: %w", got)
 	if strings.Contains(wrapped.Error(), "SECRETKEY123") {
 		t.Fatalf("key survived the wrap: %q", wrapped.Error())

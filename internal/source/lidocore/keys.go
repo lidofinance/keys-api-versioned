@@ -14,41 +14,22 @@ import (
 	"github.com/lidofinance/keys-api-versioned/internal/model"
 )
 
-// Reading a module's keys is the same walk for both module families: split every
-// operator's key range into contract-call-sized spans, read the spans, emit the
-// keys in operator order. Only the getter and the decoder differ, so the walk
-// lives here and each reader supplies those two.
-//
-// What matters about the shape is that spans are packed across operators rather
-// than within one. The measured limit on a cold sync is round trips per operator,
-// not key volume: mainnet has 731 operators across four modules, 609 of them in
-// CSM, and most CSM operators hold a handful of keys. One request per operator
-// therefore spends the whole sync waiting on latency for reads that would fit
-// together many times over. Packed, the tail collapses — with Multicall3 the pack
-// becomes a single eth_call, and without it a JSON-RPC batch, which is why the
-// reader hands whole groups to the client and lets it decide how they travel.
+// Key spans are packed across operators, not within one: cold sync is bound by round trips per
+// operator (mainnet: 731 operators, 609 in CSM, most with a handful of keys), not key volume.
 
-// keysSpec is what differs between module families: the getter to call and the
-// decoder that turns its return values into keys.
 type keysSpec struct {
 	abi    *abi.ABI
 	method string
 	decode func(values []any, moduleAddress string, op model.Operator, offset int32) ([]model.Key, error)
 }
 
-// keysPacing bounds how much goes into one request and how many run at once.
 type keysPacing struct {
-	// keysBatch is how many keys one contract call asks for.
-	keysBatch uint64
-	// callsPerRequest caps how many calls are packed into one request group.
+	keysBatch       uint64
 	callsPerRequest int
-	// keysPerRequest caps how many keys those calls may return in total, which is
-	// what keeps a group inside the node's eth_call gas cap and response size limit
-	// when the calls are large. A group always carries at least one call, so a span
-	// bigger than this cap still goes out.
+	// keysPerRequest keeps a group inside the node's eth_call gas cap; a group always carries at
+	// least one call, so a larger span still goes out.
 	keysPerRequest uint64
-	// concurrency is how many request groups are in flight.
-	concurrency int
+	concurrency    int
 }
 
 func (p keysPacing) withDefaults() keysPacing {
@@ -67,7 +48,6 @@ func (p keysPacing) withDefaults() keysPacing {
 	return p
 }
 
-// keyRead is one getter call: a contiguous range of one operator's keys.
 type keyRead struct {
 	op   model.Operator
 	span keySpan
@@ -75,7 +55,6 @@ type keyRead struct {
 
 type keySpan struct{ offset, limit uint64 }
 
-// planKeyReads lists the calls a module's keys need, in emission order.
 func planKeyReads(operators []model.Operator, batch uint64) []keyRead {
 	var reads []keyRead
 	for _, op := range operators {
@@ -89,7 +68,6 @@ func planKeyReads(operators []model.Operator, batch uint64) []keyRead {
 	return reads
 }
 
-// groupKeyReads packs the calls into request-sized groups, keeping order.
 func groupKeyReads(reads []keyRead, maxCalls int, maxKeys uint64) [][]keyRead {
 	var (
 		groups [][]keyRead
@@ -111,11 +89,8 @@ func groupKeyReads(reads []keyRead, maxCalls int, maxKeys uint64) [][]keyRead {
 	return groups
 }
 
-// streamKeys reads a module's keys and hands them to fn in operator order.
-//
-// Groups run concurrently but are emitted in plan order, so the callback sees a
-// stable sequence and the writer streams straight into the store. In-flight
-// memory is bounded by concurrency × keysPerRequest.
+// streamKeys runs groups concurrently but emits in plan order; in-flight memory is bounded by
+// concurrency × keysPerRequest.
 func streamKeys(
 	ctx context.Context,
 	c *eth.Client,
@@ -172,15 +147,13 @@ func streamKeys(
 			}
 		}
 
-		// One line per window at debug. A cold sync spends minutes here and used to
-		// say nothing at all, which made a slow node indistinguishable from a hang.
+		// Without this a slow node was indistinguishable from a hang.
 		lastGroup := window[len(window)-1]
 		logProgress(log, moduleAddress, lastGroup[len(lastGroup)-1], end, len(groups), read, started)
 	}
 	return nil
 }
 
-// readKeyGroup performs one group's calls and decodes them in order.
 func readKeyGroup(
 	ctx context.Context,
 	c *eth.Client,
@@ -198,9 +171,8 @@ func readKeyGroup(
 				new(big.Int).SetUint64(read.span.offset),
 				new(big.Int).SetUint64(read.span.limit),
 			},
-			// Keys asked for is what this read costs, and the client needs it to
-			// decide what may share one aggregate's gas budget: 200 one-key reads
-			// can, two full batches cannot.
+			// Cost decides what may share one aggregate's gas budget: 200 one-key reads can, two full
+			// batches cannot.
 			Cost: int(read.span.limit),
 		})
 	}
@@ -232,7 +204,6 @@ func batchSpans(total, batch uint64) []keySpan {
 	return spans
 }
 
-// logProgress reports where a module's key read has got to, and how fast.
 func logProgress(log *slog.Logger, moduleAddress string, last keyRead, done, groups, read int, started time.Time) {
 	if log == nil {
 		return

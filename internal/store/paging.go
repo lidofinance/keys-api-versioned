@@ -9,18 +9,11 @@ import (
 	"github.com/lidofinance/keys-api-versioned/internal/model"
 )
 
-// Pagination is possible here for the reason it is impossible in the canonical
-// service: the rows of a published version never move. There, a page-two query
-// would run against a table the registry job may have rewritten in between, so the
-// second page could skip keys or repeat them — which is why the endpoint returns
-// everything or nothing. Pinned to a version, a page is an ordinary range scan in
-// key-identity order.
+// Paging is safe here, unlike in the canonical service, because a published version's rows
+// never move.
 
-// KeyCursor points at one key, and at the version the walk is pinned to.
-//
-// The version travels in the cursor on purpose. A consumer that starts a walk and
-// then asks for page two gets page two of the same version, even if three versions
-// were published in between — without having to know that pinning exists.
+// KeyCursor carries the version, so page two is of the same version without the consumer
+// knowing pinning exists.
 type KeyCursor struct {
 	Block         int64
 	ModuleID      int32
@@ -28,13 +21,11 @@ type KeyCursor struct {
 	KeyIndex      int32
 }
 
-// String renders the cursor for the wire. It is deliberately readable rather than
-// opaque: an operator debugging a stuck consumer can tell where it is.
+// String is readable rather than opaque, so a stuck consumer's position is visible.
 func (c KeyCursor) String() string {
 	return fmt.Sprintf("%d.%d.%d.%d", c.Block, c.ModuleID, c.OperatorIndex, c.KeyIndex)
 }
 
-// ParseKeyCursor reads a cursor produced by String.
 func ParseKeyCursor(s string) (KeyCursor, error) {
 	parts := strings.Split(s, ".")
 	if len(parts) != 4 {
@@ -58,34 +49,20 @@ func ParseKeyCursor(s string) (KeyCursor, error) {
 	return c, nil
 }
 
-// KeyPage is one page request.
 type KeyPage struct {
-	// Limit is how many keys the page may contain.
 	Limit int
 	// After is exclusive: the walk resumes at the next key. Nil starts at the top.
 	After *KeyCursor
 }
 
-// PagedSnapshot is a snapshot that can serve a page of keys in a stable order.
-//
-// It is an optional capability rather than part of Snapshot: the comparison
-// backends in this repo hold only the current state, where paging would be the
-// unsafe thing it is in the canonical service.
 type PagedSnapshot interface {
-	// StreamKeysPage calls fn for each key of the page, in (module, operator, index)
-	// order, and returns the cursor to resume from. A nil cursor means the walk is
-	// finished.
+	// A nil cursor means the walk is finished.
 	StreamKeysPage(ctx context.Context, f model.KeysFilter, page KeyPage, fn func(*model.Key) error) (*KeyCursor, error)
-	// PinBlock is the version the page came from, for the cursor to carry.
 	PinBlock() int64
 }
 
-// keysPageQuery reads one page across every module in identity order.
-//
-// The row comparison is what makes the cursor exact: `(module_id, operator_index,
-// key_index) > (…)` resumes at the next key without an offset, so page N costs the
-// same as page 1. An OFFSET-based version of this in an earlier experiment here was
-// O(offset) and made writes look slower than they were.
+// The row comparison `(module_id, operator_index, key_index) > (…)` resumes without OFFSET, so
+// page N costs the same as page 1.
 const keysPageQuery = `select module_id, operator_index, key_index, pubkey, signature, used, vetted
 	from key_version
 	where from_block <= $1 and (to_block is null or to_block > $1)`
@@ -94,9 +71,7 @@ func (s *appSnapshot) StreamKeysPage(ctx context.Context, f model.KeysFilter, pa
 	if err := s.loadModules(ctx); err != nil {
 		return nil, err
 	}
-	// A page that comes back empty because a reorg deleted the version's rows would
-	// read as "the walk is finished" — a silent short answer in the one place a
-	// consumer is least likely to check.
+	// A page emptied by a reorg would read as "walk finished": a silent short answer.
 	if err := s.stillOnChain(ctx); err != nil {
 		return nil, err
 	}
@@ -134,8 +109,7 @@ func (s *appSnapshot) StreamKeysPage(ctx context.Context, f model.KeysFilter, pa
 		q += ` and module_id = any($` + strconv.Itoa(len(args)) + `)`
 	}
 
-	// One row more than asked for: its existence is how the page knows whether to
-	// hand back a cursor, without a second count query.
+	// One row more than asked: whether it exists decides the cursor, with no count query.
 	args = append(args, page.Limit+1)
 	q += ` order by module_id, operator_index, key_index limit $` + strconv.Itoa(len(args))
 
@@ -184,8 +158,6 @@ func (s *appSnapshot) StreamKeysPage(ctx context.Context, f model.KeysFilter, pa
 	return &last, nil
 }
 
-// addressOfID returns the checksummed module address for a module id, from the
-// module set already read for this snapshot.
 func (s *appSnapshot) addressOfID(id int16) string {
 	for i := range s.modules {
 		if int16(s.modules[i].ID) == id {

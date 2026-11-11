@@ -18,10 +18,8 @@ import (
 	"github.com/lidofinance/keys-api-versioned/internal/model"
 )
 
-// Node operator groups live in the module's MetaRegistry, not in the module, and
-// only curated-onchain-v2 has one. Both halves of that matter to a consumer: a
-// group has to arrive, and a module without groups has to say so rather than
-// report everyone as ungrouped.
+// Only curated-onchain-v2 has groups (in its MetaRegistry); a module without them must say so
+// rather than report everyone as ungrouped.
 
 func TestCMv2OperatorsCarryTheirGroup(t *testing.T) {
 	node := &operatorsNode{registry: metaRegistryUnderTest, operators: 4, groups: map[int64]int64{
@@ -62,9 +60,7 @@ func TestCMv2OperatorsCarryTheirGroup(t *testing.T) {
 		if *got != want.group {
 			t.Errorf("operator %d: got group %d, want %d", want.index, *got, want.group)
 		}
-		// The sentinel is a real on-chain value and a real group id is not: the
-		// renderer has to be able to tell them apart, which is the whole point of
-		// the type carrying its own JSON form.
+		// The sentinel is a real on-chain value; the renderer must tell it apart from a group id.
 		encoded, err := got.MarshalJSON()
 		if err != nil {
 			t.Fatalf("operator %d: marshal group: %v", want.index, err)
@@ -75,9 +71,8 @@ func TestCMv2OperatorsCarryTheirGroup(t *testing.T) {
 	}
 }
 
-// CSM has no MetaRegistry, and the module type says so: names are generated, there
-// are no groups, and the registry is never asked for. Probing it instead conflated
-// a failed read with "no registry" and served generated names for CMv2.
+// CSM: names are generated and the registry is never probed. Probing conflated a failed read with
+// "no registry" and served generated names for CMv2.
 func TestCSMReportsNoGroupsAndNeverProbesARegistry(t *testing.T) {
 	node := &operatorsNode{operators: 5}
 	server := httptest.NewServer(node)
@@ -106,8 +101,7 @@ func TestCSMReportsNoGroupsAndNeverProbesARegistry(t *testing.T) {
 	}
 }
 
-// META_REGISTRY is read at every operator read, not cached for the process: a module
-// upgrade can point it at another registry, and names then come from the new one.
+// A module upgrade can repoint META_REGISTRY, so it is read on every operator read.
 func TestCMv2ReadsItsMetaRegistryOnEveryRead(t *testing.T) {
 	node := &operatorsNode{registry: metaRegistryUnderTest, operators: 2, groups: map[int64]int64{}}
 	server := httptest.NewServer(node)
@@ -141,8 +135,6 @@ func TestCMv2ReadsItsMetaRegistryOnEveryRead(t *testing.T) {
 	}
 }
 
-// A failed META_REGISTRY read on CMv2 fails the read; it does not fall back to
-// generated names, which is what consumers saw when a revert meant "no registry".
 func TestCMv2FailsWhenItsRegistryCannotBeRead(t *testing.T) {
 	node := &operatorsNode{operators: 2} // META_REGISTRY reverts
 	server := httptest.NewServer(node)
@@ -179,7 +171,6 @@ func TestCMv2UndecodableNamesGetThePlaceholder(t *testing.T) {
 	}
 }
 
-// totalWithdrawnKeys is read from getNodeOperator, a genuine 0 included.
 func TestCommunityOperatorsCarryTotalWithdrawnKeys(t *testing.T) {
 	node := &operatorsNode{operators: 3}
 	server := httptest.NewServer(node)
@@ -202,9 +193,8 @@ func TestCommunityOperatorsCarryTotalWithdrawnKeys(t *testing.T) {
 	}
 }
 
-// The group read has to travel in the batch the names already pay for. A call per
-// operator is what the reader is written to avoid, and it is invisible in a
-// correctness assertion — mainnet's module 4 would simply be 45 round trips slower.
+// A call per operator is invisible to correctness assertions: mainnet's module 4 would be 45
+// round trips slower.
 func TestGroupsCostNoExtraRoundTrip(t *testing.T) {
 	node := &operatorsNode{registry: metaRegistryUnderTest, operators: 20, groups: map[int64]int64{}}
 	server := httptest.NewServer(node)
@@ -237,14 +227,12 @@ var (
 	csmUnderTest  = stakingModule(3, "community-onchain-v1", moduleUnderTest)
 )
 
-// operatorsNode answers the calls CommunityReader.Operators makes. A module with an
-// empty registry address reverts META_REGISTRY, the way plain CSM does.
+// A module with an empty registry address reverts META_REGISTRY, the way plain CSM does.
 type operatorsNode struct {
-	mu        sync.Mutex
-	registry  string
-	operators int64
-	groups    map[int64]int64
-	// names overrides the metadata name per operator.
+	mu         sync.Mutex
+	registry   string
+	operators  int64
+	groups     map[int64]int64
 	names      map[int64]string
 	metadataTo string
 
@@ -351,7 +339,6 @@ func packAddress(a string) string {
 	return "0x" + common.Bytes2Hex(common.LeftPadBytes(common.HexToAddress(a).Bytes(), 32))
 }
 
-// nodeOperator mirrors the CSM tuple; only the fields the decoder reads are set.
 type nodeOperator struct {
 	TotalAddedKeys             uint32
 	TotalWithdrawnKeys         uint32

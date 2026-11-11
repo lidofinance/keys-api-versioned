@@ -12,11 +12,6 @@ import (
 	"github.com/lidofinance/keys-api-versioned/internal/store"
 )
 
-// The document is hand-written, so the thing that can rot is the list of endpoints.
-// These tests make that a build failure rather than a consumer's problem: a route
-// added without a spec entry fails, and a spec entry whose route was removed fails.
-// Descriptions are still on the author.
-
 func TestOpenAPICoversEveryRoute(t *testing.T) {
 	server := New(stubStore{}, Config{})
 
@@ -26,9 +21,7 @@ func TestOpenAPICoversEveryRoute(t *testing.T) {
 		if r.undocumented {
 			continue
 		}
-		// Mirrors are covered by the rule the document states and
-		// TestEveryCanonicalRouteHasAMirror checks, not by an entry each. Fourteen
-		// copies of a response body would rot faster than they would help.
+		// Mirrors are covered by TestEveryCanonicalRouteHasAMirror, not an entry each.
 		if r.mirror {
 			continue
 		}
@@ -58,15 +51,8 @@ func TestOpenAPIHasNoPathsThatAreNotRoutes(t *testing.T) {
 	}
 }
 
-// TestEveryCanonicalRouteHasAMirror is what replaces documenting the extended surface
-// path by path, and it checks something an enumeration could not: that the two surfaces
-// stay in step. A canonical read added without a mirror fails here, which is the mistake
-// that would actually happen — a consumer moving to /ext/v1 finding one endpoint missing.
-//
-// It also pins the shape of a mirrored path, since dropping the canonical version
-// segment is the part that is easy to get wrong: /v2/modules/operators/keys has to land
-// on /ext/v1/modules/operators/keys, not on /ext/v1/v2/... and not on a collision with
-// /ext/v1/modules/{module_id}/operators/keys.
+// A canonical read added without a mirror fails here. /v2/modules/operators/keys must land on
+// /ext/v1/modules/operators/keys, not /ext/v1/v2/... nor collide with {module_id}/operators/keys.
 func TestEveryCanonicalRouteHasAMirror(t *testing.T) {
 	server := New(stubStore{}, Config{})
 
@@ -77,8 +63,6 @@ func TestEveryCanonicalRouteHasAMirror(t *testing.T) {
 		case r.mirror:
 			mirrors[r.pattern] = true
 		case r.undocumented, !strings.Contains(r.pattern, "/v1/"), strings.HasPrefix(r.pattern, "GET /openapi"):
-			// Not part of the mirrored surface: probes, the document, and the ext-only
-			// diff endpoints, which have no canonical twin by design.
 		case strings.Contains(r.pattern, extPrefix):
 		default:
 			canonical = append(canonical, r.pattern)
@@ -105,14 +89,10 @@ func TestEveryCanonicalRouteHasAMirror(t *testing.T) {
 	}
 }
 
-// TestTheCanonicalSurfaceCarriesNoInventedPaths states the compatibility rule as a test.
-// Anything this service invented belongs under the prefix; a path of ours appearing on
-// /v1 or /v2 is a path the canonical service could later claim with other semantics.
+// A path of ours on /v1 or /v2 is one the canonical service could later claim with other semantics.
 func TestTheCanonicalSurfaceCarriesNoInventedPaths(t *testing.T) {
 	server := New(stubStore{}, Config{})
 
-	// The canonical service's own surface, from its controllers: keys, modules,
-	// operators, status, and the one endpoint it moved to /v2.
 	canonicalPaths := map[string]bool{
 		"/v1/keys": true, "/v1/keys/{pubkey}": true, "/v1/keys/find": true,
 		"/v1/modules": true, "/v1/modules/keys": true, "/v1/modules/{module_id}": true,
@@ -167,11 +147,7 @@ func TestDocsAndSpecAreServed(t *testing.T) {
 	}
 }
 
-// specPathsWithMethods extracts "path method" pairs from the embedded document.
-//
-// Parsed with a regexp rather than a YAML library, deliberately: pulling in a YAML
-// dependency to check a list of strings in a test would be the tail wagging the dog.
-// The shape being matched is fixed by this file's own formatting.
+// Regexp, not a YAML library: the matched shape is fixed by openapi.yaml's own formatting.
 func specPathsWithMethods(t *testing.T) map[string]bool {
 	t.Helper()
 
@@ -209,7 +185,6 @@ func specPathsWithMethods(t *testing.T) map[string]bool {
 	return out
 }
 
-// stubStore is enough to build the router. No handler runs in these tests.
 type stubStore struct{}
 
 func (stubStore) Snapshot(context.Context, func(store.Snapshot) error) error { return nil }
@@ -217,7 +192,6 @@ func (stubStore) Close()                                                     {}
 
 var _ store.Store = stubStore{}
 
-// Keep the model import meaningful: this asserts the wire type the spec describes
-// still has the fields it claims, so renaming one of them breaks here too.
+// Renaming a field of the wire type the spec describes breaks here too.
 var _ = model.Key{Key: "", DepositSignature: "", OperatorIndex: 0, Used: false,
 	ModuleAddress: "", Index: 0, Vetted: false}

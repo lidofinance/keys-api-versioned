@@ -7,8 +7,7 @@ import (
 	"github.com/ethereum/go-ethereum/common"
 )
 
-// The curated registry returns the name inside getNodeOperator. A name the canonical
-// service cannot decode becomes `invalidName<index>` there, and has to here too.
+// A name the canonical service cannot decode becomes `invalidName<index>`; here too.
 func TestCuratedUndecodableNamesGetThePlaceholder(t *testing.T) {
 	for _, tc := range []struct {
 		name string

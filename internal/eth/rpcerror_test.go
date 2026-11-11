@@ -17,7 +17,6 @@ func TestEndpointFailureClassification(t *testing.T) {
 		message  string
 		endpoint bool
 	}{
-		// The one that cost a day of downtime, verbatim from the log.
 		{"drpc daily limit", 8, "Your key daily limit exceeded", true},
 		{"infura limit", -32005, "daily request count exceeded", true},
 		{"alchemy rate limit", 429, "Your app has exceeded its compute units per second capacity", true},
@@ -27,15 +26,12 @@ func TestEndpointFailureClassification(t *testing.T) {
 		{"archive state", -32000, "missing trie node", true},
 		{"range too wide", -32005, "query returned more than 10000 results", true},
 
-		// Call-level. Every endpoint answers the same, and the first of these is load
-		// bearing: the Multicall3 bisect is driven by seeing it.
+		// Load bearing: the Multicall3 bisect is driven by "out of gas".
 		{"out of gas", -32000, "out of gas", false},
 		{"reverted", 3, "execution reverted: NOT_ENOUGH_KEYS", false},
 		{"gas required", -32000, "gas required exceeds allowance 50000000", false},
 		{"intrinsic gas", -32000, "intrinsic gas too low", false},
 
-		// Unknown wording stays call-level: retrying it on every endpoint spends
-		// requests and changes nothing.
 		{"unknown", -32000, "something nobody has seen before", false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -46,9 +42,7 @@ func TestEndpointFailureClassification(t *testing.T) {
 	}
 }
 
-// A quota error arrives inside a 200 OK, which is why the fallback never used to
-// engage: the loop only advanced on transport failures. With a healthy endpoint behind
-// the exhausted one, a cycle should not notice.
+// A quota error arrives inside a 200 OK.
 func TestAnExhaustedEndpointFallsThroughToTheNextOne(t *testing.T) {
 	var exhaustedHits, healthyHits atomic.Int64
 
@@ -60,7 +54,6 @@ func TestAnExhaustedEndpointFallsThroughToTheNextOne(t *testing.T) {
 		for _, req := range reqs {
 			out = append(out, rpcError(req.ID, "Your key daily limit exceeded"))
 		}
-		// 200 OK, exactly as dRPC answers.
 		_ = json.NewEncoder(w).Encode(out)
 	}))
 	defer exhausted.Close()
@@ -90,9 +83,6 @@ func TestAnExhaustedEndpointFallsThroughToTheNextOne(t *testing.T) {
 	}
 }
 
-// The other half of the rule: a call-level answer must not be multiplied across the
-// endpoint list. The aggregate bisect depends on `out of gas` coming straight back, and
-// spending a request on every provider to be told the same thing is pure waste.
 func TestACallLevelErrorIsNotRetriedElsewhere(t *testing.T) {
 	var first, second atomic.Int64
 
@@ -130,9 +120,6 @@ func TestACallLevelErrorIsNotRetriedElsewhere(t *testing.T) {
 	}
 }
 
-// Every endpoint out of quota is the case that has to fail loudly and name what
-// happened, because "all endpoints failed" on its own sends someone to look at the
-// network.
 func TestEveryEndpointExhaustedFailsWithTheReason(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var reqs []rpcRequest
@@ -158,9 +145,6 @@ func TestEveryEndpointExhaustedFailsWithTheReason(t *testing.T) {
 	}
 }
 
-// A gateway that rate-limits with a non-2xx status and a body that still parses used to
-// be read as a valid empty answer, which is worse than an error: the caller decodes
-// nothing and believes it.
 func TestANon2xxStatusFallsThrough(t *testing.T) {
 	var healthyHits atomic.Int64
 

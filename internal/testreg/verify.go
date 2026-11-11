@@ -10,18 +10,8 @@ import (
 	"github.com/lidofinance/keys-api-versioned/internal/model"
 )
 
-// Verifier checks a response against the registry, streaming.
-//
-// Two things are checked per key and one at the end. Per key: the pubkey decodes to an
-// identity, its hash tail matches, its module agrees with the moduleAddress it was
-// served under, its salt is the one expected for that module, and its used/vetted
-// flags are the ones the spec implies. At the end: every expected key appeared exactly
-// once.
-//
-// Membership is a bitset per module rather than a checksum, because the two failures
-// worth telling apart — a gap and a duplicate — are indistinguishable in a sum. A
-// bitset for 500 000 keys is 62 KiB, and one key at a time is decoded from the body,
-// so verifying a 220 MiB dump costs a few MiB.
+// Verifier tracks membership as a bitset per module, not a checksum: a sum cannot tell a gap from
+// a duplicate. 500 000 keys cost 62 KiB, so verifying a 220 MiB dump takes a few MiB.
 type Verifier struct {
 	spec     Spec
 	salt     map[int]uint64
@@ -32,7 +22,6 @@ type Verifier struct {
 	problems []string
 }
 
-// NewVerifier expects every module of the spec at the spec's own salt.
 func NewVerifier(s Spec) *Verifier {
 	v := &Verifier{
 		spec:    s,
@@ -48,28 +37,23 @@ func NewVerifier(s Spec) *Verifier {
 	return v
 }
 
-// Expect overrides the salt a module's keys must carry. This is what a torn-read test
-// asserts on: one module at the old salt and another at the new one in the same
-// response is a dump stitched from two versions.
+// Expect: one module at the old salt and another at the new is a dump stitched from two versions.
 func (v *Verifier) Expect(moduleID int, salt uint64) *Verifier {
 	v.salt[moduleID] = salt
 	return v
 }
 
-// Only narrows the response to the named modules, for a module-scoped endpoint.
 func (v *Verifier) Only(moduleIDs ...int) *Verifier {
 	v.modules = moduleIDs
 	return v
 }
 
-// Partial stops Done from requiring completeness, for a filtered response where not
-// every key is expected. Per-key checks still apply.
+// Partial drops the completeness check; per-key checks still apply.
 func (v *Verifier) Partial() *Verifier {
 	v.partial = true
 	return v
 }
 
-// Key checks one key and records that it was seen.
 func (v *Verifier) Key(k *model.Key) error {
 	id, ok := Decode(k.PubkeyBin)
 	if !ok {
@@ -108,7 +92,6 @@ func (v *Verifier) Key(k *model.Key) error {
 	return v.mark(id)
 }
 
-// mark records membership and catches a key served twice.
 func (v *Verifier) mark(id Identity) error {
 	bits, tracked := v.seen[id.Module]
 	if !tracked {
@@ -127,7 +110,6 @@ func (v *Verifier) mark(id Identity) error {
 	return nil
 }
 
-// Done reports what the response was missing, or nothing.
 func (v *Verifier) Done() error {
 	if len(v.problems) > 0 {
 		return errors.New(v.summary())
@@ -149,7 +131,6 @@ func (v *Verifier) Done() error {
 	return nil
 }
 
-// Keys is how many keys passed, for a test that wants to assert the count itself.
 func (v *Verifier) Keys() int {
 	total := 0
 	for _, n := range v.count {
@@ -158,8 +139,6 @@ func (v *Verifier) Keys() int {
 	return total
 }
 
-// firstMissing names the gaps, because "1 key short of 60 000" is not actionable and
-// "operator 3 index 17 is missing" is.
 func (v *Verifier) firstMissing(moduleID, limit int) []Identity {
 	var out []Identity
 	bits := v.seen[moduleID]
@@ -176,9 +155,7 @@ func (v *Verifier) firstMissing(moduleID, limit int) []Identity {
 	return out
 }
 
-// fail records a problem and returns it. Recording rather than only returning means a
-// streaming caller that stops at the first error still gets the full list from Done,
-// and a caller that keeps going does not lose the earlier ones.
+// fail records as well as returns, so Done lists every problem even if the caller stopped early.
 func (v *Verifier) fail(format string, args ...any) error {
 	msg := fmt.Sprintf(format, args...)
 	if len(v.problems) < 20 {
@@ -197,8 +174,6 @@ func (v *Verifier) summary() string {
 	return out
 }
 
-// jsonKey is the served key, whose hex fields have to come back as bytes for the
-// identity check.
 type jsonKey struct {
 	Key              string `json:"key"`
 	DepositSignature string `json:"depositSignature"`
@@ -225,14 +200,12 @@ func (j jsonKey) key() (*model.Key, error) {
 	}, nil
 }
 
-// Response is what a verified response carried besides its keys.
 type Response struct {
 	Meta       *model.ELBlockSnapshot
 	Pagination *Pagination
 	Modules    []model.StakingModule
 }
 
-// Pagination is the paging block a paged response adds after its data.
 type Pagination struct {
 	Limit    int    `json:"limit"`
 	Returned int    `json:"returned"`
@@ -240,12 +213,7 @@ type Pagination struct {
 	Cursor   string `json:"cursor"`
 }
 
-// V1Keys verifies a flat keys response: `{"meta": …, "data": [ … ]}`. It streams, so
-// the body is never held whole, and it returns what the envelope carried.
-//
-// A truncated body — which is how an aborted stream arrives — surfaces here as an
-// error from the decoder, and that is the signal a test asserts on: a response that
-// parses cleanly to the end is a complete answer, whatever else was going on.
+// V1Keys streams the body; a truncated (aborted) stream surfaces as a decoder error.
 func (v *Verifier) V1Keys(r io.Reader) (Response, error) {
 	return v.walk(r, func(dec *json.Decoder, field string, out *Response) error {
 		switch field {
@@ -273,10 +241,7 @@ func (v *Verifier) V1Keys(r io.Reader) (Response, error) {
 	})
 }
 
-// GroupedKeys verifies `/v1/modules/keys`: data is an array of `{keys: […], module: …}`.
-// The grouped shape is worth its own path because it is the endpoint that used to
-// build the whole response in memory, and because a stitch shows up between two
-// groups rather than inside one array.
+// GroupedKeys: a stitch shows up between two groups rather than inside one array.
 func (v *Verifier) GroupedKeys(r io.Reader) (Response, error) {
 	return v.walk(r, func(dec *json.Decoder, field string, out *Response) error {
 		switch field {
@@ -297,7 +262,6 @@ func (v *Verifier) GroupedKeys(r io.Reader) (Response, error) {
 	})
 }
 
-// walk reads a JSON object field by field, handing each to fn.
 func (v *Verifier) walk(r io.Reader, fn func(*json.Decoder, string, *Response) error) (Response, error) {
 	var out Response
 	dec := json.NewDecoder(r)
@@ -379,7 +343,6 @@ func (v *Verifier) groupArray(dec *json.Decoder, out *Response) error {
 	return err
 }
 
-// skip consumes one value, whatever it is.
 func skip(dec *json.Decoder) error {
 	var discard json.RawMessage
 	return dec.Decode(&discard)

@@ -1,8 +1,5 @@
-// Package ethaddr implements EIP-55 address checksumming.
-//
-// The canonical service calls ethers.utils.getAddress() once per key while
-// serializing the keys stream, which means a keccak256 hash per key. Module
-// addresses repeat across millions of keys, so this package memoizes them.
+// Package ethaddr implements EIP-55 checksumming, memoized per address: module addresses repeat
+// across millions of keys.
 package ethaddr
 
 import (
@@ -14,8 +11,6 @@ import (
 
 var cache sync.Map // lowercase address -> checksummed address
 
-// Checksum returns the EIP-55 representation of a hex address.
-// Results are memoized, so the hash is computed once per distinct address.
 func Checksum(address string) string {
 	if v, ok := cache.Load(address); ok {
 		return v.(string)

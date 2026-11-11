@@ -1,9 +1,5 @@
-// Package model holds the wire types served by the API.
-//
-// Field order in every struct matches the JSON property order produced by the
-// canonical lido-keys-api DTOs (property assignment order in their
-// constructors, since it is compiled with target es2017). Keeping the order
-// identical lets the diff runner compare raw bytes, not only parsed values.
+// Package model holds the API wire types. Struct field order matches the canonical DTOs' JSON
+// property order, so the diff runner can compare raw bytes.
 package model
 
 import (
@@ -12,11 +8,7 @@ import (
 	"strings"
 )
 
-// Key is a single signing key as served by /v1/keys and /v1/modules/{id}/keys.
-//
-// A binary store fills PubkeyBin/SignatureBin instead of the string fields, and
-// the renderer hex-encodes straight into the response buffer. Only one of the
-// two forms is populated; the JSON output is identical either way.
+// Key carries either the hex strings or PubkeyBin/SignatureBin (binary store), never both.
 type Key struct {
 	Key              string `json:"key"`
 	DepositSignature string `json:"depositSignature"`
@@ -30,13 +22,7 @@ type Key struct {
 	SignatureBin []byte `json:"-"`
 }
 
-// EnsureHex fills the string fields from the binary ones.
-//
-// It exists because two response paths coexist: the streaming encoder writes hex
-// straight from the bytes and never needs the strings, while the few endpoints that
-// marshal with encoding/json do. A key that came from the binary store and goes
-// through the second path without this returns `"key": ""` — which is exactly what
-// /v1/modules/keys did until a parity run against the canonical service caught it.
+// EnsureHex is needed on encoding/json paths: a binary-store key otherwise marshals "key": "".
 func (k *Key) EnsureHex() {
 	if k.Key == "" && k.PubkeyBin != nil {
 		k.Key = EncodeHex(k.PubkeyBin)
@@ -46,7 +32,6 @@ func (k *Key) EnsureHex() {
 	}
 }
 
-// EncodeHex renders bytes the way the API does: lowercase hex with a 0x prefix.
 func EncodeHex(b []byte) string {
 	if b == nil {
 		return ""
@@ -54,18 +39,11 @@ func EncodeHex(b []byte) string {
 	return "0x" + hex.EncodeToString(b)
 }
 
-// DecodeHex parses a 0x-prefixed hex string into bytes.
 func DecodeHex(s string) ([]byte, error) {
 	return hex.DecodeString(strings.TrimPrefix(strings.ToLower(s), "0x"))
 }
 
-// Operator is a node operator as served by /v1/operators and the module
-// operator endpoints.
-//
-// Field order follows the canonical Operator DTO constructor, so responses are
-// comparable byte for byte. FinalizedUsedSigningKeys is here for completeness and
-// is neither read nor served: the canonical DTO omits it, and reading it costs a
-// second round of per-operator calls at the finalized block tag.
+// Operator: FinalizedUsedSigningKeys is never read or served (the canonical DTO omits it).
 type Operator struct {
 	Name                       string `json:"name"`
 	RewardAddress              string `json:"rewardAddress"`
@@ -83,29 +61,17 @@ type Operator struct {
 
 	FinalizedUsedSigningKeys int32 `json:"-"`
 
-	// Group is the node operator group this operator belongs to, read from the
-	// module's MetaRegistry. Nil means the module has no group registry at all,
-	// which is the case for every module except curated-onchain-v2.
-	//
-	// Untagged for the same reason FinalizedUsedSigningKeys is: the canonical
-	// Operator DTO has no such field, and /v1 and /v2 have to stay byte-identical
-	// to it. The extended surface renders it — see api.extOperator.
+	// Group is nil when the module has no group registry (all but curated-onchain-v2). Untagged: /v1
+	// and /v2 stay byte-identical to the canonical DTO; the extended surface renders it.
 	Group *GroupID `json:"-"`
 }
 
-// NoGroupID is the MetaRegistry's sentinel for "this operator is in no group".
-// It is a real value on chain and it is literally zero, so it cannot also be a
-// group id — see MetaRegistry.NO_GROUP_ID in the community-staking-module repo.
+// NoGroupID is the on-chain MetaRegistry sentinel for "no group": literally zero.
 const NoGroupID GroupID = 0
 
-// GroupID is a node operator group id as the extended surface renders it: the
-// number, or null for an operator that belongs to no group.
-//
-// Null rather than 0 because 0 names no group and serving it would invite a
-// consumer to group every ungrouped operator together under it.
+// GroupID renders as null for no group: serving 0 would invite grouping all ungrouped operators.
 type GroupID int32
 
-// MarshalJSON renders the sentinel as null and everything else as the number.
 func (g GroupID) MarshalJSON() ([]byte, error) {
 	if g == NoGroupID {
 		return []byte("null"), nil
@@ -113,7 +79,6 @@ func (g GroupID) MarshalJSON() ([]byte, error) {
 	return strconv.AppendInt(nil, int64(g), 10), nil
 }
 
-// ELBlockSnapshot describes the execution layer block the data is consistent with.
 type ELBlockSnapshot struct {
 	BlockNumber          int64  `json:"blockNumber"`
 	BlockHash            string `json:"blockHash"`
@@ -121,7 +86,6 @@ type ELBlockSnapshot struct {
 	LastChangedBlockHash string `json:"lastChangedBlockHash"`
 }
 
-// StakingModule is a staking router module as served by /v1/modules.
 type StakingModule struct {
 	Nonce                     int32  `json:"nonce"`
 	Type                      string `json:"type"`
@@ -139,18 +103,14 @@ type StakingModule struct {
 	WithdrawalCredentialsType int32  `json:"withdrawalCredentialsType"`
 	LastChangedBlockHash      string `json:"lastChangedBlockHash"`
 
-	// rawAddress keeps the lowercase address from the database; the JSON field
-	// above carries the EIP-55 checksummed form.
+	// rawAddress is the lowercase DB form; StakingModuleAddress is EIP-55 checksummed.
 	rawAddress string `json:"-"`
 }
 
-// SetRawAddress stores the lowercase module address used for database lookups.
 func (m *StakingModule) SetRawAddress(a string) { m.rawAddress = a }
 
-// RawAddress returns the lowercase module address used for database lookups.
 func (m *StakingModule) RawAddress() string { return m.rawAddress }
 
-// Status is the /v1/status payload.
 type Status struct {
 	AppVersion      string           `json:"appVersion"`
 	ChainID         int64            `json:"chainId"`
@@ -158,8 +118,7 @@ type Status struct {
 	CLBlockSnapshot *CLBlockSnapshot `json:"clBlockSnapshot"`
 }
 
-// CLBlockSnapshot mirrors the consensus layer meta of the canonical service.
-// The PoC does not ingest validators, so it is always null for now.
+// CLBlockSnapshot is always null: validators are not ingested.
 type CLBlockSnapshot struct {
 	EpochNumber   int64  `json:"epoch"`
 	Root          string `json:"root"`
@@ -170,14 +129,12 @@ type CLBlockSnapshot struct {
 	SlotStateRoot string `json:"slotStateRoot"`
 }
 
-// KeysFilter carries the query filters supported by the keys endpoints.
 type KeysFilter struct {
 	Used          *bool
 	OperatorIndex *int32
 	ModuleAddress []string // lowercase addresses; empty means every module
 }
 
-// OperatorsFilter carries the query filters supported by the operator endpoints.
 type OperatorsFilter struct {
 	Index *int32
 }

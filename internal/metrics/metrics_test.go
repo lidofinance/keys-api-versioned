@@ -8,10 +8,7 @@ import (
 	"time"
 )
 
-// The canonical series exist so that dashboards written against the canonical
-// service work here unchanged, which makes their exact names part of the contract: a
-// typo does not fail anything, it silently produces an empty panel. This asserts the
-// names as a scrape sees them.
+// A typo in a canonical name fails nothing; it silently yields an empty panel.
 func TestScrapeCarriesTheCanonicalNames(t *testing.T) {
 	m := New("keys_api")
 	m.SetBuildInfo("keys-api-versioned", "0.1.0", "dev", "1")
@@ -38,7 +35,6 @@ func TestScrapeCarriesTheCanonicalNames(t *testing.T) {
 		`lido_keys_api_nonce_value{srModuleId="1"} 42`,
 		`lido_keys_api_keys_by_sr_module_and_operator{operator="7",srModuleId="1",used="true"} 100`,
 		`lido_keys_api_keys_by_sr_module_and_operator{operator="7",srModuleId="1",used="false"} 5`,
-		// Ours: the request counter is the one to watch on a metered endpoint.
 		`keys_api_rpc_requests_total{method="eth_getLogs",result="success"} 1`,
 		`keys_api_rpc_calls_total 1`,
 		`keys_api_rpc_endpoint_requests_total{endpoint="lb.drpc.org",result="success"} 1`,
@@ -52,9 +48,6 @@ func TestScrapeCarriesTheCanonicalNames(t *testing.T) {
 	}
 }
 
-// The two HTTP histograms are not the same series under two names: one is labelled by
-// route so a dump is separable from a status read, the other by method and status
-// because that is what the canonical dashboards group by.
 func TestBothHTTPSurfacesAreRecorded(t *testing.T) {
 	m := New("keys_api")
 	m.ObserveRequest("GET", "/v1/keys", 200, 1, time.Millisecond)

@@ -9,13 +9,7 @@ import (
 	"github.com/lidofinance/keys-api-versioned/internal/ingest"
 )
 
-// TestTheLoopPublishesAVersionFromTheChain is the harness proving itself, and it is
-// the first time in this repo that the sync loop runs against Postgres at all: the
-// scripted double in internal/ingest drives it against a fake store, and internal/e2e
-// drives the writer directly with no loop and no chain.
-//
-// Everything else in this package builds on these pieces working together, so when
-// they do not, this is the test that should fail rather than something subtler.
+// The first test that runs the sync loop against Postgres; if the harness is broken, this fails.
 func TestTheLoopPublishesAVersionFromTheChain(t *testing.T) {
 	h := NewHarness(t, HarnessOpts{})
 	h.requireSandboxPreconditions()
@@ -33,8 +27,6 @@ func TestTheLoopPublishesAVersionFromTheChain(t *testing.T) {
 		t.Errorf("published %d keys, want %d", len(keys), SandboxKeys)
 	}
 
-	// The keys are the chain's, not a fixture's: every one of them has to be a key
-	// the contract itself reports, at the same operator and index.
 	onChain := map[string]bool{}
 	for op := int64(0); op < SandboxOperators; op++ {
 		for _, key := range h.Sandbox.SigningKeys(op, 0, int64(h.Sandbox.Operator(op).TotalSigningKeys)) {
@@ -47,9 +39,8 @@ func TestTheLoopPublishesAVersionFromTheChain(t *testing.T) {
 		}
 	}
 
-	// A second cycle with nothing moving must be an extend, not a rebuild. If it is a
-	// rebuild, the cheap signals are not being trusted and every other timing
-	// assertion in this package is measuring the wrong thing.
+	// A quiet cycle that rebuilds means the cheap signals are not trusted, and every other timing
+	// assertion here measures the wrong thing.
 	h.Anvil.Mine(1)
 	quiet := h.Cycle()
 	if quiet.Action != ingest.ActionExtend {
@@ -60,9 +51,6 @@ func TestTheLoopPublishesAVersionFromTheChain(t *testing.T) {
 	}
 }
 
-// TestTheServedSurfaceAnswersFromAForkedVersion checks the one thing the store-level
-// helpers in this package skip: that what the loop published is reachable over HTTP.
-// The response bytes themselves are internal/e2e's subject, not this package's.
 func TestTheServedSurfaceAnswersFromAForkedVersion(t *testing.T) {
 	h := NewHarness(t, HarnessOpts{})
 	h.Cycle()
@@ -76,13 +64,8 @@ func TestTheServedSurfaceAnswersFromAForkedVersion(t *testing.T) {
 	}
 }
 
-// requireSandboxPreconditions fails loudly if the pinned block no longer holds what
-// the scenarios were written against.
-//
-// Without this, upstream drift or a re-pin turns a scenario into a test that still
-// passes while asserting something else — the failure mode the repo has already paid
-// for once, when a per-module run could not reproduce a regression the previous module
-// created.
+// requireSandboxPreconditions catches upstream drift or a re-pin that would leave scenarios
+// passing while asserting something else.
 func (h *Harness) requireSandboxPreconditions() {
 	h.tb.Helper()
 

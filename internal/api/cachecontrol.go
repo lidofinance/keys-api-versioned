@@ -2,15 +2,14 @@ package api
 
 import "net/http"
 
-// Cache-Control as the canonical service sends it since 5.0.0: public reads may be
-// held by a CDN for 30 s, probes and metrics never.
+// Cache-Control as canonical sends it since 5.0.0: public reads cacheable for 30 s, probes and
+// metrics never.
 const (
 	publicCacheControl  = "public, max-age=30, stale-if-error=1200, stale-while-revalidate=30"
 	noStoreCacheControl = "no-store"
 )
 
-// withPublicCacheControl stamps a successful GET. Errors go out without it, so a
-// shared cache cannot pin a 4xx or 5xx for max-age.
+// Errors go out without it, so a shared cache cannot pin a 4xx/5xx for max-age.
 func withPublicCacheControl(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
@@ -21,7 +20,6 @@ func withPublicCacheControl(next http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
-// withNoStore stamps every answer of a probe or the metrics scrape.
 func withNoStore(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Cache-Control", noStoreCacheControl)
@@ -29,8 +27,7 @@ func withNoStore(next http.Handler) http.Handler {
 	})
 }
 
-// cacheControlWriter sets the header when the status turns out to be 2xx, which is
-// only known at the first WriteHeader or Write.
+// The status is only known at the first WriteHeader or Write.
 type cacheControlWriter struct {
 	http.ResponseWriter
 	decided bool

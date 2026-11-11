@@ -12,16 +12,10 @@ import (
 	"github.com/lidofinance/keys-api-versioned/internal/testreg"
 )
 
-// Node operator groups, end to end: written by the writer, read back through HTTP.
-//
-// Groups exist for one module family (curated-onchain-v2, whose MetaRegistry holds
-// them) and for no other, so the surface has to say three different things — a
-// group, "in no group", and "groups do not exist here" — and say them only on
-// /ext/v1, because /v1 is the canonical service's contract and it has no such field.
+// Groups exist only for curated-onchain-v2, so /ext/v1 says three things: a group, no group, and
+// groups do not exist here. /v1 has no such field.
 
-// groupedRegistry is two modules: module 1 has groups, module 2 has none. Operator 1
-// of module 1 is in no group, which on chain is the NO_GROUP_ID sentinel — the case
-// that must not come out as a group called 0.
+// Operator 1 of module 1 is in no group: the on-chain NO_GROUP_ID sentinel, which must not read as 0.
 func groupedRegistry() testreg.Spec {
 	spec := testreg.Spec{Modules: 2, OperatorsPerModule: 3, KeysPerOperator: 5}
 	return spec.WithGroups(func(module, operator int) *model.GroupID {
@@ -58,8 +52,7 @@ func TestTheExtendedSurfaceServesNodeOperatorGroups(t *testing.T) {
 		value    string
 	}{
 		{0, true, "7"},
-		// The sentinel, and the whole reason the field is not a plain integer: 0 is
-		// a real on-chain value that names no group.
+		// 0 is a real on-chain value naming no group.
 		{1, true, "null"},
 		{2, true, "4"},
 	} {
@@ -72,9 +65,7 @@ func TestTheExtendedSurfaceServesNodeOperatorGroups(t *testing.T) {
 		}
 	}
 
-	// A module with no group registry does not grow the field at all. `null`
-	// everywhere would read as "these operators were left out of a group", which is
-	// a different and false statement.
+	// No group registry: the field is absent, since null would claim the operators were left out.
 	for i, operator := range operatorsAt(t, srv, "/ext/v1/modules/2/operators") {
 		if _, ok := operator["groupId"]; ok {
 			t.Errorf("operator %d of a module without groups carries groupId", i)
@@ -82,10 +73,6 @@ func TestTheExtendedSurfaceServesNodeOperatorGroups(t *testing.T) {
 	}
 }
 
-// The canonical surface is the canonical service's contract, and it has no group
-// field. A consumer repointed here must not be able to tell — which is also why the
-// positive twin above exists: without it this would pass on a service that never
-// read groups at all.
 func TestTheCanonicalSurfaceNeverServesGroups(t *testing.T) {
 	db := testpg.New(t)
 	ctx := context.Background()
@@ -112,8 +99,7 @@ func TestTheCanonicalSurfaceNeverServesGroups(t *testing.T) {
 	}
 }
 
-// Every place an operator is rendered has to agree, or a consumer picking the
-// combined stream over the operator endpoint silently gets less.
+// A consumer picking the combined stream over the operator endpoint must not get less.
 func TestGroupsReachEveryOperatorRepresentation(t *testing.T) {
 	db := testpg.New(t)
 	ctx := context.Background()
@@ -139,7 +125,6 @@ func TestGroupsReachEveryOperatorRepresentation(t *testing.T) {
 		t.Errorf("the single-operator endpoint reports groupId %q, want 7", got)
 	}
 
-	// /ext/v1/operators groups by module; module 1 comes first.
 	all := srv.Get(t, "/ext/v1/operators")
 	allBody := readBody(t, all)
 	if all.StatusCode != http.StatusOK {
@@ -179,7 +164,7 @@ func TestGroupsReachEveryOperatorRepresentation(t *testing.T) {
 		t.Fatal("/ext/v1/operators returned no operators for module 1")
 	}
 
-	// The two streams, which marshal operators on their own path.
+	// The streams marshal operators on their own path.
 	for _, path := range []string{
 		"/ext/v1/modules/1/operators/keys",
 		"/ext/v1/modules/operators/keys",
@@ -198,11 +183,8 @@ func TestGroupsReachEveryOperatorRepresentation(t *testing.T) {
 	}
 }
 
-// A group edit is one operator row, not a rewrite of the module. The writer diffs
-// operators field by field, and a nullable column added to that comparison is the
-// easy thing to get wrong in both directions: forget it and the change is lost,
-// compare it with `=` instead of `is not distinct from` and every operator of a
-// group-less module churns on every rebuild.
+// The operator diff must compare the nullable group with `is not distinct from`: forget it and the
+// change is lost, use `=` and every operator of a group-less module churns.
 func TestAGroupChangeIsPickedUpAndCostsOneRow(t *testing.T) {
 	db := testpg.New(t)
 	ctx := context.Background()
@@ -216,7 +198,6 @@ func TestAGroupChangeIsPickedUpAndCostsOneRow(t *testing.T) {
 		}
 		id := model.GroupID(7)
 		if operator == 1 {
-			// The operator that was in no group joins one: null → 9.
 			id = model.GroupID(9)
 		}
 		if operator == 2 {
@@ -239,9 +220,7 @@ func TestAGroupChangeIsPickedUpAndCostsOneRow(t *testing.T) {
 		t.Errorf("operator 0 reports groupId %s, want 7 — it did not move", got)
 	}
 
-	// Module 2 has no groups in either version, so nothing about it may have been
-	// rewritten. A null-vs-null comparison done with `=` closes and reopens all of
-	// it, which is invisible in a response and visible here.
+	// A null-vs-null `=` comparison would rewrite all of module 2, invisibly in a response.
 	var rows int
 	err := db.Writer.Pool().QueryRow(ctx, `
 		select count(*) from operator_version where module_id = 2 and from_block > $1`,
@@ -254,8 +233,7 @@ func TestAGroupChangeIsPickedUpAndCostsOneRow(t *testing.T) {
 	}
 }
 
-// operatorsAt reads a module's operators as raw JSON objects, so a field's absence
-// is distinguishable from its zero value.
+// Raw JSON objects, so a field's absence is distinguishable from its zero value.
 func operatorsAt(t *testing.T, srv *testpg.Server, path string) []map[string]json.RawMessage {
 	t.Helper()
 	resp := srv.Get(t, path)

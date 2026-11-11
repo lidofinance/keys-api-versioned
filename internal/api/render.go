@@ -9,8 +9,7 @@ import (
 	"github.com/lidofinance/keys-api-versioned/internal/model"
 )
 
-// writeKey renders one key object without reflection or intermediate
-// allocations. This is the hot loop: it runs once per key on a full dump.
+// writeKey is the hot loop (once per key on a full dump): no reflection, no intermediate allocations.
 func writeKey(w *bufio.Writer, k *model.Key) {
 	w.WriteString(`{"key":"`)
 	writeHexOrString(w, k.PubkeyBin, k.Key)
@@ -29,9 +28,7 @@ func writeKey(w *bufio.Writer, k *model.Key) {
 	w.WriteByte('}')
 }
 
-// writeHexOrString emits the 0x-prefixed hex of b, or s when the store already
-// holds the hex form. The scratch buffer is stack-allocated and sized for the
-// longest field (a 96-byte signature), so encoding costs no allocation.
+// The stack scratch buffer fits the longest field (96-byte signature), so encoding allocates nothing.
 func writeHexOrString(w *bufio.Writer, b []byte, s string) {
 	if b == nil {
 		w.WriteString(s)
@@ -56,8 +53,6 @@ func writeBool(w *bufio.Writer, v bool) {
 	w.WriteString("false")
 }
 
-// marshalCompact serializes small payloads (meta, module) with encoding/json.
-// Struct field order is the JSON property order, so output matches canonical.
 func marshalCompact(v any) []byte {
 	b, err := json.Marshal(v)
 	if err != nil {

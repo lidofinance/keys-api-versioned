@@ -13,31 +13,22 @@ import (
 	"github.com/lidofinance/keys-api-versioned/internal/model"
 )
 
-// pgBuild is one version being filled in Postgres.
-//
-// It holds no transaction between calls. Each module's write is its own short
-// transaction, which is what the `building` status buys: a version can be filled
-// across many transactions, over minutes, and readers see none of it until the
-// status flips. The canonical service, having no such status, has to hold one long
-// transaction per dump instead — which is where its MVCC bloat comes from.
+// pgBuild holds no transaction between calls: each module write is its own short transaction,
+// and the building status hides the version until Publish.
 type pgBuild struct {
 	store *PGStore
 	id    int64
 	at    model.ELBlockSnapshot
 	hash  string
 
-	// anyChanged records whether any module's content moved in this version, which
-	// decides the version-level lastChangedBlockHash.
+	// anyChanged decides the version-level lastChangedBlockHash.
 	anyChanged bool
-	// nonces collects the per-module change counters observed, for the next
-	// cycle's cheap check.
-	nonces map[string]int64
+	nonces     map[string]int64
 }
 
 func (b *pgBuild) Block() int64      { return b.at.BlockNumber }
 func (b *pgBuild) BlockHash() string { return b.hash }
 
-// Keys opens a per-module key write.
 func (b *pgBuild) Keys(ctx context.Context, module model.StakingModule) (ModuleKeys, error) {
 	conn, err := b.store.pool.Acquire(ctx)
 	if err != nil {
@@ -49,8 +40,6 @@ func (b *pgBuild) Keys(ctx context.Context, module model.StakingModule) (ModuleK
 		return nil, fmt.Errorf("begin key write: %w", err)
 	}
 
-	// A temporary table scoped to the transaction: no name collisions between
-	// concurrent module writes, and no cleanup to forget.
 	if _, err := tx.Exec(ctx, `create temp table staged_keys (
 			operator_index int   not null,
 			key_index      int   not null,
@@ -73,9 +62,6 @@ func (b *pgBuild) Keys(ctx context.Context, module model.StakingModule) (ModuleK
 	}, nil
 }
 
-// stagedKey is the minimum a key write needs. The module address is not here: the
-// row carries a two-byte module id instead, and the address lives once in
-// module_version.
 type stagedKey struct {
 	operatorIndex int32
 	keyIndex      int32
@@ -85,7 +71,6 @@ type stagedKey struct {
 	vetted        bool
 }
 
-// pgModuleKeys stages one module's keys and applies them as a diff.
 type pgModuleKeys struct {
 	build    *pgBuild
 	conn     *pgxpool.Conn
@@ -97,11 +82,6 @@ type pgModuleKeys struct {
 	done    bool
 }
 
-// Add stages a key, flushing to the staging table in batches so that memory does
-// not scale with the module's size.
-//
-// A source may hand over either form — bytes straight from a contract call, or hex
-// from a file — and the bytes are what get stored either way.
 func (k *pgModuleKeys) Add(ctx context.Context, key model.Key) error {
 	pubkey, signature := key.PubkeyBin, key.SignatureBin
 	if pubkey == nil {
@@ -153,14 +133,8 @@ func (k *pgModuleKeys) flush(ctx context.Context) error {
 	return nil
 }
 
-// Commit applies the staged set as a diff against the rows currently open.
-//
-// Two statements do the work, and the order matters. The first closes every open
-// row the staged set does not contain identically — gone, or changed. The second
-// opens a row for every staged key that no longer has an identical open row, which
-// after the first statement is exactly the new and the changed ones. Keys that did
-// not move are matched by both and written by neither, which is why a version that
-// changes one operator costs a handful of rows rather than 500 000.
+// Commit closes open rows not staged identically, then opens rows for staged keys left without
+// one. Unchanged keys are written by neither, so one changed operator costs a handful of rows.
 func (k *pgModuleKeys) Commit(ctx context.Context) (KeyDiff, error) {
 	defer k.release()
 	if k.done {
@@ -172,7 +146,6 @@ func (k *pgModuleKeys) Commit(ctx context.Context) (KeyDiff, error) {
 		return KeyDiff{}, err
 	}
 
-	// The comparison below joins on key identity, so the staging table needs it.
 	if _, err := k.tx.Exec(ctx, `create index on staged_keys (operator_index, key_index)`); err != nil {
 		return KeyDiff{}, fmt.Errorf("index staging table: %w", err)
 	}
@@ -239,7 +212,6 @@ func (k *pgModuleKeys) release() {
 	}
 }
 
-// Operators replaces a module's operator set, by the same diff rule as keys.
 func (b *pgBuild) Operators(ctx context.Context, module model.StakingModule, operators []model.Operator) (int, error) {
 	block := b.at.BlockNumber
 
@@ -350,8 +322,6 @@ func (b *pgBuild) Operators(ctx context.Context, module model.StakingModule, ope
 	return changed, nil
 }
 
-// Module writes the module row, moving its lastChangedBlockHash only when
-// something about the module actually moved.
 func (b *pgBuild) Module(ctx context.Context, m model.StakingModule, contentChanged bool) error {
 	address, err := model.DecodeHex(m.RawAddress())
 	if err != nil {
@@ -369,10 +339,8 @@ func (b *pgBuild) Module(ctx context.Context, m model.StakingModule, contentChan
 	}
 	defer tx.Rollback(ctx)
 
-	// The open row for this module, if any, plus whether its fields still match.
-	// last_changed_block_hash is deliberately not part of the comparison: it is
-	// derived from the comparison, and comparing it would make every re-read look
-	// like a change.
+	// last_changed_block_hash is not compared: it derives from the comparison, so every re-read
+	// would look like a change.
 	var (
 		openRowID      int64
 		prevLastChange string
@@ -397,9 +365,7 @@ func (b *pgBuild) Module(ctx context.Context, m model.StakingModule, contentChan
 	}
 
 	if openRowID != 0 && fieldsMatch && !contentChanged {
-		// Nothing moved: leave the previous row open and its stamp alone. This is
-		// the case a re-read after a restart lands in, and it is exactly where the
-		// canonical field lies about having changed.
+		// Nothing moved: keep the previous row and its stamp (the restart re-read case).
 		return tx.Commit(ctx)
 	}
 
@@ -426,12 +392,7 @@ func (b *pgBuild) Module(ctx context.Context, m model.StakingModule, contentChan
 	return tx.Commit(ctx)
 }
 
-// Publish makes the version current.
-//
-// One row update, whatever the version's size. The version-level
-// lastChangedBlockHash moves only when some module's content moved, so a consumer
-// polling it keeps the skip guarantee the canonical contract promises — only here
-// it is true.
+// Publish moves the version-level lastChangedBlockHash only when some module's content moved.
 func (b *pgBuild) Publish(ctx context.Context, label string, finalized int64) error {
 	if label == "" {
 		label = "latest"
@@ -462,16 +423,8 @@ func (b *pgBuild) Publish(ctx context.Context, label string, finalized int64) er
 	}
 	defer tx.Rollback(ctx)
 
-	// The previous head is not retired: it stays published, and it stays readable by
-	// an explicit pin for as long as retention keeps it. Currency is "the newest
-	// published version", not a flag, so succession costs no write to the old row.
-	//
-	// The one thing to undo is staleness. It was a statement about the head — "this
-	// no longer reflects the chain" — and once a newer version exists the older one
-	// is history rather than a stale head, so the distrust no longer applies.
-	// `superseded` stays reserved for what it actually means: taken off the chain by
-	// a reorg. A consumer pinned to one of those needs 409, and a consumer pinned to
-	// ordinary history needs its data.
+	// The previous head stays published and pinnable; only its staleness is cleared. Superseded is
+	// reserved for reorged versions, whose pins need 409.
 	if _, err := tx.Exec(ctx,
 		`update versions set status = 'published' where status = 'stale' and id <> $1`, b.id); err != nil {
 		return fmt.Errorf("clear staleness on the previous head: %w", err)
@@ -487,9 +440,7 @@ func (b *pgBuild) Publish(ctx context.Context, label string, finalized int64) er
 	return tx.Commit(ctx)
 }
 
-// Abort leaves the version where it is: invisible, claimed by nothing, collected
-// by retention. Deleting its rows here would be a second long write on a path that
-// is already failing.
+// Abort leaves rows for retention: deleting them would be a second long write on a failing path.
 func (b *pgBuild) Abort(ctx context.Context) {
 	_, _ = b.store.pool.Exec(ctx,
 		`update versions set status = 'superseded' where id = $1 and status = 'building'`, b.id)

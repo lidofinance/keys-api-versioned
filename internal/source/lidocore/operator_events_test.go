@@ -14,15 +14,10 @@ import (
 	"github.com/lidofinance/keys-api-versioned/internal/model"
 )
 
-// The operator event scan is what a quiet cycle spends most of its requests on, and
-// eth_getLogs is the method a metered provider bills hardest. What matters here is
-// not that the boolean is right — one filter is one filter — but how many requests
-// the answer costs, and that the topics asked of each contract are the ones it can
-// actually emit.
+// What matters is not the boolean but how many eth_getLogs it costs, and that each contract is
+// asked only for topics it can emit.
 
-// logsNode answers eth_getLogs and records the filters it was asked.
 type logsNode struct {
-	// hits addresses that should return a log, lower-cased.
 	hits map[string]bool
 
 	mu            sync.Mutex
@@ -116,8 +111,7 @@ func (n *logsNode) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(out)
 }
 
-// The four mainnet modules are two families: curated and SimpleDVT share the curated
-// reader, CSM and CMv2 the community one.
+// Mainnet's four modules are two reader families: curated + SimpleDVT, CSM + CMv2.
 var eventScanModules = []model.StakingModule{
 	stakingModule(1, "curated-onchain-v1", "0x1111111111111111111111111111111111111111"),
 	stakingModule(2, "curated-onchain-v1", "0x2222222222222222222222222222222222222222"),
@@ -125,10 +119,7 @@ var eventScanModules = []model.StakingModule{
 	stakingModule(4, "curated-onchain-v2", "0x4444444444444444444444444444444444444444"),
 }
 
-// The locator is never read here: the scan needs no router address, which is itself
-// worth pinning — a filter is a filter, and resolving contracts for it would be a
-// request the answer does not need. The one exception is CMv2's MetaRegistry, read
-// once per process when no operator read has resolved it yet.
+// The scan never reads the locator; only CMv2's MetaRegistry is resolved, once per process.
 const locatorForEventScan = "0x00000000000000000000000000000000000010c8"
 
 func stakingModule(id int32, moduleType, address string) model.StakingModule {
@@ -173,7 +164,6 @@ func TestOperatorScanCostsOneRequestPerModuleFamily(t *testing.T) {
 		t.Fatalf("curated filter %+v, want three topics over both curated modules", *curated)
 	}
 
-	// CSM, CMv2 and CMv2's MetaRegistry, which is where CMv2 names change.
 	wantAddresses := []string{
 		"0x3333333333333333333333333333333333333333",
 		"0x4444444444444444444444444444444444444444",
@@ -191,7 +181,6 @@ func TestOperatorScanCostsOneRequestPerModuleFamily(t *testing.T) {
 		t.Fatalf("community filter topics %v, want %v", community.topics, wantTopics)
 	}
 
-	// Resolved once, then remembered.
 	if _, err := provider.OperatorsChangedAny(context.Background(), eventScanModules, 201, 300); err != nil {
 		t.Fatalf("second scan: %v", err)
 	}
@@ -203,8 +192,7 @@ func TestOperatorScanCostsOneRequestPerModuleFamily(t *testing.T) {
 	}
 }
 
-// Hashes computed independently with `cast keccak`, so a typo in a signature fails
-// here rather than silently matching nothing on chain.
+// Hashes computed independently with `cast keccak`, so a signature typo fails here.
 func TestOperatorEventTopicsHashToTheCanonicalValues(t *testing.T) {
 	for signature, want := range map[string]string{
 		"VettedSigningKeysCountChanged(uint256,uint256)":    "0x947f955eec7e1f626bee3afd2aa47b5de04ddcdd3fe78dc8838213015ef58dfd",
@@ -226,9 +214,7 @@ func eventTopicHex(t *testing.T, name string) string {
 }
 
 func TestOperatorScanStopsAtTheFirstChange(t *testing.T) {
-	// The curated family is scanned first and reports a change, so the community
-	// filter is never sent: the caller wants one boolean and a rebuild follows either
-	// way.
+	// The curated family reports a change first, so the community filter is never sent.
 	node := &logsNode{hits: map[string]bool{"0x2222222222222222222222222222222222222222": true}}
 	server := httptest.NewServer(node)
 	defer server.Close()
@@ -256,9 +242,7 @@ func TestOperatorScanSkipsUnreadableModules(t *testing.T) {
 	client := eth.NewClient(server.URL, eth.Options{Concurrency: 2, BatchSize: 8})
 	provider := NewProvider(client, locatorForEventScan, Options{})
 
-	// A module type this provider has no reader for holds no keys in any version, so
-	// it has no operator metadata here to go stale — and it must not turn the scan
-	// into an error, which is what the per-module path avoided by never asking.
+	// A module with no reader holds no keys in any version; it must not turn the scan into an error.
 	modules := []model.StakingModule{
 		stakingModule(9, "some-future-module-type", "0x9999999999999999999999999999999999999999"),
 	}
