@@ -286,5 +286,14 @@ func (m *Metrics) Handler() http.Handler {
 func (m *Metrics) ObserveRequest(method, route string, status int, bytes int64, d time.Duration) {
 	m.RequestDuration.WithLabelValues(route, strconv.Itoa(status)).Observe(d.Seconds())
 	m.ResponseBytes.WithLabelValues(route).Add(float64(bytes))
-	m.CanonicalHTTP.WithLabelValues(strconv.Itoa(status), method).Observe(d.Seconds())
+	m.CanonicalHTTP.WithLabelValues(strconv.Itoa(status), methodLabel(method)).Observe(d.Seconds())
+}
+
+// methodLabel bounds the label: the method is client input, and each invented one was a new series.
+func methodLabel(method string) string {
+	switch method {
+	case "GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS":
+		return method
+	}
+	return "other"
 }

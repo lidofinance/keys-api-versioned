@@ -87,7 +87,7 @@ func (s *Server) handleModuleOperatorsKeys(w http.ResponseWriter, r *http.Reques
 		return nil
 	})
 	if err != nil && !writeStoreError(w, err) {
-		writeError(w, http.StatusInternalServerError, err.Error())
+		s.internalError(w, r, err)
 	}
 }
 
@@ -169,6 +169,6 @@ func (s *Server) handleModulesOperatorsKeysStream(w http.ResponseWriter, r *http
 		return nil
 	})
 	if err != nil && !writeStoreError(w, err) {
-		writeError(w, http.StatusInternalServerError, err.Error())
+		s.internalError(w, r, err)
 	}
 }

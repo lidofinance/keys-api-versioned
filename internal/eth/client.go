@@ -410,11 +410,12 @@ func schemeHostOf(raw string) string {
 
 func hostOf(url string) string {
 	trimmed := strings.TrimPrefix(strings.TrimPrefix(url, "http://"), "https://")
+	// Query and fragment end the host too: a key passed as ?key= with no path stayed in.
+	if end := strings.IndexAny(trimmed, "/?#"); end >= 0 {
+		trimmed = trimmed[:end]
+	}
 	if at := strings.LastIndex(trimmed, "@"); at >= 0 {
 		trimmed = trimmed[at+1:]
-	}
-	if slash := strings.IndexByte(trimmed, '/'); slash >= 0 {
-		trimmed = trimmed[:slash]
 	}
 	return trimmed
 }

@@ -120,7 +120,7 @@ func (s *Server) handleKeys(w http.ResponseWriter, r *http.Request) {
 		return nil
 	})
 	if err != nil && !writeStoreError(w, err) {
-		writeError(w, http.StatusInternalServerError, err.Error())
+		s.internalError(w, r, err)
 	}
 }
 
@@ -183,7 +183,7 @@ func (s *Server) handleModuleKeys(w http.ResponseWriter, r *http.Request) {
 		return nil
 	})
 	if err != nil && !writeStoreError(w, err) {
-		writeError(w, http.StatusInternalServerError, err.Error())
+		s.internalError(w, r, err)
 	}
 }
 
@@ -247,7 +247,7 @@ func (s *Server) handleGroupedKeys(w http.ResponseWriter, r *http.Request) {
 		return nil
 	})
 	if err != nil && !writeStoreError(w, err) {
-		writeError(w, http.StatusInternalServerError, err.Error())
+		s.internalError(w, r, err)
 	}
 }
 
@@ -356,7 +356,7 @@ func (s *Server) findKeys(w http.ResponseWriter, r *http.Request, pubkeys []stri
 		return writeJSON(w, response{Data: collected, Meta: meta{ELBlockSnapshot: elMeta}})
 	})
 	if err != nil && !writeStoreError(w, err) {
-		writeError(w, http.StatusInternalServerError, err.Error())
+		s.internalError(w, r, err)
 	}
 }
 
@@ -417,6 +417,6 @@ func (s *Server) handleModuleKeysFind(w http.ResponseWriter, r *http.Request) {
 		})
 	})
 	if err != nil && !writeStoreError(w, err) {
-		writeError(w, http.StatusInternalServerError, err.Error())
+		s.internalError(w, r, err)
 	}
 }

@@ -62,6 +62,21 @@ func TestBothHTTPSurfacesAreRecorded(t *testing.T) {
 	}
 }
 
+func TestInventedMethodsShareOneSeries(t *testing.T) {
+	m := New("keys_api")
+	for _, method := range []string{"FOO", "BAR", "get"} {
+		m.ObserveRequest(method, "unmatched", 405, 0, time.Millisecond)
+	}
+
+	body := scrape(t, m)
+	if !strings.Contains(body, `http_requests_duration_seconds_count{method="other",statusCode="405"} 3`) {
+		t.Errorf("invented methods should collapse into one series:\n%s", body)
+	}
+	if strings.Contains(body, `method="FOO"`) {
+		t.Error("a client-chosen method reached a label")
+	}
+}
+
 func scrape(t *testing.T, m *Metrics) string {
 	t.Helper()
 	rec := httptest.NewRecorder()

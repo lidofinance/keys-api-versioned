@@ -20,6 +20,7 @@ import (
 	"github.com/lidofinance/keys-api-versioned/internal/api"
 	"github.com/lidofinance/keys-api-versioned/internal/eth"
 	"github.com/lidofinance/keys-api-versioned/internal/ingest"
+	"github.com/lidofinance/keys-api-versioned/internal/logmask"
 	"github.com/lidofinance/keys-api-versioned/internal/metrics"
 	"github.com/lidofinance/keys-api-versioned/internal/secrets"
 	"github.com/lidofinance/keys-api-versioned/internal/source"
@@ -34,15 +35,16 @@ const appVersion = "0.1.0-poc"
 const metricsNamespace = "keys_api"
 
 func main() {
-	log := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: logLevel()}))
+	masker := &logmask.Masker{}
+	log := slog.New(logmask.NewHandler(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: logLevel()}), masker))
 
-	if err := run(log); err != nil && !errors.Is(err, context.Canceled) {
+	if err := run(log, masker); err != nil && !errors.Is(err, context.Canceled) {
 		log.Error("exiting", "err", err)
 		os.Exit(1)
 	}
 }
 
-func run(log *slog.Logger) error {
+func run(log *slog.Logger, masker *logmask.Masker) error {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
@@ -50,6 +52,7 @@ func run(log *slog.Logger) error {
 	// A broken file is logged and ignored: the environment still holds a working configuration.
 	secretsPath := envOr("SECRETS_FILE_PATH", secrets.DefaultPath)
 	appliedSecrets, err := secrets.LoadIntoEnv(secretsPath)
+	addSecrets(masker, appliedSecrets)
 	if err != nil {
 		log.Error("secrets file unusable, reading configuration from the environment", "path", secretsPath, "err", err)
 	}
@@ -202,6 +205,7 @@ func run(log *slog.Logger) error {
 		interval := time.Duration(envInt("SECRETS_POLL_INTERVAL_IN_SECONDS", int(secrets.DefaultPollInterval/time.Second))) * time.Second
 		watcher := secrets.NewWatcher(secretsPath, interval,
 			func(values map[string]string) error {
+				addSecrets(masker, values)
 				return applyRotatedSecrets(values, appliedSecrets, setEndpoints, log, m)
 			},
 			func(err error) {
@@ -229,6 +233,25 @@ func run(log *slog.Logger) error {
 		}
 	}
 	return nil
+}
+
+// addSecrets registers the credentials from the environment and the secrets file with the log masker.
+func addSecrets(masker *logmask.Masker, fileValues map[string]string) {
+	masker.Add(logmask.FromURLs(os.Getenv("PROVIDERS_URLS"))...)
+	masker.Add(logmask.FromDSN(os.Getenv("DATABASE_URL"))...)
+	for key, value := range fileValues {
+		switch key {
+		case "PROVIDERS_URLS":
+			masker.Add(logmask.FromURLs(value)...)
+		case "DATABASE_URL":
+			masker.Add(logmask.FromDSN(value)...)
+		default:
+			// A number in the file is configuration, like a chain id; masking it would blank out logs.
+			if _, err := strconv.ParseInt(value, 10, 64); err != nil {
+				masker.Add(value)
+			}
+		}
+	}
 }
 
 // applyRotatedSecrets: PROVIDERS_URLS applies live (the client copies endpoints per request). Other

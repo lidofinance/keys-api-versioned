@@ -43,7 +43,7 @@ func (s *Server) handleModules(w http.ResponseWriter, r *http.Request) {
 		return writeJSON(w, response{Data: modules, ELBlockSnapshot: elMeta})
 	})
 	if err != nil && !writeStoreError(w, err) {
-		writeError(w, http.StatusInternalServerError, err.Error())
+		s.internalError(w, r, err)
 	}
 }
 
@@ -81,7 +81,7 @@ func (s *Server) handleModule(w http.ResponseWriter, r *http.Request) {
 		return writeJSON(w, response{Data: *module, ELBlockSnapshot: elMeta})
 	})
 	if err != nil && !writeStoreError(w, err) {
-		writeError(w, http.StatusInternalServerError, err.Error())
+		s.internalError(w, r, err)
 	}
 }
 
@@ -103,6 +103,6 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		})
 	})
 	if err != nil && !writeStoreError(w, err) {
-		writeError(w, http.StatusInternalServerError, err.Error())
+		s.internalError(w, r, err)
 	}
 }

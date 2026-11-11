@@ -42,3 +42,17 @@ func TestRedactErrLeavesOtherErrorsAlone(t *testing.T) {
 		t.Fatal("non-URL error was replaced")
 	}
 }
+
+func TestHostOfDropsPathQueryFragmentAndUserinfo(t *testing.T) {
+	for in, want := range map[string]string{
+		"https://node.example.com/v2/key123":          "node.example.com",
+		"https://node.example.com?apikey=key123":      "node.example.com",
+		"https://node.example.com#key123":             "node.example.com",
+		"https://user:pass@node.example.com:8545/rpc": "node.example.com:8545",
+		"http://node.example.com/rpc?k=a@b":           "node.example.com",
+	} {
+		if got := hostOf(in); got != want {
+			t.Errorf("hostOf(%q) = %q, want %q", in, got, want)
+		}
+	}
+}

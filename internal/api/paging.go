@@ -136,6 +136,6 @@ func (s *Server) handleKeysPage(w http.ResponseWriter, r *http.Request, filter m
 		return nil
 	})
 	if err != nil && !writeStoreError(w, err) {
-		writeError(w, http.StatusInternalServerError, err.Error())
+		s.internalError(w, r, err)
 	}
 }

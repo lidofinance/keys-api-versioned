@@ -208,6 +208,13 @@ func writeError(w http.ResponseWriter, status int, message any) {
 	})
 }
 
+// internalError keeps the cause in the log: its text names the database, its user and tables, and
+// the canonical service answers a bare "Internal server error".
+func (s *Server) internalError(w http.ResponseWriter, r *http.Request, err error) {
+	s.cfg.Log.Error("request failed", "method", r.Method, "path", r.URL.Path, "err", err)
+	writeError(w, http.StatusInternalServerError, "Internal server error")
+}
+
 func tooEarly(w http.ResponseWriter) {
 	writeError(w, http.StatusTooEarly, "Too early response")
 }

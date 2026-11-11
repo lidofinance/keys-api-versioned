@@ -100,7 +100,7 @@ func (s *Server) handleOperators(w http.ResponseWriter, r *http.Request) {
 		return writeJSON(w, out)
 	})
 	if err != nil && !writeStoreError(w, err) {
-		writeError(w, http.StatusInternalServerError, err.Error())
+		s.internalError(w, r, err)
 	}
 }
 
@@ -150,7 +150,7 @@ func (s *Server) handleModuleOperators(w http.ResponseWriter, r *http.Request) {
 		})
 	})
 	if err != nil && !writeStoreError(w, err) {
-		writeError(w, http.StatusInternalServerError, err.Error())
+		s.internalError(w, r, err)
 	}
 }
 
@@ -213,7 +213,7 @@ func (s *Server) handleModuleOperator(w http.ResponseWriter, r *http.Request) {
 		})
 	})
 	if err != nil && !writeStoreError(w, err) {
-		writeError(w, http.StatusInternalServerError, err.Error())
+		s.internalError(w, r, err)
 	}
 }
 
