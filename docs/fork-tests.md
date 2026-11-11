@@ -148,16 +148,10 @@ Not yet built, in rough order of value:
 - **A module status change on the router** — `DepositsPaused`, `Stopped`. It moves no
   module nonce, because the counter is in the module and the status is in the router, so
   it is invisible until the gap audit.
-- **`META_REGISTRY` error conflation** (`community.go`, `resolveMetaRegistry`): a
-  transient failure at the first CMv2 read is indistinguishable from "this module has no
-  registry", and the empty result is cached for the life of the process. Groups make the
-  consequence worse than it was: a conflated failure now drops a field rather than only
-  falling back to generated names, and a consumer selecting by group sees the operators
-  vanish from every group rather than see an error.
 - **A node operator group edit is invisible until the audit.** `createOrUpdateOperatorGroup`
   on the MetaRegistry moves no module nonce and emits nothing at the module address, so
-  the operator-event scan cannot see it — the same hole CMv2 names already sit in, and
-  the reason the scan would have to learn a second address per module. A scenario needs
+  the operator-event scan, which watches the registry for `OperatorMetadataSet` only,
+  cannot see it. A scenario needs
   Hoodi's `curated-onchain-v2` rather than Sandbox (so `HarnessOpts.Modules` widened, and
   its 74 operators paid for), `MANAGE_OPERATOR_GROUPS_ROLE` granted the way `registry.go`
   grants Aragon roles, and the control that makes it worth writing: the same edit *is*

@@ -93,6 +93,8 @@ An existing deployment resyncs once when it picks this up: its rows are in `publ
 
 ## Parity
 
+Tracked canonical version: **5.0.0**, plus the unreleased `develop` fixes to operator names and change detection (through `71fc5b3`). Since 4.0.1 that brought `totalWithdrawnKeys` on every operator, the `invalidName<index>` placeholder for undecodable names, CMv2 renames picked up from the `META_REGISTRY` event, and `Cache-Control` on reads.
+
 `cmd/diff` fetches the same endpoint from both services, sorts key arrays (neither implementation promises an order) and compares. `-live` tolerates the two being at different blocks, which they always are when both follow a chain.
 
 Latest run, both services following mainnet in the stand, all eight compared endpoints equal:

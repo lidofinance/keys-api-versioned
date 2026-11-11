@@ -63,7 +63,10 @@ type Operator struct {
 	Active        bool   `json:"active"`
 	StakingLimit  int32  `json:"stakingLimit"`
 	UsedKeys      int32  `json:"usedKeys"`
-	Keys          []Key  `json:"keys"`
+	// TotalWithdrawnKeys is served as is; leave it out for a curated-onchain-v1
+	// module, where the canonical service serves null.
+	TotalWithdrawnKeys *int32 `json:"totalWithdrawnKeys,omitempty"`
+	Keys               []Key  `json:"keys"`
 }
 
 // Key is one signing key. Signature may be empty, in which case it is derived
@@ -215,6 +218,7 @@ func (p *Provider) Operators(_ context.Context, _ source.Ref, m model.StakingMod
 			Active:                     op.Active,
 			ModuleAddress:              src.Address,
 			DepositableValidatorsCount: max(op.StakingLimit-op.UsedKeys, 0),
+			TotalWithdrawnKeys:         op.TotalWithdrawnKeys,
 		})
 	}
 	return out, nil

@@ -316,6 +316,39 @@ func TestOperatorEventsRereadOperatorsAndNotKeys(t *testing.T) {
 	}
 }
 
+// A CMv2 rename is an event at the module's MetaRegistry, not at the module. The scan
+// carries the registry in the community filter, so it costs no extra request and is
+// picked up within a cycle, as in the canonical service.
+func TestACMv2RenameAtTheMetaRegistryRereadsOperators(t *testing.T) {
+	node := newBudgetNode()
+	server := httptest.NewServer(node)
+	defer server.Close()
+
+	syncer, store := budgetSyncer(t, server.URL)
+	if r := syncer.Cycle(context.Background()); r.Err != nil {
+		t.Fatalf("cold start: %v", r.Err)
+	}
+	operatorsBefore := len(store.operatorWrites)
+
+	node.advance()
+	node.emitOperatorEvent(budgetMetaRegistry)
+	node.reset()
+
+	r := syncer.Cycle(context.Background())
+	if r.Err != nil {
+		t.Fatalf("cycle with a MetaRegistry event: %v", r.Err)
+	}
+	if r.Action != ActionRebuild {
+		t.Fatalf("action %q (%s), want rebuild", r.Action, r.Reason)
+	}
+	if got := len(store.operatorWrites) - operatorsBefore; got != len(budgetModules) {
+		t.Errorf("%d modules had their operators re-read, want %d", got, len(budgetModules))
+	}
+	if got := node.count("eth_getLogs"); got != 2 {
+		t.Errorf("eth_getLogs %d, want 2: the registry rides in the community filter", got)
+	}
+}
+
 // The scan range used to start at the published version's own block, and a version
 // that nothing changed is never rewritten — so the window grew by a block every cycle
 // and the same blocks were re-read five times a minute until the periodic audit reset
@@ -671,10 +704,11 @@ func TestRestartWithAPopulatedStoreReadsNoKeys(t *testing.T) {
 
 	// What a restart does cost, and it is worth stating rather than leaving to be
 	// discovered: one extra eth_call, because the staking router address is resolved
-	// before it can be verified against anything, and a wide event scan, because the
-	// scan mark is in memory and starts empty again.
-	if got := node.count("eth_call"); got != 3 {
-		t.Errorf("eth_call %d, want 3: a quiet cycle's 2 plus one to resolve the router cold", got)
+	// before it can be verified against anything; one more for CMv2's MetaRegistry,
+	// which the event scan watches and no operator read has resolved yet; and a wide
+	// event scan, because the scan mark is in memory and starts empty again.
+	if got := node.count("eth_call"); got != 4 {
+		t.Errorf("eth_call %d, want 4: a quiet cycle's 2 plus the router and the MetaRegistry resolved cold", got)
 	}
 	for _, scan := range node.scanned() {
 		if scan[0] != store.latest.BlockNumber+1 {
@@ -948,6 +982,8 @@ const routerContractVersion = 4
 const (
 	budgetLocator = "0x000000000000000000000000000000000000010c"
 	budgetRouter  = "0x00000000000000000000000000000000000001a0"
+	// budgetMetaRegistry is module 4's MetaRegistry.
+	budgetMetaRegistry = "0x00000000000000000000000000000000000004e7"
 )
 
 func newBudgetNode() *budgetNode {
@@ -1234,6 +1270,11 @@ func (n *budgetNode) answerCall(id int, to string, data []byte) json.RawMessage 
 
 	case sel == selector(&eth.RegistryABI, "getNonce"):
 		return budgetResult(id, word(big.NewInt(nonces[to]).Bytes()))
+
+	// CMv2 names live in its MetaRegistry; the operator read resolves it, and the
+	// event scan watches it.
+	case sel == selector(&eth.CMv2ABI, "META_REGISTRY"):
+		return budgetResult(id, word(common.FromHex(budgetMetaRegistry)))
 
 	default:
 		return budgetError(id, "unexpected call to "+to)

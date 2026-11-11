@@ -48,6 +48,9 @@ type Spec struct {
 	// the module has no group registry — which is what every module but
 	// curated-onchain-v2 looks like, and therefore the default.
 	Group func(module, operator int) *model.GroupID
+	// Withdrawn reports an operator's totalWithdrawnKeys. Nil, or a nil result, is
+	// a module without the counter (curated-onchain-v1).
+	Withdrawn func(module, operator int) *int32
 }
 
 // Small is the default for semantics tests: enough shape to have module and operator
@@ -75,6 +78,12 @@ func (s Spec) WithUsed(used func(module, operator, index int) bool) Spec {
 // WithGroups returns the same registry with node operator groups.
 func (s Spec) WithGroups(group func(module, operator int) *model.GroupID) Spec {
 	s.Group = group
+	return s
+}
+
+// WithWithdrawn returns the same registry with withdrawn-key counters.
+func (s Spec) WithWithdrawn(withdrawn func(module, operator int) *int32) Spec {
+	s.Withdrawn = withdrawn
 	return s
 }
 
@@ -156,6 +165,7 @@ func (s Spec) Operators(moduleID int) []model.Operator {
 			ModuleAddress:              ModuleAddress(moduleID),
 			DepositableValidatorsCount: int32(s.KeysPerOperator - used),
 			Group:                      s.group(moduleID, op),
+			TotalWithdrawnKeys:         s.withdrawn(moduleID, op),
 		})
 	}
 	return out
@@ -166,6 +176,13 @@ func (s Spec) group(module, operator int) *model.GroupID {
 		return nil
 	}
 	return s.Group(module, operator)
+}
+
+func (s Spec) withdrawn(module, operator int) *int32 {
+	if s.Withdrawn == nil {
+		return nil
+	}
+	return s.Withdrawn(module, operator)
 }
 
 func (s Spec) used(module, operator, index int) bool {

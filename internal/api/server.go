@@ -149,6 +149,13 @@ func (s *Server) Handler() http.Handler {
 
 	for _, r := range s.routes() {
 		handler := r.handler
+		_, path, _ := strings.Cut(r.pattern, " ")
+		switch {
+		case r.undocumented:
+			handler = withNoStore(handler).ServeHTTP
+		case isAPIPath(path):
+			handler = withPublicCacheControl(handler)
+		}
 		// One place, before any handler can write: a canonical-surface request that sent
 		// extension parameters is told they were ignored.
 		mux.HandleFunc(r.pattern, func(w http.ResponseWriter, req *http.Request) {
@@ -158,10 +165,17 @@ func (s *Server) Handler() http.Handler {
 	}
 
 	if s.cfg.MetricsHandler != nil {
-		mux.Handle("GET /metrics", s.cfg.MetricsHandler)
+		mux.Handle("GET /metrics", withNoStore(s.cfg.MetricsHandler))
 	}
 
 	return withLogging(withCanonicalMethodMismatch(mux), s.cfg.Log, s.cfg.Observe)
+}
+
+// isAPIPath reports whether a path is a data read on either surface, as opposed to
+// the API document or a probe.
+func isAPIPath(path string) bool {
+	return strings.HasPrefix(path, "/v1/") || strings.HasPrefix(path, "/v2/") ||
+		strings.HasPrefix(path, extPrefix+"/")
 }
 
 // snapshot resolves the version one request is served from: the pin in

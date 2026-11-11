@@ -265,7 +265,8 @@ func (b *pgBuild) Operators(ctx context.Context, module model.StakingModule, ope
 			total_signing_keys           int     not null,
 			used_signing_keys            int     not null,
 			depositable_validators_count int     not null,
-			group_id                     int
+			group_id                     int,
+			total_withdrawn_keys         int
 		) on commit drop`); err != nil {
 		return 0, fmt.Errorf("staging table: %w", err)
 	}
@@ -276,20 +277,23 @@ func (b *pgBuild) Operators(ctx context.Context, module model.StakingModule, ope
 		if err != nil {
 			return 0, fmt.Errorf("operator %d reward address: %w", o.Index, err)
 		}
-		var group any
+		var group, withdrawn any
 		if o.Group != nil {
 			group = int32(*o.Group)
 		}
+		if o.TotalWithdrawnKeys != nil {
+			withdrawn = *o.TotalWithdrawnKeys
+		}
 		staged = append(staged, []any{o.Index, o.Active, o.Name, reward, o.StakingLimit,
 			o.StoppedValidators, o.TotalSigningKeys, o.UsedSigningKeys, o.DepositableValidatorsCount,
-			group})
+			group, withdrawn})
 	}
 
 	if _, err := tx.CopyFrom(ctx,
 		pgx.Identifier{"staged_operators"},
 		[]string{"operator_index", "active", "name", "reward_address", "staking_limit",
 			"stopped_validators", "total_signing_keys", "used_signing_keys", "depositable_validators_count",
-			"group_id"},
+			"group_id", "total_withdrawn_keys"},
 		pgx.CopyFromSlice(len(staged), func(i int) ([]any, error) { return staged[i], nil })); err != nil {
 		return 0, fmt.Errorf("stage operators: %w", err)
 	}
@@ -312,7 +316,8 @@ func (b *pgBuild) Operators(ctx context.Context, module model.StakingModule, ope
 		          -- Nullable, so equality is not enough: null = null is null, which
 		          -- would close and reopen every operator of a group-less module on
 		          -- every rebuild.
-		          and s.group_id is not distinct from v.group_id)`, module.ID, block)
+		          and s.group_id is not distinct from v.group_id
+		          and s.total_withdrawn_keys is not distinct from v.total_withdrawn_keys)`, module.ID, block)
 	if err != nil {
 		return 0, fmt.Errorf("close superseded operators: %w", err)
 	}
@@ -320,9 +325,11 @@ func (b *pgBuild) Operators(ctx context.Context, module model.StakingModule, ope
 	opened, err := tx.Exec(ctx, `
 		insert into operator_version
 			(module_id, operator_index, active, name, reward_address, staking_limit, stopped_validators,
-			 total_signing_keys, used_signing_keys, depositable_validators_count, group_id, from_block, to_block)
+			 total_signing_keys, used_signing_keys, depositable_validators_count, group_id, total_withdrawn_keys,
+			 from_block, to_block)
 		select $1, s.operator_index, s.active, s.name, s.reward_address, s.staking_limit, s.stopped_validators,
-		       s.total_signing_keys, s.used_signing_keys, s.depositable_validators_count, s.group_id, $2, null
+		       s.total_signing_keys, s.used_signing_keys, s.depositable_validators_count, s.group_id,
+		       s.total_withdrawn_keys, $2, null
 		  from staged_operators s
 		 where not exists (
 		       select 1 from operator_version v

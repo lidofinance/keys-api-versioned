@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 
@@ -36,7 +37,7 @@ func TestCMv2OperatorsCarryTheirGroup(t *testing.T) {
 	reader := &CommunityReader{}
 
 	operators, err := reader.Operators(context.Background(), client,
-		eth.BlockRef{Tag: "latest"}, moduleUnderTest)
+		eth.BlockRef{Tag: "latest"}, cmv2UnderTest)
 	if err != nil {
 		t.Fatalf("Operators: %v", err)
 	}
@@ -74,12 +75,41 @@ func TestCMv2OperatorsCarryTheirGroup(t *testing.T) {
 	}
 }
 
-// A module with no MetaRegistry has no groups, and the cost of finding that out
-// must not scale with the operator count — one reverting probe per module, not one
-// failed call per operator. This is the CSM case, and modules 1 and 2 never get
-// here at all because CuratedReader has no registry to ask.
-func TestAModuleWithoutAMetaRegistryReportsNoGroupsAndAsksOnce(t *testing.T) {
+// CSM has no MetaRegistry, and the module type says so: names are generated, there
+// are no groups, and the registry is never asked for. Probing it instead conflated
+// a failed read with "no registry" and served generated names for CMv2.
+func TestCSMReportsNoGroupsAndNeverProbesARegistry(t *testing.T) {
 	node := &operatorsNode{operators: 5}
+	server := httptest.NewServer(node)
+	defer server.Close()
+
+	client := eth.NewClient(server.URL, eth.Options{Concurrency: 2, BatchSize: 8})
+	reader := &CommunityReader{}
+
+	operators, err := reader.Operators(context.Background(), client, eth.BlockRef{Tag: "latest"}, csmUnderTest)
+	if err != nil {
+		t.Fatalf("Operators: %v", err)
+	}
+	for _, o := range operators {
+		if o.Group != nil {
+			t.Errorf("operator %d reported group %d on a module with no registry", o.Index, *o.Group)
+		}
+		if want := fmt.Sprintf("CSM Operator %d", o.Index); o.Name != want {
+			t.Errorf("operator %d is named %q, want %q", o.Index, o.Name, want)
+		}
+	}
+	if got := node.registryProbes.Load(); got != 0 {
+		t.Errorf("META_REGISTRY was called %d times on a CSM module, want 0", got)
+	}
+	if got := node.groupCalls.Load(); got != 0 {
+		t.Errorf("%d group calls went to a module with no registry, want 0", got)
+	}
+}
+
+// META_REGISTRY is read at every operator read, not cached for the process: a module
+// upgrade can point it at another registry, and names then come from the new one.
+func TestCMv2ReadsItsMetaRegistryOnEveryRead(t *testing.T) {
+	node := &operatorsNode{registry: metaRegistryUnderTest, operators: 2, groups: map[int64]int64{}}
 	server := httptest.NewServer(node)
 	defer server.Close()
 
@@ -87,30 +117,88 @@ func TestAModuleWithoutAMetaRegistryReportsNoGroupsAndAsksOnce(t *testing.T) {
 	reader := &CommunityReader{}
 	ctx := context.Background()
 
-	for cycle := 0; cycle < 2; cycle++ {
-		operators, err := reader.Operators(ctx, client, eth.BlockRef{Tag: "latest"}, moduleUnderTest)
-		if err != nil {
-			t.Fatalf("cycle %d: Operators: %v", cycle, err)
-		}
-		for _, o := range operators {
-			if o.Group != nil {
-				t.Errorf("cycle %d: operator %d reported group %d on a module with no registry",
-					cycle, o.Index, *o.Group)
-			}
-			if !strings.HasPrefix(o.Name, "CSM Operator ") {
-				t.Errorf("cycle %d: operator %d is named %q, want the generated CSM name",
-					cycle, o.Index, o.Name)
-			}
-		}
+	if _, err := reader.Operators(ctx, client, eth.BlockRef{Tag: "latest"}, cmv2UnderTest); err != nil {
+		t.Fatalf("first read: %v", err)
+	}
+	const upgraded = "0x00000000000000000000000000000000000ce116"
+	node.setRegistry(upgraded)
+	if _, err := reader.Operators(ctx, client, eth.BlockRef{Tag: "latest"}, cmv2UnderTest); err != nil {
+		t.Fatalf("second read: %v", err)
 	}
 
-	if got := node.groupCalls.Load(); got != 0 {
-		t.Errorf("%d group calls went to a module with no registry, want 0", got)
+	if got := node.registryProbes.Load(); got != 2 {
+		t.Errorf("META_REGISTRY read %d times over two reads, want 2", got)
 	}
-	// The probe is cached, so the second cycle costs nothing — a module that reverts
-	// on every cycle is log spam and a wasted round trip per cycle forever.
-	if got := node.registryProbes.Load(); got != 1 {
-		t.Errorf("META_REGISTRY was probed %d times over two cycles, want 1", got)
+	if got := node.lastMetadataTo(); got != upgraded {
+		t.Errorf("metadata read from %s after the upgrade, want %s", got, upgraded)
+	}
+	addresses, err := reader.OperatorEventAddresses(ctx, client, cmv2UnderTest, 1)
+	if err != nil {
+		t.Fatalf("OperatorEventAddresses: %v", err)
+	}
+	if len(addresses) != 2 || addresses[1] != upgraded {
+		t.Errorf("event scan watches %v, want the module and %s", addresses, upgraded)
+	}
+}
+
+// A failed META_REGISTRY read on CMv2 fails the read; it does not fall back to
+// generated names, which is what consumers saw when a revert meant "no registry".
+func TestCMv2FailsWhenItsRegistryCannotBeRead(t *testing.T) {
+	node := &operatorsNode{operators: 2} // META_REGISTRY reverts
+	server := httptest.NewServer(node)
+	defer server.Close()
+
+	client := eth.NewClient(server.URL, eth.Options{Concurrency: 2, BatchSize: 8})
+	reader := &CommunityReader{}
+
+	operators, err := reader.Operators(context.Background(), client, eth.BlockRef{Tag: "latest"}, cmv2UnderTest)
+	if err == nil {
+		t.Fatalf("got %d operators and no error, want the META_REGISTRY failure", len(operators))
+	}
+}
+
+// Undecodable names get the canonical placeholder instead of failing the write:
+// Postgres text accepts neither invalid UTF-8 nor a NUL byte.
+func TestCMv2UndecodableNamesGetThePlaceholder(t *testing.T) {
+	node := &operatorsNode{registry: metaRegistryUnderTest, operators: 3, groups: map[int64]int64{},
+		names: map[int64]string{0: "A\xffB", 1: "nul\x00name", 2: "Ünïcode ok"}}
+	server := httptest.NewServer(node)
+	defer server.Close()
+
+	client := eth.NewClient(server.URL, eth.Options{Concurrency: 2, BatchSize: 8})
+	reader := &CommunityReader{}
+
+	operators, err := reader.Operators(context.Background(), client, eth.BlockRef{Tag: "latest"}, cmv2UnderTest)
+	if err != nil {
+		t.Fatalf("Operators: %v", err)
+	}
+	for i, want := range []string{"invalidName0", "invalidName1", "Ünïcode ok"} {
+		if operators[i].Name != want {
+			t.Errorf("operator %d named %q, want %q", i, operators[i].Name, want)
+		}
+	}
+}
+
+// totalWithdrawnKeys is read from getNodeOperator, a genuine 0 included.
+func TestCommunityOperatorsCarryTotalWithdrawnKeys(t *testing.T) {
+	node := &operatorsNode{operators: 3}
+	server := httptest.NewServer(node)
+	defer server.Close()
+
+	client := eth.NewClient(server.URL, eth.Options{Concurrency: 2, BatchSize: 8})
+	reader := &CommunityReader{}
+
+	operators, err := reader.Operators(context.Background(), client, eth.BlockRef{Tag: "latest"}, csmUnderTest)
+	if err != nil {
+		t.Fatalf("Operators: %v", err)
+	}
+	for i, o := range operators {
+		if o.TotalWithdrawnKeys == nil {
+			t.Fatalf("operator %d: totalWithdrawnKeys missing", i)
+		}
+		if *o.TotalWithdrawnKeys != int32(i) {
+			t.Errorf("operator %d: totalWithdrawnKeys %d, want %d", i, *o.TotalWithdrawnKeys, i)
+		}
 	}
 }
 
@@ -126,7 +214,7 @@ func TestGroupsCostNoExtraRoundTrip(t *testing.T) {
 	reader := &CommunityReader{}
 
 	if _, err := reader.Operators(context.Background(), client,
-		eth.BlockRef{Tag: "latest"}, moduleUnderTest); err != nil {
+		eth.BlockRef{Tag: "latest"}, cmv2UnderTest); err != nil {
 		t.Fatalf("Operators: %v", err)
 	}
 
@@ -144,15 +232,36 @@ func TestGroupsCostNoExtraRoundTrip(t *testing.T) {
 
 const metaRegistryUnderTest = "0x00000000000000000000000000000000000ce115"
 
+var (
+	cmv2UnderTest = stakingModule(4, "curated-onchain-v2", moduleUnderTest)
+	csmUnderTest  = stakingModule(3, "community-onchain-v1", moduleUnderTest)
+)
+
 // operatorsNode answers the calls CommunityReader.Operators makes. A module with an
 // empty registry address reverts META_REGISTRY, the way plain CSM does.
 type operatorsNode struct {
+	mu        sync.Mutex
 	registry  string
 	operators int64
 	groups    map[int64]int64
+	// names overrides the metadata name per operator.
+	names      map[int64]string
+	metadataTo string
 
 	registryProbes atomic.Int64
 	groupCalls     atomic.Int64
+}
+
+func (n *operatorsNode) setRegistry(address string) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	n.registry = address
+}
+
+func (n *operatorsNode) lastMetadataTo() string {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return n.metadataTo
 }
 
 func (n *operatorsNode) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -196,10 +305,13 @@ func (n *operatorsNode) answer(method string, params []any) (string, error) {
 	switch {
 	case selector == [4]byte(eth.CMv2ABI.Methods["META_REGISTRY"].ID):
 		n.registryProbes.Add(1)
-		if n.registry == "" {
+		n.mu.Lock()
+		registry := n.registry
+		n.mu.Unlock()
+		if registry == "" {
 			return "", fmt.Errorf("execution reverted")
 		}
-		return packAddress(n.registry), nil
+		return packAddress(registry), nil
 
 	case selector == [4]byte(eth.CSMABI.Methods["getNodeOperatorsCount"].ID):
 		return packUint(big.NewInt(n.operators)), nil
@@ -211,7 +323,14 @@ func (n *operatorsNode) answer(method string, params []any) (string, error) {
 		return packSummary()
 
 	case selector == [4]byte(eth.MetaRegistryABI.Methods["getOperatorMetadata"].ID):
-		return packMetadata(fmt.Sprintf("operator-%d", argID(data)))
+		n.mu.Lock()
+		n.metadataTo = strings.ToLower(to)
+		name, ok := n.names[argID(data)]
+		n.mu.Unlock()
+		if !ok {
+			name = fmt.Sprintf("operator-%d", argID(data))
+		}
+		return packMetadata(name)
 
 	case selector == [4]byte(eth.MetaRegistryABI.Methods["getNodeOperatorGroupId"].ID):
 		n.groupCalls.Add(1)
@@ -255,6 +374,7 @@ type nodeOperator struct {
 func packNodeOperator(id int64) (string, error) {
 	op := nodeOperator{
 		TotalAddedKeys:     2,
+		TotalWithdrawnKeys: uint32(id),
 		TotalDepositedKeys: 1,
 		TotalVettedKeys:    2,
 		RewardAddress:      common.BigToAddress(big.NewInt(id + 1)),

@@ -42,7 +42,8 @@ func (r *CuratedReader) OperatorEventTopics() []string {
 // it with a second round of per-operator calls at the finalized block tag, and no
 // endpoint we serve exposes it — the operator DTO omits it. Skipping it halves the
 // per-operator round trips.
-func (r *CuratedReader) Operators(ctx context.Context, c *eth.Client, at eth.BlockRef, moduleAddress string) ([]model.Operator, error) {
+func (r *CuratedReader) Operators(ctx context.Context, c *eth.Client, at eth.BlockRef, m model.StakingModule) ([]model.Operator, error) {
+	moduleAddress := m.RawAddress()
 	out, err := c.CallOne(ctx, at, eth.Call{
 		To: moduleAddress, ABI: &eth.RegistryABI, Method: "getNodeOperatorsCount",
 	})

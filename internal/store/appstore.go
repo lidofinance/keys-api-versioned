@@ -617,7 +617,8 @@ func (s *appSnapshot) KeysByPubkeys(ctx context.Context, moduleAddress string, p
 }
 
 const appOperatorCols = `operator_index, active, name, reward_address, staking_limit,
-	stopped_validators, total_signing_keys, used_signing_keys, depositable_validators_count, group_id`
+	stopped_validators, total_signing_keys, used_signing_keys, depositable_validators_count, group_id,
+	total_withdrawn_keys`
 
 // Operators returns a module's operators at the pinned version.
 func (s *appSnapshot) Operators(ctx context.Context, moduleAddress string, f model.OperatorsFilter) ([]model.Operator, error) {
@@ -653,7 +654,7 @@ func (s *appSnapshot) Operators(ctx context.Context, moduleAddress string, f mod
 		)
 		if err := rows.Scan(&o.Index, &o.Active, &o.Name, &reward, &o.StakingLimit,
 			&o.StoppedValidators, &o.TotalSigningKeys, &o.UsedSigningKeys,
-			&o.DepositableValidatorsCount, &group); err != nil {
+			&o.DepositableValidatorsCount, &group, &o.TotalWithdrawnKeys); err != nil {
 			return nil, fmt.Errorf("scan operator: %w", err)
 		}
 		// A null column is a module without groups, and it stays nil all the way to

@@ -5,7 +5,9 @@ import (
 	"fmt"
 	"math/big"
 	"reflect"
+	"strconv"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/lidofinance/keys-api-versioned/internal/model"
 )
@@ -110,7 +112,7 @@ func decodeCuratedOperator(index int32, moduleAddress string, values []any) (mod
 	}
 
 	return model.Operator{
-		Name:              name,
+		Name:              operatorName(name, index),
 		RewardAddress:     strings.ToLower(addressOf(values[2])),
 		StakingLimit:      int32(intOf(values[3])),
 		StoppedValidators: int32(intOf(values[4])),
@@ -136,16 +138,28 @@ func decodeCommunityOperator(index int32, moduleAddress string, values []any) (m
 		return model.Operator{}, fmt.Errorf("getNodeOperator: expected a struct, got %T", values[0])
 	}
 
+	withdrawn := int32(fieldInt(s, "TotalWithdrawnKeys"))
 	return model.Operator{
-		RewardAddress:     strings.ToLower(fieldAddress(s, "RewardAddress")),
-		StakingLimit:      int32(fieldInt(s, "TotalVettedKeys")),
-		StoppedValidators: int32(fieldInt(s, "TotalExitedKeys")),
-		TotalSigningKeys:  int32(fieldInt(s, "TotalAddedKeys")),
-		UsedSigningKeys:   int32(fieldInt(s, "TotalDepositedKeys")),
-		Index:             index,
-		Active:            true,
-		ModuleAddress:     moduleAddress,
+		RewardAddress:      strings.ToLower(fieldAddress(s, "RewardAddress")),
+		StakingLimit:       int32(fieldInt(s, "TotalVettedKeys")),
+		StoppedValidators:  int32(fieldInt(s, "TotalExitedKeys")),
+		TotalSigningKeys:   int32(fieldInt(s, "TotalAddedKeys")),
+		UsedSigningKeys:    int32(fieldInt(s, "TotalDepositedKeys")),
+		Index:              index,
+		Active:             true,
+		ModuleAddress:      moduleAddress,
+		TotalWithdrawnKeys: &withdrawn,
 	}, nil
+}
+
+// operatorName returns the on-chain name, or the canonical placeholder
+// `invalidName<index>` for a name that is not valid UTF-8 or holds a NUL byte.
+// Postgres text rejects both, so without this one such name stops the ingest.
+func operatorName(name string, index int32) string {
+	if !utf8.ValidString(name) || strings.ContainsRune(name, 0) {
+		return "invalidName" + strconv.Itoa(int(index))
+	}
+	return name
 }
 
 // depositableFromSummary picks depositableValidatorsCount out of
@@ -166,7 +180,7 @@ func firstValue(values []any) any {
 	return values[0]
 }
 
-func metadataName(values []any) string {
+func metadataName(values []any, index int32) string {
 	if len(values) == 0 {
 		return ""
 	}
@@ -174,7 +188,7 @@ func metadataName(values []any) string {
 	if s.Kind() != reflect.Struct {
 		return ""
 	}
-	return fieldString(s, "Name")
+	return operatorName(fieldString(s, "Name"), index)
 }
 
 // decodeCuratedKeys splits the packed return of getSigningKeys into keys.

@@ -27,6 +27,7 @@ import (
 
 	"github.com/ethereum/go-ethereum/accounts/abi"
 	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/crypto"
 )
 
 //go:embed abi/*.json
@@ -83,8 +84,13 @@ func loadABIs() error {
 //
 // The name is looked up across every loaded ABI, so a caller names the event it
 // cares about ("NodeOperatorNameSet") without also having to say which contract
-// declares it. Names are unique across these files.
+// declares it. Names are unique across these files. A full signature
+// ("VettedSigningKeysCountChanged(uint256,uint256)") is hashed as is, for events
+// none of the files declares.
 func EventTopic(name string) (common.Hash, error) {
+	if strings.Contains(name, "(") {
+		return crypto.Keccak256Hash([]byte(name)), nil
+	}
 	if err := loadABIs(); err != nil {
 		return common.Hash{}, err
 	}
@@ -640,12 +646,6 @@ func (c *Client) BlockHashByNumber(ctx context.Context, number *big.Int) (string
 		return "", err
 	}
 	return block.Hash, nil
-}
-
-// HasLogs reports whether an address emitted any of the named events in a block
-// range. It asks for one log, because the answer is only ever used as a flag.
-func (c *Client) HasLogs(ctx context.Context, address string, eventNames []string, fromBlock, toBlock int64) (bool, error) {
-	return c.HasAnyLogs(ctx, []string{address}, eventNames, fromBlock, toBlock)
 }
 
 // HasAnyLogs reports whether any of the addresses emitted any of the events in the

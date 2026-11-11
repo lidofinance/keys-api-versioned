@@ -98,14 +98,30 @@ func (p *Provider) noteSourceChange(reason string) {
 type ModuleReader interface {
 	// Types lists the module types this reader handles, as getType returns them.
 	Types() []string
-	// Operators reads every operator of the module at a block.
-	Operators(ctx context.Context, c *eth.Client, at eth.BlockRef, moduleAddress string) ([]model.Operator, error)
+	// Operators reads every operator of the module at a block. The module is passed
+	// whole because a reader serving two types may read them differently.
+	Operators(ctx context.Context, c *eth.Client, at eth.BlockRef, m model.StakingModule) ([]model.Operator, error)
 	// Keys streams the module's keys. Operators are passed in because both
 	// implementations need their limits, and reading them twice is wasteful.
 	Keys(ctx context.Context, c *eth.Client, at eth.BlockRef, moduleAddress string, operators []model.Operator, fn func(model.Key) error) error
 	// OperatorEventTopics are the events that change operator metadata without
-	// moving the module nonce.
+	// moving the module nonce: ABI event names, or full signatures for events no
+	// loaded ABI declares.
 	OperatorEventTopics() []string
+}
+
+// operatorEventAddresser is implemented by a reader whose operator metadata partly
+// lives outside the module contract. Without it, the scan watches the module only.
+type operatorEventAddresser interface {
+	OperatorEventAddresses(ctx context.Context, c *eth.Client, m model.StakingModule, toBlock int64) ([]string, error)
+}
+
+// operatorEventAddresses lists the contracts the scan watches for one module.
+func (p *Provider) operatorEventAddresses(ctx context.Context, r ModuleReader, m model.StakingModule, toBlock int64) ([]string, error) {
+	if a, ok := r.(operatorEventAddresser); ok {
+		return a.OperatorEventAddresses(ctx, p.client, m, toBlock)
+	}
+	return []string{m.RawAddress()}, nil
 }
 
 // Options configure pacing and which readers are available.
@@ -482,7 +498,7 @@ func (p *Provider) Operators(ctx context.Context, at source.Ref, m model.Staking
 	if err != nil {
 		return nil, err
 	}
-	return r.Operators(ctx, p.client, blockRef(at), m.RawAddress())
+	return r.Operators(ctx, p.client, blockRef(at), m)
 }
 
 // Keys streams the keys of one module. Operators are read first because both
@@ -495,7 +511,7 @@ func (p *Provider) Keys(ctx context.Context, at source.Ref, m model.StakingModul
 	ref := blockRef(at)
 
 	started := time.Now()
-	operators, err := r.Operators(ctx, p.client, ref, m.RawAddress())
+	operators, err := r.Operators(ctx, p.client, ref, m)
 	if err != nil {
 		return fmt.Errorf("operators of module %d: %w", m.ID, err)
 	}
@@ -530,7 +546,11 @@ func (p *Provider) OperatorsChanged(ctx context.Context, m model.StakingModule, 
 		return false, nil
 	}
 
-	changed, err := p.client.HasLogs(ctx, m.RawAddress(), topics, fromBlock, toBlock)
+	addresses, err := p.operatorEventAddresses(ctx, r, m, toBlock)
+	if err != nil {
+		return false, err
+	}
+	changed, err := p.client.HasAnyLogs(ctx, addresses, topics, fromBlock, toBlock)
 	if err == nil {
 		p.log.Debug("operator event scan", "module", m.ID,
 			"from", fromBlock, "to", toBlock, "changed", changed, "topics", topics)
@@ -543,9 +563,10 @@ func (p *Provider) OperatorsChanged(ctx context.Context, m model.StakingModule, 
 //
 // The grouping is by reader, not by module: `address` in a log filter takes a list,
 // but the topics have to be the ones that family actually emits — curated modules
-// have three, the CSM-shaped ones have one, and a union across both would ask each
-// contract about events it cannot emit. Mainnet's four modules are two families, so
-// a quiet cycle costs two eth_getLogs instead of four.
+// have three, the CSM-shaped ones three others (CMv2's MetaRegistry rides in the same
+// filter), and a union across both would ask each contract about events it cannot
+// emit. Mainnet's four modules are two families, so a quiet cycle costs two
+// eth_getLogs instead of four.
 //
 // The scan short-circuits on the first family that reports a change, because the
 // caller wants one boolean and a rebuild is triggered either way.
@@ -587,7 +608,11 @@ func (p *Provider) OperatorsChangedAny(ctx context.Context, modules []model.Stak
 			byType[key] = g
 			groups = append(groups, g)
 		}
-		g.addresses = append(g.addresses, m.RawAddress())
+		addresses, err := p.operatorEventAddresses(ctx, r, m, toBlock)
+		if err != nil {
+			return false, err
+		}
+		g.addresses = append(g.addresses, addresses...)
 	}
 
 	for _, g := range groups {

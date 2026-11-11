@@ -77,6 +77,9 @@ type Operator struct {
 	Active                     bool   `json:"active"`
 	ModuleAddress              string `json:"moduleAddress"`
 	DepositableValidatorsCount int32  `json:"depositableValidatorsCount"`
+	// TotalWithdrawnKeys is null for curated-onchain-v1, which has no such counter,
+	// and a number (0 included) for the CSM-shaped modules. Canonical since 5.0.0.
+	TotalWithdrawnKeys *int32 `json:"totalWithdrawnKeys"`
 
 	FinalizedUsedSigningKeys int32 `json:"-"`
 
