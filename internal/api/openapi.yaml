@@ -174,7 +174,8 @@ paths:
 
         `since` must still be inside the retention window; if it is not the answer is
         `410`, because a diff computed against a version whose closed rows were deleted
-        would silently miss removals.
+        would silently miss removals. A diff over more than 100 000 keys answers `413`:
+        read a full dump at the newer version instead.
       parameters:
         - $ref: '#/components/parameters/Since'
         - $ref: '#/components/parameters/To'
@@ -189,6 +190,7 @@ paths:
         '404': { $ref: '#/components/responses/NotFound' }
         '409': { $ref: '#/components/responses/Superseded' }
         '410': { $ref: '#/components/responses/Pruned' }
+        '413': { $ref: '#/components/responses/DiffTooLarge' }
         '501': { $ref: '#/components/responses/NotImplemented' }
 
   /v1/keys/{pubkey}:
@@ -400,6 +402,7 @@ paths:
         '400': { $ref: '#/components/responses/BadRequest' }
         '404': { $ref: '#/components/responses/NotFound' }
         '410': { $ref: '#/components/responses/Pruned' }
+        '413': { $ref: '#/components/responses/DiffTooLarge' }
         '501': { $ref: '#/components/responses/NotImplemented' }
 
   /v1/modules/{module_id}/keys/find:
@@ -743,6 +746,11 @@ components:
           schema: { $ref: '#/components/schemas/Error' }
     NotImplemented:
       description: This backend does not serve that part of the surface.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    DiffTooLarge:
+      description: The diff is larger than a diff is buffered for.
       content:
         application/json:
           schema: { $ref: '#/components/schemas/Error' }

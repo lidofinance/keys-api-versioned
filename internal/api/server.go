@@ -26,6 +26,8 @@ type Config struct {
 	Observe        ObserveFunc
 	// StreamWriteTimeout: zero means streamWriteTimeout.
 	StreamWriteTimeout time.Duration
+	// MaxDiffKeys: zero means maxDiffKeys.
+	MaxDiffKeys int
 }
 
 type Server struct {
