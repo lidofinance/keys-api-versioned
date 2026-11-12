@@ -4,6 +4,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -142,32 +143,65 @@ func TestWatcherKeepsPreviousValuesWhenApplyFails(t *testing.T) {
 
 func TestLoadIntoEnvPutsTheFileOverTheEnvironment(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config")
-	render(t, path, `{"KEYS_API_TEST_URLS":"http://from-file:8545"}`)
-	t.Setenv("KEYS_API_TEST_URLS", "http://from-env:8545")
+	render(t, path, `{"PROVIDERS_URLS":"http://from-file:8545"}`)
+	t.Setenv("PROVIDERS_URLS", "http://from-env:8545")
 
-	values, err := LoadIntoEnv(path)
+	values, _, err := LoadIntoEnv(path)
 	if err != nil {
 		t.Fatalf("load: %v", err)
 	}
 	if len(values) != 1 {
 		t.Fatalf("expected the applied values back, got %v", values)
 	}
-	if os.Getenv("KEYS_API_TEST_URLS") != "http://from-file:8545" {
-		t.Fatalf("environment not overridden: %q", os.Getenv("KEYS_API_TEST_URLS"))
+	if os.Getenv("PROVIDERS_URLS") != "http://from-file:8545" {
+		t.Fatalf("environment not overridden: %q", os.Getenv("PROVIDERS_URLS"))
 	}
 }
 
 func TestLoadIntoEnvLeavesTheEnvironmentAloneWithoutAFile(t *testing.T) {
-	t.Setenv("KEYS_API_TEST_URLS", "http://from-env:8545")
+	t.Setenv("PROVIDERS_URLS", "http://from-env:8545")
 
-	values, err := LoadIntoEnv(filepath.Join(t.TempDir(), "nothing-here"))
+	values, _, err := LoadIntoEnv(filepath.Join(t.TempDir(), "nothing-here"))
 	if err != nil {
 		t.Fatalf("load: %v", err)
 	}
 	if len(values) != 0 {
 		t.Fatalf("expected no values, got %v", values)
 	}
-	if os.Getenv("KEYS_API_TEST_URLS") != "http://from-env:8545" {
-		t.Fatalf("environment changed: %q", os.Getenv("KEYS_API_TEST_URLS"))
+	if os.Getenv("PROVIDERS_URLS") != "http://from-env:8545" {
+		t.Fatalf("environment changed: %q", os.Getenv("PROVIDERS_URLS"))
+	}
+}
+
+func TestTheFileSetsCredentialsOnly(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config")
+	render(t, path, `{"PROVIDERS_URLS":"http://from-file:8545","KEYS_API_MODE":"ingest","LIDO_LOCATOR":"0x0"}`)
+	t.Setenv("KEYS_API_MODE", "server")
+
+	values, ignored, err := LoadIntoEnv(path)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if _, ok := values["PROVIDERS_URLS"]; !ok || len(values) != 1 {
+		t.Errorf("applied %v, want PROVIDERS_URLS only", values)
+	}
+	if strings.Join(ignored, ",") != "KEYS_API_MODE,LIDO_LOCATOR" {
+		t.Errorf("ignored %v, want KEYS_API_MODE and LIDO_LOCATOR", ignored)
+	}
+	if got := os.Getenv("KEYS_API_MODE"); got != "server" {
+		t.Errorf("KEYS_API_MODE = %q: the file changed configuration it may not set", got)
+	}
+}
+
+func TestAFileReadableByOthersIsReported(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config")
+	render(t, path, `{}`)
+	for mode, loose := range map[os.FileMode]bool{0o600: false, 0o400: false, 0o640: true, 0o644: true} {
+		if err := os.Chmod(path, mode); err != nil {
+			t.Fatal(err)
+		}
+		if _, got := LooseMode(path); got != loose {
+			t.Errorf("mode %o: loose = %t, want %t", mode, got, loose)
+		}
 	}
 }

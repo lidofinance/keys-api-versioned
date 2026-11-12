@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"sort"
 	"time"
 )
 
@@ -53,19 +54,48 @@ func Read(path string) (map[string]string, error) {
 	return values, nil
 }
 
-// LoadIntoEnv makes the file the single source for env-read values, so a rotation cannot leave
-// callers half-rotated. Returns what it applied.
-func LoadIntoEnv(path string) (map[string]string, error) {
-	values, err := Read(path)
-	if err != nil {
-		return nil, err
-	}
+// Allowed: the file carries credentials only. Other configuration belongs in the environment,
+// where a deploy shows it; whoever writes the file must not be able to set KEYS_API_MODE.
+var Allowed = map[string]bool{"DATABASE_URL": true, "PROVIDERS_URLS": true}
+
+// Split returns the allowed values and the sorted names of the others.
+func Split(values map[string]string) (map[string]string, []string) {
+	kept := make(map[string]string, len(values))
+	var ignored []string
 	for key, value := range values {
-		if err := os.Setenv(key, value); err != nil {
-			return nil, fmt.Errorf("set %s from %s: %w", key, path, err)
+		if Allowed[key] {
+			kept[key] = value
+		} else {
+			ignored = append(ignored, key)
 		}
 	}
-	return values, nil
+	sort.Strings(ignored)
+	return kept, ignored
+}
+
+// LoadIntoEnv makes the file the single source for env-read values, so a rotation cannot leave
+// callers half-rotated. Returns what it applied and the keys it ignored.
+func LoadIntoEnv(path string) (map[string]string, []string, error) {
+	values, err := Read(path)
+	if err != nil {
+		return nil, nil, err
+	}
+	kept, ignored := Split(values)
+	for key, value := range kept {
+		if err := os.Setenv(key, value); err != nil {
+			return nil, nil, fmt.Errorf("set %s from %s: %w", key, path, err)
+		}
+	}
+	return kept, ignored, nil
+}
+
+// LooseMode reports a file readable by group or others.
+func LooseMode(path string) (os.FileMode, bool) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return 0, false
+	}
+	return info.Mode().Perm(), info.Mode().Perm()&0o077 != 0
 }
 
 type Watcher struct {

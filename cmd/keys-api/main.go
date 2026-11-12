@@ -11,7 +11,6 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
-	"sort"
 	"strconv"
 	"strings"
 	"syscall"
@@ -54,10 +53,17 @@ func run(log *slog.Logger, masker *logmask.Masker) error {
 	// Before anything reads the environment, so the file is the source for every envOr below.
 	// A broken file is logged and ignored: the environment still holds a working configuration.
 	secretsPath := envOr("SECRETS_FILE_PATH", secrets.DefaultPath)
-	appliedSecrets, err := secrets.LoadIntoEnv(secretsPath)
+	appliedSecrets, ignoredSecrets, err := secrets.LoadIntoEnv(secretsPath)
 	addSecrets(masker, appliedSecrets)
 	if err != nil {
 		log.Error("secrets file unusable, reading configuration from the environment", "path", secretsPath, "err", err)
+	}
+	if len(ignoredSecrets) > 0 {
+		log.Warn("secrets file: only credentials are read from it, other keys are ignored",
+			"path", secretsPath, "ignored", strings.Join(ignoredSecrets, ","))
+	}
+	if mode, loose := secrets.LooseMode(secretsPath); loose {
+		log.Warn("secrets file is readable by group or others", "path", secretsPath, "mode", mode.String())
 	}
 	if len(appliedSecrets) > 0 {
 		log.Info("configuration: secrets file over the environment", "path", secretsPath)
@@ -201,21 +207,23 @@ func run(log *slog.Logger, masker *logmask.Masker) error {
 		}()
 	}
 
-	// Rotation, once everything that could consume a credential exists.
-	if len(appliedSecrets) > 0 {
-		interval := time.Duration(envInt("SECRETS_POLL_INTERVAL_IN_SECONDS", int(secrets.DefaultPollInterval/time.Second))) * time.Second
-		watcher := secrets.NewWatcher(secretsPath, interval,
-			func(values map[string]string) error {
-				addSecrets(masker, values)
-				return applyRotatedSecrets(values, appliedSecrets, setEndpoints, log, m)
-			},
-			func(err error) {
-				log.Error("secrets rotation", "err", err)
-				m.SecretsReloads.WithLabelValues("failure").Inc()
-			})
-		go watcher.Run(ctx)
-	}
+	// Rotation, once everything that could consume a credential exists. Watched even when the file
+	// was missing or broken at boot: one that appears later is still read.
+	restart := make(chan error, 1)
+	interval := time.Duration(envInt("SECRETS_POLL_INTERVAL_IN_SECONDS", int(secrets.DefaultPollInterval/time.Second))) * time.Second
+	watcher := secrets.NewWatcher(secretsPath, interval,
+		func(values map[string]string) error {
+			values, _ = secrets.Split(values)
+			addSecrets(masker, values)
+			return applyRotatedSecrets(values, setEndpoints, restart, log, m)
+		},
+		func(err error) {
+			log.Error("secrets rotation", "err", err)
+			m.SecretsReloads.WithLabelValues("failure").Inc()
+		})
+	go watcher.Run(ctx)
 
+	var exitErr error
 	select {
 	case <-ctx.Done():
 		log.Info("shutting down")
@@ -224,6 +232,8 @@ func run(log *slog.Logger, masker *logmask.Masker) error {
 			stop()
 			return err
 		}
+	case exitErr = <-restart:
+		log.Warn("shutting down for a restart", "reason", exitErr)
 	}
 
 	if server != nil {
@@ -233,7 +243,7 @@ func run(log *slog.Logger, masker *logmask.Masker) error {
 			log.Warn("http shutdown", "err", err)
 		}
 	}
-	return nil
+	return exitErr
 }
 
 // runWriter waits for the writer lock without holding up the API: in KEYS_API_MODE=all a rollout
@@ -295,42 +305,59 @@ func addSecrets(masker *logmask.Masker, fileValues map[string]string) {
 	}
 }
 
-// applyRotatedSecrets: PROVIDERS_URLS applies live (the client copies endpoints per request). Other
-// keys need a restart and are not recorded as applied, so they keep being reported.
+// applyRotatedSecrets compares with the environment, which the file was loaded into at boot.
+// PROVIDERS_URLS applies live once it validates (the client copies endpoints per request);
+// DATABASE_URL asks for a restart, since the pool holds connections made with the old one.
 func applyRotatedSecrets(
-	values, applied map[string]string,
+	values map[string]string,
 	setEndpoints func(string) error,
+	restart chan<- error,
 	log *slog.Logger,
 	m *metrics.Metrics,
 ) error {
-	var live, needRestart []string
-	for key, value := range values {
-		if value == applied[key] {
-			continue
+	if value, ok := values["DATABASE_URL"]; ok && value != os.Getenv("DATABASE_URL") {
+		m.SecretsReloads.WithLabelValues("restart_required").Inc()
+		select {
+		case restart <- errors.New("DATABASE_URL changed in the secrets file; exiting so the orchestrator restarts with it"):
+		default:
 		}
-		if key == "PROVIDERS_URLS" && setEndpoints != nil {
-			if err := setEndpoints(value); err != nil {
-				return fmt.Errorf("PROVIDERS_URLS: %w", err)
-			}
-			applied[key] = value
-			if err := os.Setenv(key, value); err != nil {
-				return err
-			}
-			live = append(live, key)
-			continue
-		}
-		needRestart = append(needRestart, key)
+		return nil
 	}
 
-	if len(live) > 0 {
-		sort.Strings(live)
-		log.Info("applied rotated secrets", "keys", strings.Join(live, ","))
-		m.SecretsReloads.WithLabelValues("success").Inc()
+	value, ok := values["PROVIDERS_URLS"]
+	if !ok || value == os.Getenv("PROVIDERS_URLS") || setEndpoints == nil {
+		return nil
 	}
-	if len(needRestart) > 0 {
-		sort.Strings(needRestart)
-		log.Warn("rotated secrets need a restart to take effect", "keys", strings.Join(needRestart, ","))
-		m.SecretsReloads.WithLabelValues("restart_required").Inc()
+	if err := validateProviderURLs(value); err != nil {
+		return fmt.Errorf("PROVIDERS_URLS: %w; keeping the previous endpoints", err)
+	}
+	if err := setEndpoints(value); err != nil {
+		return fmt.Errorf("PROVIDERS_URLS: %w", err)
+	}
+	if err := os.Setenv("PROVIDERS_URLS", value); err != nil {
+		return err
+	}
+	log.Info("applied rotated secrets", "keys", "PROVIDERS_URLS")
+	m.SecretsReloads.WithLabelValues("success").Inc()
+	return nil
+}
+
+// validateProviderURLs names entries by position: the URL itself carries the provider key.
+func validateProviderURLs(list string) error {
+	n := 0
+	for _, raw := range strings.Split(list, ",") {
+		raw = strings.TrimSpace(raw)
+		if raw == "" {
+			continue
+		}
+		n++
+		u, err := url.Parse(raw)
+		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+			return fmt.Errorf("entry %d is not an http(s) URL with a host", n)
+		}
+	}
+	if n == 0 {
+		return errors.New("no endpoints")
 	}
 	return nil
 }
@@ -343,6 +370,9 @@ func buildSource(ctx context.Context, chainID int64, log *slog.Logger, m *metric
 		urls := envOr("PROVIDERS_URLS", "")
 		if urls == "" {
 			return nil, nil, errors.New("PROVIDERS_URLS is required for KEYS_API_SOURCE=lido-core")
+		}
+		if err := validateProviderURLs(urls); err != nil {
+			return nil, nil, fmt.Errorf("PROVIDERS_URLS: %w", err)
 		}
 
 		// No compiled-in per-chain addresses: devnets are the main use case.
