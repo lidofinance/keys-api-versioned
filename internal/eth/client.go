@@ -116,6 +116,10 @@ type Client struct {
 	healthMu sync.Mutex
 	health   map[string]*endpointHealth
 
+	chainID int64
+	chainMu sync.Mutex
+	chainOf map[string]int64
+
 	now func() time.Time
 
 	observe func(RequestInfo)
@@ -137,10 +141,26 @@ func (c *Client) endpoints() []string {
 
 // SetURLs: in-flight requests keep their endpoints; an empty list is refused. What was learned
 // about the old endpoints (multicall presence, budget, failures) is dropped.
+// An endpoint on another chain is refused outright; one that does not answer is checked on use.
 func (c *Client) SetURLs(urls string) error {
 	list := splitURLs(urls)
 	if len(list) == 0 {
 		return errors.New("no usable endpoints")
+	}
+	checked := map[string]int64{}
+	if c.chainID != 0 {
+		ctx, cancel := context.WithTimeout(context.Background(), setURLsCheckTimeout)
+		defer cancel()
+		for i, url := range list {
+			got, err := c.chainIDAt(ctx, url, i)
+			if err != nil {
+				continue
+			}
+			if got != c.chainID {
+				return &wrongChainError{host: hostOf(url), got: got, want: c.chainID}
+			}
+			checked[url] = got
+		}
 	}
 	c.urlsMu.Lock()
 	c.urls = list
@@ -155,10 +175,16 @@ func (c *Client) SetURLs(urls string) error {
 	c.healthMu.Lock()
 	c.health = map[string]*endpointHealth{}
 	c.healthMu.Unlock()
+
+	c.chainMu.Lock()
+	c.chainOf = checked
+	c.chainMu.Unlock()
 	return nil
 }
 
 type Options struct {
+	// ChainID: every endpoint must answer eth_chainId with it before it serves a read. 0 skips it.
+	ChainID     int64
 	Concurrency int
 	BatchSize   int
 	// Timeout bounds a whole attempt, body included; the two below fail a dead endpoint early.
@@ -279,6 +305,8 @@ func NewClient(urls string, o Options) *Client {
 		mcInitialCost: int64(o.MulticallMaxCost),
 		observe:       o.Observe,
 		health:        map[string]*endpointHealth{},
+		chainID:       o.ChainID,
+		chainOf:       map[string]int64{},
 		now:           time.Now,
 	}
 	c.mcMaxCost.Store(int64(o.MulticallMaxCost))
@@ -367,6 +395,13 @@ func (c *Client) do(ctx context.Context, reqs []rpcRequest) ([]json.RawMessage, 
 	var lastErr error
 	endpoints := c.attemptOrder(c.endpoints())
 	for i, url := range endpoints {
+		if err := c.checkChain(ctx, url, i); err != nil {
+			if ctx.Err() != nil {
+				return nil, err
+			}
+			lastErr = err
+			continue
+		}
 		results, err := c.attempt(ctx, url, i, method, body, reqs)
 		if err == nil {
 			c.endpointSucceeded(url)
@@ -387,6 +422,74 @@ func (c *Client) do(ctx context.Context, reqs []rpcRequest) ([]json.RawMessage, 
 	}
 
 	return nil, fmt.Errorf("all %d endpoint(s) failed, last: %w", len(endpoints), lastErr)
+}
+
+const setURLsCheckTimeout = 10 * time.Second
+
+type wrongChainError struct {
+	host      string
+	got, want int64
+}
+
+func (e *wrongChainError) Error() string {
+	return fmt.Sprintf("endpoint %s is on chain %d, CHAIN_ID is %d", e.host, e.got, e.want)
+}
+
+// checkChain lets an endpoint serve only after it answered eth_chainId with the configured chain.
+// A wrong answer sticks until SetURLs; no answer is retried on the next request.
+func (c *Client) checkChain(ctx context.Context, url string, index int) error {
+	if c.chainID == 0 {
+		return nil
+	}
+	c.chainMu.Lock()
+	got, known := c.chainOf[url]
+	c.chainMu.Unlock()
+	if !known {
+		var err error
+		if got, err = c.chainIDAt(ctx, url, index); err != nil {
+			c.endpointFailed(url)
+			return err
+		}
+		c.chainMu.Lock()
+		c.chainOf[url] = got
+		c.chainMu.Unlock()
+		if got != c.chainID {
+			c.log.Error("rpc endpoint is on another chain; it will not be used",
+				"endpoint", hostOf(url), "endpoint_chain_id", got, "want", c.chainID)
+		}
+	}
+	if got != c.chainID {
+		return &wrongChainError{host: hostOf(url), got: got, want: c.chainID}
+	}
+	return nil
+}
+
+func (c *Client) chainIDAt(ctx context.Context, url string, index int) (int64, error) {
+	reqs := []rpcRequest{{JSONRPC: "2.0", ID: c.id(), Method: "eth_chainId", Params: []any{}}}
+	body, err := json.Marshal(reqs)
+	if err != nil {
+		return 0, err
+	}
+	res, err := c.attempt(ctx, url, index, "eth_chainId", body, reqs)
+	if err != nil {
+		return 0, err
+	}
+	return parseChainID(res[0])
+}
+
+// VerifyChain fails on an endpoint on another chain and counts the endpoints on the right one.
+func (c *Client) VerifyChain(ctx context.Context) (verified int, err error) {
+	for i, url := range c.endpoints() {
+		err := c.checkChain(ctx, url, i)
+		var wrong *wrongChainError
+		switch {
+		case errors.As(err, &wrong):
+			return verified, err
+		case err == nil:
+			verified++
+		}
+	}
+	return verified, ctx.Err()
 }
 
 // attempt is one round trip to one endpoint; every failure is logged here with its host only.
@@ -650,12 +753,16 @@ func (c *Client) ChainID(ctx context.Context) (int64, error) {
 	if err != nil {
 		return 0, err
 	}
+	return parseChainID(res[0])
+}
+
+func parseChainID(raw json.RawMessage) (int64, error) {
 	var hexID string
-	if err := json.Unmarshal(res[0], &hexID); err != nil {
+	if err := json.Unmarshal(raw, &hexID); err != nil {
 		return 0, err
 	}
 	n, ok := new(big.Int).SetString(strings.TrimPrefix(hexID, "0x"), 16)
-	if !ok {
+	if !ok || !n.IsInt64() {
 		return 0, fmt.Errorf("bad chain id %q", hexID)
 	}
 	return n.Int64(), nil

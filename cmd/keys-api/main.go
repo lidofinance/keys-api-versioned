@@ -137,7 +137,10 @@ func run(log *slog.Logger, masker *logmask.Masker) error {
 		"app_version", appVersion, "commit", commit, "providers", redactedProviders(),
 		"pin", pin, "ext_pin", extPin)
 
-	var syncer *ingest.Syncer
+	var (
+		syncer       *ingest.Syncer
+		syncerSource source.Provider
+	)
 	if mode != "server" {
 		provider, rotateEndpoints, err := buildSource(ctx, chainID, log, m)
 		if err != nil {
@@ -145,8 +148,10 @@ func run(log *slog.Logger, masker *logmask.Masker) error {
 		}
 		setEndpoints = rotateEndpoints
 
-		// A node on the wrong chain returns plausible, wrong keys.
-		if identifier, ok := provider.(source.ChainIdentifier); ok {
+		// A node on the wrong chain returns plausible, wrong keys. Endpoint sources are checked per
+		// endpoint by the writer before it starts (verifyChain); this covers a file.
+		_, perEndpoint := provider.(source.ChainVerifier)
+		if identifier, ok := provider.(source.ChainIdentifier); ok && !perEndpoint {
 			actual, err := identifier.ChainID(ctx)
 			if err != nil {
 				log.Warn("could not verify the chain id", "err", err)
@@ -155,6 +160,7 @@ func run(log *slog.Logger, masker *logmask.Masker) error {
 			}
 		}
 
+		syncerSource = provider
 		syncer = ingest.NewSyncer(provider, pgStore, ingest.SyncConfig{
 			Interval:         time.Duration(envInt("UPDATE_KEYS_INTERVAL_MS", 5000)) * time.Millisecond,
 			MaxBlockGap:      int64(envInt("MAX_BLOCKS_OVERLAP", 1000)),
@@ -184,6 +190,10 @@ func run(log *slog.Logger, masker *logmask.Masker) error {
 	} else {
 		go func() {
 			defer close(syncDone)
+			if err := verifyChain(ctx, syncerSource, log); err != nil {
+				errs <- err
+				return
+			}
 			errs <- runWriter(ctx, pgStore, syncer, log)
 		}()
 	}
@@ -251,6 +261,32 @@ func run(log *slog.Logger, masker *logmask.Masker) error {
 	}
 	return exitErr
 }
+
+// verifyChain refuses an endpoint on another chain, and waits with backoff while none answers
+// rather than starting unverified; the API keeps serving meanwhile.
+func verifyChain(ctx context.Context, provider any, log *slog.Logger) error {
+	verifier, ok := provider.(source.ChainVerifier)
+	if !ok {
+		return nil
+	}
+	for wait := chainRetryStart; ; wait = min(2*wait, 30*time.Second) {
+		verified, err := verifier.VerifyChain(ctx)
+		if err != nil {
+			return err
+		}
+		if verified > 0 {
+			return nil
+		}
+		log.Warn("no endpoint has confirmed the chain id yet, retrying", "in", wait.String())
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(wait):
+		}
+	}
+}
+
+var chainRetryStart = time.Second
 
 // runWriter waits for the writer lock without holding up the API: in KEYS_API_MODE=all a rollout
 // keeps the old pod, and its lock, until the new one is ready. Only the writer applies the schema.
@@ -390,6 +426,7 @@ func buildSource(ctx context.Context, chainID int64, log *slog.Logger, m *metric
 		}
 
 		client := eth.NewClient(urls, eth.Options{
+			ChainID:     chainID,
 			Concurrency: envInt("PROVIDER_CONCURRENT_REQUESTS", 8),
 			BatchSize:   envInt("PROVIDER_JSON_RPC_MAX_BATCH_SIZE", 100),
 			Timeout:     time.Duration(envInt("PROVIDER_TIMEOUT_MS", 120_000)) * time.Millisecond,
