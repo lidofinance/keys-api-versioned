@@ -11,8 +11,9 @@ import (
 // Two-int advisory key with a constant class; leases (internal/store) take their class from the
 // schema, so the writer is never read as a lease.
 const (
-	writerLockClass = 0x6b617069 // "kapi"
-	writerLockKey   = `hashtext(current_setting('search_path'))`
+	writerLockClass  = 0x6b617069 // "kapi"
+	migrateLockClass = writerLockClass + 1
+	writerLockKey    = `hashtext(current_setting('search_path'))`
 )
 
 const (

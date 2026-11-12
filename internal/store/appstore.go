@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/lidofinance/keys-api-versioned/internal/ethaddr"
@@ -184,6 +185,10 @@ func resolveAppPin(ctx context.Context, conn pinReader, pin string) (*model.ELBl
 		}
 		return nil, 0, 0, "", classifyMissingAppPin(ctx, conn, pin)
 	}
+	if missingSchema(err) {
+		// Before the writer's first migrate, or while it rebuilds the schema: nothing is published.
+		return nil, 0, 0, "", nil
+	}
 	if err != nil {
 		return nil, 0, 0, "", fmt.Errorf("resolve pin: %w", err)
 	}
@@ -251,6 +256,11 @@ func classifyMissingAppPin(ctx context.Context, conn pinReader, pin string) erro
 		return ErrPruned{Ref: pin}
 	}
 	return ErrNotFound{Ref: pin, What: "snapshot"}
+}
+
+func missingSchema(err error) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && (pgErr.Code == "42P01" || pgErr.Code == "3F000")
 }
 
 func appHead(ctx context.Context, conn pinReader) (int64, string, error) {

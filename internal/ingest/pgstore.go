@@ -88,29 +88,41 @@ func (s *PGStore) Pool() *pgxpool.Pool { return s.pool }
 
 // Migrate rebuilds the schema when the schema.sql fingerprint changes; there is no migration path.
 // A refill costs 14 s on Hoodi, 49 s on mainnet; readers get 425 until the cold sync ends.
+//
+// One transaction under an advisory lock: two image versions racing no longer drop each other's
+// schema mid-apply, and readers see the old layout or the new empty one, never half of either.
 func (s *PGStore) Migrate(ctx context.Context) error {
 	fingerprint := schemaFingerprint(schemaSQL)
 
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("migrate: %w", err)
+	}
+	defer tx.Rollback(ctx)
+	if _, err := tx.Exec(ctx, `select pg_advisory_xact_lock($1, `+writerLockKey+`)`, migrateLockClass); err != nil {
+		return fmt.Errorf("migrate: lock: %w", err)
+	}
+
 	if s.schema != "" {
-		stored, err := s.storedFingerprint(ctx)
+		stored, err := storedFingerprint(ctx, tx)
 		if err != nil {
 			return err
 		}
-		if stored != fingerprint && s.schemaHasTables(ctx) {
-			if _, err := s.pool.Exec(ctx, `drop schema `+pgIdentifier(s.schema)+` cascade`); err != nil {
+		if stored != fingerprint && schemaHasTables(ctx, tx) {
+			if _, err := tx.Exec(ctx, `drop schema `+pgIdentifier(s.schema)+` cascade`); err != nil {
 				return fmt.Errorf("drop schema %s for rebuild: %w", s.schema, err)
 			}
 		}
-		if _, err := s.pool.Exec(ctx, `create schema if not exists `+pgIdentifier(s.schema)); err != nil {
+		if _, err := tx.Exec(ctx, `create schema if not exists `+pgIdentifier(s.schema)); err != nil {
 			return fmt.Errorf("create schema %s: %w", s.schema, err)
 		}
 	}
-	if _, err := s.pool.Exec(ctx, schemaSQL); err != nil {
+	if _, err := tx.Exec(ctx, schemaSQL); err != nil {
 		return fmt.Errorf("apply schema: %w", err)
 	}
 	if s.schema != "" {
 		var landed string
-		err := s.pool.QueryRow(ctx, `select n.nspname from pg_class c
+		err := tx.QueryRow(ctx, `select n.nspname from pg_class c
 			join pg_namespace n on n.oid = c.relnamespace
 			where c.oid = to_regclass('versions')`).Scan(&landed)
 		if err != nil {
@@ -122,20 +134,20 @@ func (s *PGStore) Migrate(ctx context.Context) error {
 		}
 	}
 
-	if _, err := s.pool.Exec(ctx, `
+	if _, err := tx.Exec(ctx, `
 		insert into schema_fingerprint (id, fingerprint) values (1, $1)
 		on conflict (id) do update set fingerprint = excluded.fingerprint, applied_at = now()`,
 		fingerprint); err != nil {
 		return fmt.Errorf("record the schema fingerprint: %w", err)
 	}
-	return nil
+	return tx.Commit(ctx)
 }
 
 // storedFingerprint: "" for a schema with tables means an unknown layout, rebuilt like a mismatch.
-func (s *PGStore) storedFingerprint(ctx context.Context) (string, error) {
+func storedFingerprint(ctx context.Context, tx pgx.Tx) (string, error) {
 	// to_regclass answers NULL for a missing name, including a missing schema, instead of failing.
 	var exists bool
-	if err := s.pool.QueryRow(ctx,
+	if err := tx.QueryRow(ctx,
 		`select to_regclass('schema_fingerprint') is not null`).Scan(&exists); err != nil {
 		return "", fmt.Errorf("look for the schema fingerprint: %w", err)
 	}
@@ -144,7 +156,7 @@ func (s *PGStore) storedFingerprint(ctx context.Context) (string, error) {
 	}
 
 	var fingerprint string
-	err := s.pool.QueryRow(ctx, `select fingerprint from schema_fingerprint where id = 1`).Scan(&fingerprint)
+	err := tx.QueryRow(ctx, `select fingerprint from schema_fingerprint where id = 1`).Scan(&fingerprint)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return "", nil
 	}
@@ -154,9 +166,9 @@ func (s *PGStore) storedFingerprint(ctx context.Context) (string, error) {
 	return fingerprint, nil
 }
 
-func (s *PGStore) schemaHasTables(ctx context.Context) bool {
+func schemaHasTables(ctx context.Context, tx pgx.Tx) bool {
 	var exists bool
-	if err := s.pool.QueryRow(ctx,
+	if err := tx.QueryRow(ctx,
 		`select to_regclass('versions') is not null`).Scan(&exists); err != nil {
 		return false
 	}
