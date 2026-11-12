@@ -75,3 +75,22 @@ func TestARotationToAnotherChainIsRefused(t *testing.T) {
 		t.Errorf("an unreachable endpoint is checked on use, not refused: %v", err)
 	}
 }
+
+func TestABlockHashThatIsNotOneIsRefused(t *testing.T) {
+	for _, hash := range []string{"0x" + strings.Repeat("a", 66), "", "0x12", strings.Repeat("a", 66), "0x" + strings.Repeat("g", 64)} {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			var reqs []rpcRequest
+			_ = json.NewDecoder(r.Body).Decode(&reqs)
+			block, _ := json.Marshal(map[string]string{"number": "0x10", "hash": hash, "timestamp": "0x1"})
+			_ = json.NewEncoder(w).Encode([]rpcResponse{{ID: reqs[0].ID, Result: block}})
+		}))
+		client := NewClient(srv.URL, Options{Concurrency: 1})
+		if _, _, _, err := client.Head(context.Background()); err == nil {
+			t.Errorf("Head accepted block hash %q", hash)
+		}
+		if _, _, _, err := client.FinalizedBlock(context.Background()); err == nil {
+			t.Errorf("FinalizedBlock accepted block hash %q", hash)
+		}
+		srv.Close()
+	}
+}

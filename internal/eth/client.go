@@ -703,6 +703,9 @@ func (c *Client) Head(ctx context.Context) (*big.Int, string, int64, error) {
 	if !ok {
 		return nil, "", 0, fmt.Errorf("bad block number %q", block.Number)
 	}
+	if !isBlockHash(block.Hash) {
+		return nil, "", 0, fmt.Errorf("bad block hash %q", block.Hash)
+	}
 	ts, _ := new(big.Int).SetString(strings.TrimPrefix(block.Timestamp, "0x"), 16)
 	var seconds int64
 	if ts != nil {
@@ -737,6 +740,9 @@ func (c *Client) FinalizedBlock(ctx context.Context) (int64, string, int64, erro
 	n, ok := new(big.Int).SetString(strings.TrimPrefix(block.Number, "0x"), 16)
 	if !ok {
 		return 0, "", 0, fmt.Errorf("bad finalized block number %q", block.Number)
+	}
+	if !isBlockHash(block.Hash) {
+		return 0, "", 0, fmt.Errorf("bad finalized block hash %q", block.Hash)
 	}
 	ts, _ := new(big.Int).SetString(strings.TrimPrefix(block.Timestamp, "0x"), 16)
 	var seconds int64
@@ -783,7 +789,24 @@ func (c *Client) BlockHashByNumber(ctx context.Context, number *big.Int) (string
 	if err := json.Unmarshal(res[0], &block); err != nil {
 		return "", err
 	}
+	if block.Hash != "" && !isBlockHash(block.Hash) {
+		return "", fmt.Errorf("bad block hash %q", block.Hash)
+	}
 	return block.Hash, nil
+}
+
+// isBlockHash: a hash goes into varchar(66) and into every later read as the pin; anything else
+// from a provider is refused here rather than by Postgres on every build.
+func isBlockHash(h string) bool {
+	if len(h) != 66 || h[0] != '0' || (h[1] != 'x' && h[1] != 'X') {
+		return false
+	}
+	for _, c := range h[2:] {
+		if !('0' <= c && c <= '9' || 'a' <= c && c <= 'f' || 'A' <= c && c <= 'F') {
+			return false
+		}
+	}
+	return true
 }
 
 // HasAnyLogs asks for all addresses in one eth_getLogs. Callers group by module family, so no
