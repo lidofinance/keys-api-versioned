@@ -3,6 +3,7 @@ package eth
 import (
 	"context"
 	"encoding/json"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -33,6 +34,10 @@ func TestEndpointFailureClassification(t *testing.T) {
 		{"intrinsic gas", -32000, "intrinsic gas too low", false},
 
 		{"unknown", -32000, "something nobody has seen before", false},
+
+		{"node failure, unknown wording", -32603, "kaboom", true},
+		{"reflected gateway status", 502, "Bad Gateway", true},
+		{"revert code, unknown wording", 3, "0x08c379a0", false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			if got := endpointFailure(tc.code, tc.message); got != tc.endpoint {
@@ -174,4 +179,34 @@ func TestANon2xxStatusFallsThrough(t *testing.T) {
 	if healthyHits.Load() != 1 {
 		t.Errorf("the healthy endpoint got %d requests, want 1", healthyHits.Load())
 	}
+}
+
+func TestAnUnclassifiedErrorIsCountedAndLogged(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var reqs []rpcRequest
+		_ = json.NewDecoder(r.Body).Decode(&reqs)
+		_ = json.NewEncoder(w).Encode([]rpcResponse{rpcErrorWithCode(reqs[0].ID, -32000, "the frobnicator is cold")})
+	}))
+	defer srv.Close()
+	var logged strings.Builder
+	client := NewClient(srv.URL, Options{Concurrency: 1, Log: slog.New(slog.NewTextHandler(&logged, nil))})
+
+	if _, err := client.ChainID(context.Background()); err == nil {
+		t.Fatal("an error answer was taken as a result")
+	}
+	if got := client.Stats().Unclassified; got != 1 {
+		t.Errorf("Unclassified = %d, want 1", got)
+	}
+	if !strings.Contains(logged.String(), "frobnicator") || !strings.Contains(logged.String(), "level=WARN") {
+		t.Errorf("the unknown message was not logged at warn:\n%s", logged.String())
+	}
+}
+
+func rpcErrorWithCode(id, code int, message string) rpcResponse {
+	r := rpcResponse{ID: id}
+	r.Error = &struct {
+		Code    int    `json:"code"`
+		Message string `json:"message"`
+	}{code, message}
+	return r
 }

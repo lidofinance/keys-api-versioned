@@ -66,15 +66,26 @@ var endpointErrorPatterns = []string{
 	"upstream",
 }
 
-// -32005 is Infura/Alchemy "limit exceeded", -32029 a gateway rate limit; 429 and 503 are HTTP
-// statuses reflected into the JSON-RPC error.
+// -32005 is Infura/Alchemy "limit exceeded", -32029 a gateway rate limit, -32601 a method the node
+// lacks, -32603 the node's own failure; HTTP statuses also come reflected into the error.
 var endpointErrorCodes = map[int]bool{
 	-32005: true,
 	-32029: true,
 	-32097: true,
+	-32601: true,
+	-32603: true,
+	401:    true,
+	402:    true,
+	403:    true,
 	429:    true,
+	500:    true,
+	502:    true,
 	503:    true,
+	504:    true,
 }
+
+// 3 is geth's "execution reverted" with revert data: the call's own outcome on any node.
+var callErrorCodes = map[int]bool{3: true}
 
 // Endpoint refusals that are about the request's size, so a smaller aggregate may pass.
 var sizeRefusalPatterns = []string{
@@ -94,22 +105,31 @@ func sizeRefusal(message string) bool {
 	return false
 }
 
-// endpointFailure treats unknown errors as call-level: a wrongly-returned error just fails the
-// cycle, a wrongly-retried one spends requests on every endpoint and still fails.
-func endpointFailure(code int, message string) bool {
+// classify treats unknown errors as call-level: a wrongly-returned error just fails the cycle, a
+// wrongly-retried one spends requests on every endpoint and still fails. known=false is counted
+// and logged, so the lists can follow what providers actually send.
+func classify(code int, message string) (endpoint, known bool) {
 	lower := strings.ToLower(message)
 	for _, pattern := range callErrorPatterns {
 		if strings.Contains(lower, pattern) {
-			return false
+			return false, true
 		}
 	}
 	if endpointErrorCodes[code] {
-		return true
+		return true, true
+	}
+	if callErrorCodes[code] {
+		return false, true
 	}
 	for _, pattern := range endpointErrorPatterns {
 		if strings.Contains(lower, pattern) {
-			return true
+			return true, true
 		}
 	}
-	return false
+	return false, false
+}
+
+func endpointFailure(code int, message string) bool {
+	endpoint, _ := classify(code, message)
+	return endpoint
 }

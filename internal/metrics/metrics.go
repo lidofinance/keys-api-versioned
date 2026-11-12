@@ -66,6 +66,7 @@ const CanonicalPrefix = "lido_keys_api"
 type RPCStats struct {
 	Requests, Calls               int64
 	Aggregates, Splits, Fallbacks int64
+	Unclassified                  int64
 }
 
 func New(namespace string) *Metrics {
@@ -241,6 +242,7 @@ func (m *Metrics) BindRPCStats(namespace string, snapshot func() RPCStats) {
 		{"rpc_aggregates_total", "Requests that carried a Multicall3 aggregate.", func(s RPCStats) int64 { return s.Aggregates }},
 		{"rpc_splits_total", "Aggregates halved after an endpoint refused one. Climbing means the aggregate budget is above what this endpoint tolerates.", func(s RPCStats) int64 { return s.Splits }},
 		{"rpc_fallbacks_total", "Calls that went out plainly rather than aggregated.", func(s RPCStats) int64 { return s.Fallbacks }},
+		{"rpc_unclassified_errors_total", "JSON-RPC errors no rule recognised, treated as the call's own and not failed over. The log line names the message, so a new provider wording can be added to the rules.", func(s RPCStats) int64 { return s.Unclassified }},
 	} {
 		read := spec.read
 		m.registry.MustRegister(prometheus.NewCounterFunc(prometheus.CounterOpts{

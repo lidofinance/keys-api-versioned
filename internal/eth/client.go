@@ -217,26 +217,29 @@ type RequestInfo struct {
 }
 
 type stats struct {
-	requests   atomic.Int64
-	calls      atomic.Int64
-	aggregates atomic.Int64
-	splits     atomic.Int64
-	fallbacks  atomic.Int64
+	requests     atomic.Int64
+	calls        atomic.Int64
+	aggregates   atomic.Int64
+	splits       atomic.Int64
+	fallbacks    atomic.Int64
+	unclassified atomic.Int64
 }
 
 type Stats struct {
 	Requests, Calls int64
 	// Splits: requests halved after a node refused an aggregate; Fallbacks: single calls on the plain path.
 	Aggregates, Splits, Fallbacks int64
+	Unclassified                  int64
 }
 
 func (c *Client) Stats() Stats {
 	return Stats{
-		Requests:   c.stats.requests.Load(),
-		Calls:      c.stats.calls.Load(),
-		Aggregates: c.stats.aggregates.Load(),
-		Splits:     c.stats.splits.Load(),
-		Fallbacks:  c.stats.fallbacks.Load(),
+		Requests:     c.stats.requests.Load(),
+		Calls:        c.stats.calls.Load(),
+		Aggregates:   c.stats.aggregates.Load(),
+		Splits:       c.stats.splits.Load(),
+		Fallbacks:    c.stats.fallbacks.Load(),
+		Unclassified: c.stats.unclassified.Load(),
 	}
 }
 
@@ -567,10 +570,16 @@ func (c *Client) attempt(ctx context.Context, url string, index int, method stri
 			// A call error inside a successful round trip still counts as an error, as in the canonical
 			// middleware: a node answering "out of gas" to everything is broken.
 			c.observed(method, len(reqs), "error", host, took)
-			if endpointFailure(got.Error.Code, got.Error.Message) {
+			endpoint, known := classify(got.Error.Code, got.Error.Message)
+			switch {
+			case endpoint:
 				c.log.Warn("rpc endpoint refused the request, trying the next one",
 					"endpoint", host, "method", method, "calls", len(reqs),
 					"code", got.Error.Code, "err", got.Error.Message)
+			case !known:
+				c.stats.unclassified.Add(1)
+				c.log.Warn("rpc error matches no rule; treated as the call's own, not failed over",
+					"endpoint", host, "method", method, "code", got.Error.Code, "err", got.Error.Message)
 			}
 			return nil, &jsonRPCError{method: r.Method, code: got.Error.Code, message: got.Error.Message}
 		}

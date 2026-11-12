@@ -446,6 +446,7 @@ func buildSource(ctx context.Context, chainID int64, log *slog.Logger, m *metric
 			return metrics.RPCStats{
 				Requests: s.Requests, Calls: s.Calls,
 				Aggregates: s.Aggregates, Splits: s.Splits, Fallbacks: s.Fallbacks,
+				Unclassified: s.Unclassified,
 			}
 		})
 		provider := lidocore.NewProvider(client, locator, lidocore.Options{
