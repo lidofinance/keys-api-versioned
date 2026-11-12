@@ -7,10 +7,12 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"net/http"
 	"net/url"
 	"os"
 	"os/signal"
+	"sort"
 	"strconv"
 	"strings"
 	"syscall"
@@ -69,6 +71,10 @@ func run(log *slog.Logger, masker *logmask.Masker) error {
 		log.Info("configuration: secrets file over the environment", "path", secretsPath)
 	} else {
 		log.Info("configuration: the environment", "path", secretsPath, "reason", "no secrets file")
+	}
+
+	if err := validateEnv(); err != nil {
+		return err
 	}
 
 	var setEndpoints func(string) error
@@ -598,6 +604,56 @@ func defaultExtPin(source string) string {
 		return "latest"
 	}
 	return "finalized"
+}
+
+// envLimits: a typo or a negative used to fall back to the default without a line in the log.
+var envLimits = map[string][2]int64{
+	"CHAIN_ID":                         {0, math.MaxInt64},
+	"DATABASE_MAX_CONNS":               {1, 1000},
+	"PORT":                             {1, 65535},
+	"UPDATE_KEYS_INTERVAL_MS":          {1, 86_400_000},
+	"MAX_BLOCKS_OVERLAP":               {1, math.MaxInt32},
+	"RETAIN_VERSIONS":                  {0, 1_000_000},
+	"SECONDS_PER_SLOT":                 {0, 3600},
+	"SLOTS_PER_EPOCH":                  {0, 1 << 16},
+	"SECRETS_POLL_INTERVAL_IN_SECONDS": {1, 86_400},
+	"PROVIDER_CONCURRENT_REQUESTS":     {1, 1024},
+	"PROVIDER_JSON_RPC_MAX_BATCH_SIZE": {1, 10_000},
+	"PROVIDER_TIMEOUT_MS":              {1, 3_600_000},
+	"PROVIDER_MULTICALL_MAX_CALLS":     {0, 100_000},
+	"PROVIDER_MULTICALL_MAX_KEYS":      {0, 10_000_000},
+	"KEYS_BATCH_SIZE":                  {1, 100_000},
+	"KEYS_CALLS_PER_REQUEST":           {1, 100_000},
+	"KEYS_PER_REQUEST":                 {1, 10_000_000},
+	"KEYS_READ_CONCURRENCY":            {1, 1024},
+}
+
+var envBools = []string{"KEYS_API_BUILD_AT_FINALIZED", "PROVIDER_METERED", "PROVIDER_MULTICALL"}
+
+// validateEnv does not echo values: a credential pasted into the wrong variable stays out of the log.
+func validateEnv() error {
+	var errs []string
+	for key, limits := range envLimits {
+		v := os.Getenv(key)
+		if v == "" {
+			continue
+		}
+		if n, err := strconv.ParseInt(v, 10, 64); err != nil || n < limits[0] || n > limits[1] {
+			errs = append(errs, fmt.Sprintf("%s must be an integer from %d to %d", key, limits[0], limits[1]))
+		}
+	}
+	for _, key := range envBools {
+		if v := os.Getenv(key); v != "" {
+			if _, err := strconv.ParseBool(v); err != nil {
+				errs = append(errs, key+" must be true or false")
+			}
+		}
+	}
+	if len(errs) == 0 {
+		return nil
+	}
+	sort.Strings(errs)
+	return errors.New(strings.Join(errs, "; "))
 }
 
 func envInt(key string, def int) int {

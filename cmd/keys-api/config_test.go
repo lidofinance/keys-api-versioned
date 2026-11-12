@@ -10,6 +10,33 @@ import (
 	"github.com/lidofinance/keys-api-versioned/internal/metrics"
 )
 
+func TestAnUnparsableOrOutOfRangeVariableFailsStartup(t *testing.T) {
+	for key, value := range map[string]string{
+		"PROVIDER_TIMEOUT_MS":         "12O00",
+		"DATABASE_MAX_CONNS":          "-1",
+		"PORT":                        "70000",
+		"KEYS_API_BUILD_AT_FINALIZED": "yes please",
+	} {
+		t.Run(key, func(t *testing.T) {
+			t.Setenv(key, value)
+			err := validateEnv()
+			if err == nil || !strings.Contains(err.Error(), key) {
+				t.Fatalf("%s=%q: got %v, want an error naming it", key, value, err)
+			}
+			if strings.Contains(err.Error(), value) {
+				t.Errorf("the error echoes the value: %v", err)
+			}
+		})
+	}
+
+	t.Setenv("PROVIDER_TIMEOUT_MS", "12000")
+	t.Setenv("KEYS_API_BUILD_AT_FINALIZED", "true")
+	t.Setenv("RETAIN_VERSIONS", "0")
+	if err := validateEnv(); err != nil {
+		t.Fatalf("valid values: %v", err)
+	}
+}
+
 func TestARotatedEndpointListIsValidatedBeforeTheSwap(t *testing.T) {
 	t.Setenv("PROVIDERS_URLS", "https://old.example.com/v3/old-key")
 	swapped := 0
