@@ -484,8 +484,11 @@ func (s *appSnapshot) StreamKeys(ctx context.Context, moduleAddress string, f mo
 		args = append(args, *f.OperatorIndex)
 		q += ` and operator_index = $` + strconv.Itoa(len(args))
 	}
+	// Canonical's order; heap order reshuffles once a module is rewritten. Planned per call: the
+	// cached generic plan sorted module 1 on disk (77 MB, +100 ms a dump) instead of using kv_ident.
+	q += ` order by operator_index, key_index`
 
-	rows, err := s.conn.Query(ctx, q, args...)
+	rows, err := s.conn.Query(ctx, q, append([]any{pgx.QueryExecModeCacheDescribe}, args...)...)
 	if err != nil {
 		return fmt.Errorf("stream keys: %w", err)
 	}
