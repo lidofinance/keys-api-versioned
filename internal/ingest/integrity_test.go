@@ -93,6 +93,38 @@ func TestAPinResolvedWhilePruningGets410(t *testing.T) {
 	}
 }
 
+func TestStagingKeysHoldsNoTransactionOpen(t *testing.T) {
+	db := testpg.New(t, testpg.WithKeyStageBatch(2))
+	ctx := context.Background()
+
+	spec := testreg.Spec{Modules: 1, OperatorsPerModule: 1, KeysPerOperator: 5}
+	build, err := db.Writer.Begin(ctx, testreg.At(db.Block(0)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer build.Abort(ctx)
+	keys, err := build.Keys(ctx, spec.Module(1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer keys.Abort(ctx)
+	for i := 0; i < spec.KeysPerOperator; i++ {
+		if err := keys.Add(ctx, spec.Key(1, 0, i)); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	var open int
+	if err := db.Admin().QueryRow(ctx, `select count(*) from pg_stat_activity
+		where datname = current_database() and state like 'idle in transaction%'
+		  and query like '%staged_keys%'`).Scan(&open); err != nil {
+		t.Fatal(err)
+	}
+	if open != 0 {
+		t.Errorf("%d session(s) idle in a transaction while keys are staged", open)
+	}
+}
+
 func waitForALeaseWaiter(t *testing.T, db *testpg.DB) {
 	t.Helper()
 	deadline := time.Now().Add(5 * time.Second)
