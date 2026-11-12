@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/ethereum/go-ethereum/accounts/abi"
 	"github.com/ethereum/go-ethereum/common"
@@ -22,11 +23,21 @@ type fakeNode struct {
 	// Zero means no limit.
 	maxAggregate int
 	refuseAll    bool
+	// refusal replaces "out of gas" as the message an aggregate is refused with.
+	refusal string
 
-	mu         sync.Mutex
+	mu sync.Mutex
+	// outage is the number of next requests answered with a 503.
+	outage     int
 	requests   int
 	plainCalls int
 	aggregates []int
+}
+
+func (n *fakeNode) set(f func(n *fakeNode)) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	f(n)
 }
 
 func (n *fakeNode) counts() (requests, plainCalls int, aggregates []int) {
@@ -44,7 +55,15 @@ func (n *fakeNode) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	n.mu.Lock()
 	n.requests++
+	down := n.outage > 0
+	if down {
+		n.outage--
+	}
 	n.mu.Unlock()
+	if down {
+		http.Error(w, "service unavailable", http.StatusServiceUnavailable)
+		return
+	}
 
 	out := make([]rpcResponse, 0, len(reqs))
 	for _, req := range reqs {
@@ -81,8 +100,15 @@ func (n *fakeNode) answerAggregate(id int, data []byte) rpcResponse {
 	}
 	calls := *abi.ConvertType(values[0], new([]call3)).(*[]call3)
 
-	if n.refuseAll || (n.maxAggregate > 0 && len(calls) > n.maxAggregate) {
-		return rpcError(id, "out of gas")
+	n.mu.Lock()
+	refuse := n.refuseAll || (n.maxAggregate > 0 && len(calls) > n.maxAggregate)
+	refusal := n.refusal
+	n.mu.Unlock()
+	if refuse {
+		if refusal == "" {
+			refusal = "out of gas"
+		}
+		return rpcError(id, refusal)
 	}
 
 	n.mu.Lock()
@@ -442,5 +468,138 @@ func TestMeteredDoesNotWrapASingleCall(t *testing.T) {
 	_, plain, aggregates := node.counts()
 	if plain != 1 || len(aggregates) != 0 {
 		t.Errorf("plain=%d aggregates=%v, want one plain call and no aggregate", plain, aggregates)
+	}
+}
+
+// An outage is not a size limit: bisecting on it once left the budget at 1 for the rest of the run.
+func TestAnOutageDoesNotShrinkTheAggregateBudget(t *testing.T) {
+	node := &fakeNode{code: []byte{0x60, 0x00}}
+	client := newTestClient(t, node, true)
+	ctx := context.Background()
+
+	if _, err := client.CallBatch(ctx, BlockRef{Tag: "latest"}, nonceCalls(8)); err != nil {
+		t.Fatalf("warm-up: %v", err)
+	}
+	budget := client.mcMaxCost.Load()
+
+	node.set(func(n *fakeNode) { n.outage = 1 })
+	if _, err := client.CallBatch(ctx, BlockRef{Tag: "latest"}, nonceCalls(8)); err == nil {
+		t.Fatal("got an answer through a 503 from the only endpoint")
+	}
+	if got := client.mcMaxCost.Load(); got != budget {
+		t.Errorf("budget went from %d to %d after a 503", budget, got)
+	}
+	if stats := client.Stats(); stats.Splits != 0 || stats.Fallbacks != 0 {
+		t.Errorf("got stats %+v, want no split and no fallback for an outage", stats)
+	}
+
+	calls := nonceCalls(8)
+	results, err := client.CallBatch(ctx, BlockRef{Tag: "latest"}, calls)
+	if err != nil {
+		t.Fatalf("after the outage: %v", err)
+	}
+	assertNonces(t, calls, results)
+	if _, _, aggregates := node.counts(); aggregates[len(aggregates)-1] != 8 {
+		t.Errorf("got aggregates %v, want the last one to carry all 8 calls", aggregates)
+	}
+}
+
+// Providers report a size limit as an endpoint error; it must still bisect, not fail the read.
+func TestASizeRefusalStillBisects(t *testing.T) {
+	node := &fakeNode{code: []byte{0x60, 0x00}, maxAggregate: 2, refusal: "response size exceeded"}
+	client := newTestClient(t, node, true)
+
+	calls := nonceCalls(5)
+	results, err := client.CallBatch(context.Background(), BlockRef{Tag: "latest"}, calls)
+	if err != nil {
+		t.Fatalf("CallBatch: %v", err)
+	}
+	assertNonces(t, calls, results)
+	if stats := client.Stats(); stats.Splits == 0 {
+		t.Errorf("got stats %+v, want the refused aggregate split", stats)
+	}
+}
+
+func TestAggregationResumesAfterThePause(t *testing.T) {
+	node := &fakeNode{code: []byte{0x60, 0x00}, refuseAll: true}
+	client := newTestClient(t, node, true)
+	clock := newFakeClock()
+	client.now = clock.Now
+	ctx := context.Background()
+
+	for round := 0; round < maxAggregateFallbacks; round++ {
+		if _, err := client.CallBatch(ctx, BlockRef{Tag: "latest"}, nonceCalls(4)); err != nil {
+			t.Fatalf("round %d: %v", round, err)
+		}
+	}
+	if client.aggregationEnabled() {
+		t.Fatal("aggregation still on after repeated single-call refusals")
+	}
+
+	node.set(func(n *fakeNode) { n.refuseAll = false })
+	clock.advance(aggregationPause + time.Second)
+	if !client.aggregationEnabled() {
+		t.Fatal("aggregation still off after the pause")
+	}
+	if got := client.mcMaxCost.Load(); got != defaultMulticallMaxCost {
+		t.Errorf("budget is %d after the pause, want the configured %d", got, defaultMulticallMaxCost)
+	}
+	before := client.Stats().Aggregates
+	if _, err := client.CallBatch(ctx, BlockRef{Tag: "latest"}, nonceCalls(4)); err != nil {
+		t.Fatalf("after the pause: %v", err)
+	}
+	if client.Stats().Aggregates == before {
+		t.Error("no aggregate went out after the pause")
+	}
+}
+
+func TestRefusalsSpreadOverTimeDoNotPauseAggregation(t *testing.T) {
+	client := NewClient("http://unused", Options{Multicall: true})
+	clock := newFakeClock()
+	client.now = clock.Now
+	client.mcProbed, client.mcPresent = true, true
+
+	for i := 0; i < 2*maxAggregateFallbacks; i++ {
+		client.noteSingleCallRefusal()
+		if !client.aggregationEnabled() {
+			t.Fatalf("paused after refusal %d, %s apart", i+1, aggregateFallbackWindow/2)
+		}
+		clock.advance(aggregateFallbackWindow/2 + time.Second)
+	}
+}
+
+func TestSetURLsForgetsWhatWasLearnedAboutTheOldEndpoints(t *testing.T) {
+	bare := &fakeNode{}
+	bareServer := httptest.NewServer(bare)
+	t.Cleanup(bareServer.Close)
+	withMulticall := &fakeNode{code: []byte{0x60, 0x00}}
+	multicallServer := httptest.NewServer(withMulticall)
+	t.Cleanup(multicallServer.Close)
+
+	client := NewClient(bareServer.URL, Options{Concurrency: 1, BatchSize: 2, Multicall: true})
+	ctx := context.Background()
+	if _, err := client.CallBatch(ctx, BlockRef{Tag: "latest"}, nonceCalls(4)); err != nil {
+		t.Fatalf("before rotation: %v", err)
+	}
+	client.lowerBudget(1)
+	client.endpointFailed(bareServer.URL)
+
+	if err := client.SetURLs(multicallServer.URL); err != nil {
+		t.Fatalf("SetURLs: %v", err)
+	}
+	if got := client.mcMaxCost.Load(); got != defaultMulticallMaxCost {
+		t.Errorf("budget is %d after rotation, want the configured %d", got, defaultMulticallMaxCost)
+	}
+	if len(client.health) != 0 {
+		t.Errorf("failure counts of the old endpoints survived rotation: %v", client.health)
+	}
+	calls := nonceCalls(4)
+	results, err := client.CallBatch(ctx, BlockRef{Tag: "latest"}, calls)
+	if err != nil {
+		t.Fatalf("after rotation: %v", err)
+	}
+	assertNonces(t, calls, results)
+	if _, _, aggregates := withMulticall.counts(); len(aggregates) == 0 {
+		t.Error("the new endpoint has multicall but the old probe answer was kept")
 	}
 }

@@ -76,6 +76,24 @@ var endpointErrorCodes = map[int]bool{
 	503:    true,
 }
 
+// Endpoint refusals that are about the request's size, so a smaller aggregate may pass.
+var sizeRefusalPatterns = []string{
+	"response size exceeded",
+	"response too large",
+	"request entity too large",
+	"payload too large",
+}
+
+func sizeRefusal(message string) bool {
+	lower := strings.ToLower(message)
+	for _, pattern := range sizeRefusalPatterns {
+		if strings.Contains(lower, pattern) {
+			return true
+		}
+	}
+	return false
+}
+
 // endpointFailure treats unknown errors as call-level: a wrongly-returned error just fails the
 // cycle, a wrongly-retried one spends requests on every endpoint and still fails.
 func endpointFailure(code int, message string) bool {

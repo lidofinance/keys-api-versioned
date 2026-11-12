@@ -12,6 +12,7 @@ import (
 	"io"
 	"log/slog"
 	"math/big"
+	"net"
 	"net/http"
 	neturl "net/url"
 	"strings"
@@ -99,14 +100,23 @@ type Client struct {
 	batchSz int
 	log     *slog.Logger
 
-	multicall  bool
-	metered    bool
-	mcAddress  string
-	mcMaxCalls int
-	mcMaxCost  atomic.Int64
-	mcMu       sync.Mutex
-	mcProbed   bool
-	mcPresent  bool
+	multicall     bool
+	metered       bool
+	mcAddress     string
+	mcMaxCalls    int
+	mcMaxCost     atomic.Int64
+	mcInitialCost int64
+	mcMu          sync.Mutex
+	mcProbed      bool
+	mcPresent     bool
+	mcFallbacks   int
+	mcWindowStart time.Time
+	mcPausedUntil time.Time
+
+	healthMu sync.Mutex
+	health   map[string]*endpointHealth
+
+	now func() time.Time
 
 	observe func(RequestInfo)
 
@@ -125,22 +135,36 @@ func (c *Client) endpoints() []string {
 	return out
 }
 
-// SetURLs: in-flight requests keep their endpoints; an empty list is refused.
+// SetURLs: in-flight requests keep their endpoints; an empty list is refused. What was learned
+// about the old endpoints (multicall presence, budget, failures) is dropped.
 func (c *Client) SetURLs(urls string) error {
 	list := splitURLs(urls)
 	if len(list) == 0 {
 		return errors.New("no usable endpoints")
 	}
 	c.urlsMu.Lock()
-	defer c.urlsMu.Unlock()
 	c.urls = list
+	c.urlsMu.Unlock()
+
+	c.mcMu.Lock()
+	c.mcProbed, c.mcPresent = false, false
+	c.mcFallbacks, c.mcWindowStart, c.mcPausedUntil = 0, time.Time{}, time.Time{}
+	c.mcMaxCost.Store(c.mcInitialCost)
+	c.mcMu.Unlock()
+
+	c.healthMu.Lock()
+	c.health = map[string]*endpointHealth{}
+	c.healthMu.Unlock()
 	return nil
 }
 
 type Options struct {
 	Concurrency int
 	BatchSize   int
-	Timeout     time.Duration
+	// Timeout bounds a whole attempt, body included; the two below fail a dead endpoint early.
+	Timeout               time.Duration
+	ConnectTimeout        time.Duration
+	ResponseHeaderTimeout time.Duration
 	// Multicall packs a multi-call read into one aggregate3; presence is probed and the plain path
 	// stays as the fallback.
 	Multicall        bool
@@ -210,6 +234,12 @@ func NewClient(urls string, o Options) *Client {
 	if o.Timeout == 0 {
 		o.Timeout = 60 * time.Second
 	}
+	if o.ConnectTimeout <= 0 {
+		o.ConnectTimeout = defaultConnectTimeout
+	}
+	if o.ResponseHeaderTimeout <= 0 {
+		o.ResponseHeaderTimeout = defaultResponseHeaderTimeout
+	}
 	if o.MulticallAddress == "" {
 		o.MulticallAddress = MulticallAddress
 	}
@@ -226,21 +256,72 @@ func NewClient(urls string, o Options) *Client {
 		o.Log = slog.New(slog.NewTextHandler(io.Discard, nil))
 	}
 
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.DialContext = (&net.Dialer{Timeout: o.ConnectTimeout, KeepAlive: 30 * time.Second}).DialContext
+	transport.TLSHandshakeTimeout = o.ConnectTimeout
+	transport.ResponseHeaderTimeout = o.ResponseHeaderTimeout
+
 	c := &Client{
-		urls:       list,
-		http:       &http.Client{Timeout: o.Timeout},
-		sem:        make(chan struct{}, o.Concurrency),
-		batchSz:    o.BatchSize,
-		log:        o.Log,
-		multicall:  o.Multicall,
-		metered:    o.Metered,
-		mcAddress:  strings.ToLower(o.MulticallAddress),
-		mcMaxCalls: o.MulticallMaxCalls,
-		observe:    o.Observe,
+		urls: list,
+		http: &http.Client{
+			Timeout:   o.Timeout,
+			Transport: transport,
+			// A redirect would re-send the request body to a host of the provider's choosing.
+			CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+		},
+		sem:           make(chan struct{}, o.Concurrency),
+		batchSz:       o.BatchSize,
+		log:           o.Log,
+		multicall:     o.Multicall,
+		metered:       o.Metered,
+		mcAddress:     strings.ToLower(o.MulticallAddress),
+		mcMaxCalls:    o.MulticallMaxCalls,
+		mcInitialCost: int64(o.MulticallMaxCost),
+		observe:       o.Observe,
+		health:        map[string]*endpointHealth{},
+		now:           time.Now,
 	}
 	c.mcMaxCost.Store(int64(o.MulticallMaxCost))
 	return c
 }
+
+// The largest legitimate answer, a batch of keys, is under 1 MiB.
+const maxResponseBytes = 64 << 20
+
+const (
+	defaultConnectTimeout        = 5 * time.Second
+	defaultResponseHeaderTimeout = 30 * time.Second
+)
+
+// After breakerThreshold consecutive failures an endpoint moves to the back of the list for
+// breakerCooldown; it is still tried when every endpoint ahead of it fails.
+const (
+	breakerThreshold = 3
+	breakerCooldown  = 30 * time.Second
+)
+
+type endpointHealth struct {
+	failures  int
+	openUntil time.Time
+}
+
+// jsonRPCError is an error object inside a successful HTTP answer.
+type jsonRPCError struct {
+	method  string
+	code    int
+	message string
+}
+
+func (e *jsonRPCError) Error() string {
+	return fmt.Sprintf("%s: rpc error %d: %s", e.method, e.code, e.message)
+}
+
+type httpStatusError struct {
+	status int
+	host   string
+}
+
+func (e *httpStatusError) Error() string { return fmt.Sprintf("http %d from %s", e.status, e.host) }
 
 type rpcRequest struct {
 	JSONRPC string `json:"jsonrpc"`
@@ -284,102 +365,159 @@ func (c *Client) do(ctx context.Context, reqs []rpcRequest) ([]json.RawMessage, 
 	}
 
 	var lastErr error
-	endpoints := c.endpoints()
+	endpoints := c.attemptOrder(c.endpoints())
 	for i, url := range endpoints {
-		req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
-		if err != nil {
+		results, err := c.attempt(ctx, url, i, method, body, reqs)
+		if err == nil {
+			c.endpointSucceeded(url)
+			return results, nil
+		}
+		// Our own cancellation says nothing about the endpoint.
+		if ctx.Err() != nil {
 			return nil, err
 		}
-		req.Header.Set("Content-Type", "application/json")
-
-		started := time.Now()
-		c.stats.requests.Add(1)
-		resp, err := c.http.Do(req)
-		if err != nil {
-			c.observed(method, len(reqs), "error", hostOf(url), time.Since(started))
-			// *url.Error embeds the full URL, key included: redact before anything logs or wraps it.
-			lastErr = redactErr(err)
-			c.log.Warn("rpc endpoint failed, trying the next one",
-				"endpoint", hostOf(url), "method", method, "calls", len(reqs), "err", lastErr)
-			continue
+		var rpcErr *jsonRPCError
+		if errors.As(err, &rpcErr) && !endpointFailure(rpcErr.code, rpcErr.message) {
+			// A call failure: every endpoint would answer the same.
+			c.endpointSucceeded(url)
+			return nil, err
 		}
-
-		var out []rpcResponse
-		err = json.NewDecoder(resp.Body).Decode(&out)
-		status := resp.StatusCode
-		resp.Body.Close()
-		took := time.Since(started)
-		if err != nil {
-			c.observed(method, len(reqs), "error", hostOf(url), took)
-			lastErr = fmt.Errorf("decode: %w", err)
-			c.log.Warn("rpc response could not be decoded",
-				"endpoint", hostOf(url), "method", method, "status", status, "err", err)
-			continue
-		}
-
-		// A 429 with a body that happens to parse would otherwise read as a valid empty answer.
-		if status < 200 || status >= 300 {
-			c.observed(method, len(reqs), "error", hostOf(url), took)
-			lastErr = fmt.Errorf("http %d from %s", status, hostOf(url))
-			c.log.Warn("rpc endpoint answered with a non-2xx status, trying the next one",
-				"endpoint", hostOf(url), "method", method, "status", status)
-			continue
-		}
-
-		c.log.Debug("rpc",
-			"method", method, "calls", len(reqs), "endpoint", hostOf(url),
-			"took", took.Round(time.Millisecond).String(), "request_bytes", len(body),
-			"fallback_index", i)
-
-		byID := make(map[int]rpcResponse, len(out))
-		for _, r := range out {
-			byID[r.ID] = r
-		}
-
-		results := make([]json.RawMessage, len(reqs))
-		var (
-			callErr error
-			refused bool
-			refusal string
-			refCode int
-		)
-		for i, r := range reqs {
-			got, ok := byID[r.ID]
-			if !ok {
-				c.observed(method, len(reqs), "error", hostOf(url), took)
-				return nil, fmt.Errorf("no response for id %d (%s)", r.ID, r.Method)
-			}
-			if got.Error != nil {
-				// A call error inside a successful round trip still counts as an error, as in the canonical
-				// middleware: a node answering "out of gas" to everything is broken.
-				c.observed(method, len(reqs), "error", hostOf(url), took)
-				err := fmt.Errorf("%s: rpc error %d: %s", r.Method, got.Error.Code, got.Error.Message)
-
-				// Endpoint failure: try the next endpoint. Call failure: every endpoint would answer the same.
-				if endpointFailure(got.Error.Code, got.Error.Message) {
-					refused, refusal, refCode = true, got.Error.Message, got.Error.Code
-					lastErr = err
-				} else {
-					callErr = err
-				}
-				break
-			}
-			results[i] = got.Result
-		}
-		if callErr != nil {
-			return nil, callErr
-		}
-		if refused {
-			c.log.Warn("rpc endpoint refused the request, trying the next one",
-				"endpoint", hostOf(url), "method", method, "calls", len(reqs),
-				"code", refCode, "err", refusal)
-			continue
-		}
-		c.observed(method, len(reqs), "success", hostOf(url), took)
-		return results, nil
+		c.endpointFailed(url)
+		lastErr = err
 	}
 
 	return nil, fmt.Errorf("all %d endpoint(s) failed, last: %w", len(endpoints), lastErr)
+}
+
+// attempt is one round trip to one endpoint; every failure is logged here with its host only.
+func (c *Client) attempt(ctx context.Context, url string, index int, method string, body []byte, reqs []rpcRequest) ([]json.RawMessage, error) {
+	host := hostOf(url)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
+	if err != nil {
+		return nil, redactErr(err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	started := time.Now()
+	c.stats.requests.Add(1)
+	resp, err := c.http.Do(req)
+	if err != nil {
+		c.observed(method, len(reqs), "error", host, time.Since(started))
+		// *url.Error embeds the full URL, key included: redact before anything logs or wraps it.
+		err = redactErr(err)
+		c.log.Warn("rpc endpoint failed, trying the next one",
+			"endpoint", host, "method", method, "calls", len(reqs), "err", err)
+		return nil, err
+	}
+
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes+1))
+	resp.Body.Close()
+	status := resp.StatusCode
+	took := time.Since(started)
+	if err == nil && len(raw) > maxResponseBytes {
+		err = fmt.Errorf("response larger than %d MiB", maxResponseBytes>>20)
+	}
+	if err != nil {
+		c.observed(method, len(reqs), "error", host, took)
+		err = redactErr(err)
+		c.log.Warn("rpc response could not be read, trying the next endpoint",
+			"endpoint", host, "method", method, "status", status, "err", err)
+		return nil, err
+	}
+
+	// A 429 with a body that happens to parse would otherwise read as a valid empty answer.
+	if status < 200 || status >= 300 {
+		c.observed(method, len(reqs), "error", host, took)
+		c.log.Warn("rpc endpoint answered with a non-2xx status, trying the next one",
+			"endpoint", host, "method", method, "status", status)
+		return nil, &httpStatusError{status: status, host: host}
+	}
+
+	var out []rpcResponse
+	if err := json.Unmarshal(raw, &out); err != nil {
+		c.observed(method, len(reqs), "error", host, took)
+		c.log.Warn("rpc response could not be decoded",
+			"endpoint", host, "method", method, "status", status, "err", err)
+		return nil, fmt.Errorf("decode: %w", err)
+	}
+
+	c.log.Debug("rpc",
+		"method", method, "calls", len(reqs), "endpoint", host,
+		"took", took.Round(time.Millisecond).String(), "request_bytes", len(body),
+		"fallback_index", index)
+
+	byID := make(map[int]rpcResponse, len(out))
+	for _, r := range out {
+		byID[r.ID] = r
+	}
+
+	results := make([]json.RawMessage, len(reqs))
+	for i, r := range reqs {
+		got, ok := byID[r.ID]
+		if !ok {
+			c.observed(method, len(reqs), "error", host, took)
+			c.log.Warn("rpc response is missing an id, trying the next endpoint",
+				"endpoint", host, "method", method, "id", r.ID)
+			return nil, fmt.Errorf("no response for id %d (%s) from %s", r.ID, r.Method, host)
+		}
+		if got.Error != nil {
+			// A call error inside a successful round trip still counts as an error, as in the canonical
+			// middleware: a node answering "out of gas" to everything is broken.
+			c.observed(method, len(reqs), "error", host, took)
+			if endpointFailure(got.Error.Code, got.Error.Message) {
+				c.log.Warn("rpc endpoint refused the request, trying the next one",
+					"endpoint", host, "method", method, "calls", len(reqs),
+					"code", got.Error.Code, "err", got.Error.Message)
+			}
+			return nil, &jsonRPCError{method: r.Method, code: got.Error.Code, message: got.Error.Message}
+		}
+		results[i] = got.Result
+	}
+	c.observed(method, len(reqs), "success", host, took)
+	return results, nil
+}
+
+// attemptOrder keeps the configured order, with endpoints in their cool-down moved to the back.
+func (c *Client) attemptOrder(endpoints []string) []string {
+	c.healthMu.Lock()
+	defer c.healthMu.Unlock()
+	now := c.now()
+	ordered := make([]string, 0, len(endpoints))
+	var cooling []string
+	for _, url := range endpoints {
+		if h := c.health[url]; h != nil && now.Before(h.openUntil) {
+			cooling = append(cooling, url)
+			continue
+		}
+		ordered = append(ordered, url)
+	}
+	return append(ordered, cooling...)
+}
+
+func (c *Client) endpointFailed(url string) {
+	c.healthMu.Lock()
+	defer c.healthMu.Unlock()
+	h := c.health[url]
+	if h == nil {
+		h = &endpointHealth{}
+		c.health[url] = h
+	}
+	h.failures++
+	if h.failures < breakerThreshold {
+		return
+	}
+	now := c.now()
+	if !now.Before(h.openUntil) {
+		c.log.Warn("rpc endpoint keeps failing, trying it last for a while",
+			"endpoint", hostOf(url), "failures", h.failures, "cooldown", breakerCooldown.String())
+	}
+	h.openUntil = now.Add(breakerCooldown)
+}
+
+func (c *Client) endpointSucceeded(url string) {
+	c.healthMu.Lock()
+	defer c.healthMu.Unlock()
+	delete(c.health, url)
 }
 
 func (c *Client) observed(method string, calls int, result, endpoint string, d time.Duration) {

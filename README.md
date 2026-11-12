@@ -233,7 +233,7 @@ Hoodi also gives the cleanest measurement of what aggregation is for, because th
 
 **The ceiling that shaped the design.** An aggregate's inner calls share one `eth_call` gas budget while separate calls in a JSON-RPC batch each get their own. Two reads of 1100 curated keys in one aggregate come back `out of gas` from mainnet geth; 200 reads of one key each are fine. So aggregates are bounded by *keys returned* rather than by call count (`Call.Cost`), and a read too expensive to share goes out plainly. The first version bounded them by count, which cost nothing on the CSM tail and quietly wrecked module 1 — it bisected on every group, then dragged a permanently lowered call cap into the modules after it, turning CSM's 22 requests into 908. Worth recording because both halves of the mistake were invisible in a per-module run: the failure showed up only in a full sync, in the module that had not failed.
 
-Nothing about this needs configuring per endpoint. Presence of the contract is probed once (devnets have none), a refused aggregate is bisected and the budget lowered to what worked, and an endpoint that refuses even a single aggregated read turns aggregation off for the process. `PROVIDER_MULTICALL=false` is the manual escape hatch.
+Nothing about this needs configuring per endpoint. Presence of the contract is probed once (devnets have none), a refused aggregate is bisected and the budget lowered to what worked, and an endpoint that refuses a single aggregated read three times within ten minutes pauses aggregation for thirty, after which the budget starts again from the configured value. Only a refusal of the aggregate itself (a call-level error such as `out of gas`, or a response-size limit) bisects; a transport failure or a non-2xx status is returned as it is, so an outage cannot shrink the budget. Rotating `PROVIDERS_URLS` forgets the probe answer and the budget. `PROVIDER_MULTICALL=false` is the manual escape hatch.
 
 ### The endpoint list is a fallback list, and it has to behave like one
 
@@ -248,8 +248,11 @@ What a failed call has to answer is not "did it fail" but "is this about the end
 | expired or invalid key, `unauthorized` | `gas required exceeds allowance` |
 | method or archive state the node does not serve | `intrinsic gas too low` |
 | a non-2xx HTTP status, whatever the body says | anything unrecognised |
+| a redirect, a response missing a requested id, a body over 64 MiB | |
 
 `out of gas` staying in the right-hand column is load bearing rather than tidy: the Multicall3 bisect is driven by seeing it, so failing over would break the aggregation described above. Unrecognised wording also stays on the right — a wrongly-retried call spends a request on every provider and still fails, while a wrongly-returned one fails the cycle and is retried on the next tick anyway.
+
+An attempt fails early on a dead endpoint (5 s to connect, 30 s to the response headers; `PROVIDER_TIMEOUT_MS` bounds the whole attempt), and an endpoint that fails three times in a row is tried last for 30 s — still asked when everything ahead of it fails.
 
 `keys_api_rpc_endpoint_requests_total{endpoint,result}` makes the failover visible, which matters because the hazard of a fallback list is not noticing the first entry died.
 

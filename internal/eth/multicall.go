@@ -3,8 +3,11 @@ package eth
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"net/http"
 	"strings"
+	"time"
 
 	"github.com/ethereum/go-ethereum/accounts/abi"
 	"github.com/ethereum/go-ethereum/common"
@@ -21,9 +24,13 @@ const (
 	defaultMulticallMaxCost  = 1000
 )
 
-// maxAggregateFallbacks: an endpoint refusing an aggregate of one refuses all of them, so after
-// this many the client stops aggregating instead of bisecting every group.
-const maxAggregateFallbacks = 3
+// An endpoint refusing an aggregate of one refuses all of them: after maxAggregateFallbacks such
+// refusals within the window, aggregation pauses, then resumes with the configured budget.
+const (
+	maxAggregateFallbacks   = 3
+	aggregateFallbackWindow = 10 * time.Minute
+	aggregationPause        = 30 * time.Minute
+)
 
 // Field names must match the ABI's: that is how the tuple coder maps them.
 type call3 struct {
@@ -47,7 +54,7 @@ func (c *Client) aggregateReady(ctx context.Context, at BlockRef) bool {
 	c.mcMu.Lock()
 	defer c.mcMu.Unlock()
 	if c.mcProbed {
-		return c.mcPresent
+		return c.aggregationOnLocked()
 	}
 
 	code, err := c.Code(ctx, c.mcAddress, at)
@@ -158,6 +165,9 @@ func (c *Client) aggregateChunk(ctx context.Context, at BlockRef, calls []Call, 
 		},
 	}})
 	if err != nil {
+		if !aggregateRefused(err) {
+			return err
+		}
 		return c.aggregateFallback(ctx, at, calls, out, err)
 	}
 
@@ -191,6 +201,19 @@ func (c *Client) aggregateChunk(ctx context.Context, at BlockRef, calls []Call, 
 	return nil
 }
 
+// aggregateRefused: an outage read as a size limit would shrink the budget for the rest of the run.
+func aggregateRefused(err error) bool {
+	var status *httpStatusError
+	if errors.As(err, &status) {
+		return status.status == http.StatusRequestEntityTooLarge
+	}
+	var rpcErr *jsonRPCError
+	if !errors.As(err, &rpcErr) {
+		return false
+	}
+	return !endpointFailure(rpcErr.code, rpcErr.message) || sizeRefusal(rpcErr.message)
+}
+
 // aggregateFallback finds the size an endpoint tolerates by bisection and remembers it. A single
 // call that still fails goes plain, which reports the real error.
 func (c *Client) aggregateFallback(ctx context.Context, at BlockRef, calls []Call, out [][]any, cause error) error {
@@ -202,9 +225,7 @@ func (c *Client) aggregateFallback(ctx context.Context, at BlockRef, calls []Cal
 		c.stats.fallbacks.Add(1)
 		c.log.Warn("aggregate failed for a single call, sending it plainly",
 			"method", calls[0].Method, "to", calls[0].To, "err", cause)
-		if c.stats.fallbacks.Load() >= maxAggregateFallbacks {
-			c.disableAggregation("this endpoint refuses aggregated calls even one at a time")
-		}
+		c.noteSingleCallRefusal()
 		return c.callPlain(ctx, at, calls, out)
 	}
 
@@ -224,22 +245,44 @@ func (c *Client) aggregateFallback(ctx context.Context, at BlockRef, calls []Cal
 func (c *Client) aggregationEnabled() bool {
 	c.mcMu.Lock()
 	defer c.mcMu.Unlock()
-	return c.mcPresent
+	return c.aggregationOnLocked()
+}
+
+func (c *Client) aggregationOnLocked() bool {
+	if !c.mcPresent {
+		return false
+	}
+	if c.mcPausedUntil.IsZero() {
+		return true
+	}
+	if c.now().Before(c.mcPausedUntil) {
+		return false
+	}
+	c.mcPausedUntil = time.Time{}
+	c.mcMaxCost.Store(c.mcInitialCost)
+	c.log.Info("multicall resumed", "budget", c.mcInitialCost)
+	return true
 }
 
 // Info, not warn: one call per read degrades throughput, not correctness.
-func (c *Client) disableAggregation(reason string) {
+func (c *Client) noteSingleCallRefusal() {
 	c.mcMu.Lock()
 	defer c.mcMu.Unlock()
-	if !c.mcPresent {
+	now := c.now()
+	if now.Sub(c.mcWindowStart) > aggregateFallbackWindow {
+		c.mcWindowStart, c.mcFallbacks = now, 0
+	}
+	c.mcFallbacks++
+	if c.mcFallbacks < maxAggregateFallbacks || now.Before(c.mcPausedUntil) {
 		return
 	}
-	c.mcPresent = false
-	c.log.Info("multicall disabled, calls go one per read from here on",
-		"reason", reason, "fallbacks", c.stats.fallbacks.Load())
+	c.mcPausedUntil = now.Add(aggregationPause)
+	c.mcFallbacks = 0
+	c.log.Info("multicall paused, calls go one per read: the endpoint refuses aggregates even one at a time",
+		"pause", aggregationPause.String(), "fallbacks", c.stats.fallbacks.Load())
 }
 
-// lowerBudget only ever lowers: endpoint limits don't move during a run.
+// lowerBudget only lowers: a limit seen once holds until a pause or an endpoint rotation resets it.
 func (c *Client) lowerBudget(to int) {
 	if to < 1 {
 		to = 1
