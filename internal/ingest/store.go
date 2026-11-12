@@ -114,6 +114,9 @@ type Pruned struct {
 	HeldAt int64
 }
 
+// ErrBuildBehind: the store holds a version or rows above the block a build was asked for.
+var ErrBuildBehind = errors.New("the store holds data above this block; a build here would rewrite it")
+
 // ErrVersionExists: the sync loop treats it as "nothing to do this cycle".
 var ErrVersionExists = errors.New("a version with this block identity already exists")
 

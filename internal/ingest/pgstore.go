@@ -242,7 +242,29 @@ func (s *PGStore) Recent(ctx context.Context, limit int) ([]StoredVersion, error
 	return out, rows.Err()
 }
 
+// Begin refuses a block below what the store already holds: Commit closes rows at the build's
+// block, so a lower build after a higher one rewrites ranges the newer version reads.
 func (s *PGStore) Begin(ctx context.Context, at model.ELBlockSnapshot) (Build, error) {
+	var (
+		newerVersion bool
+		newestRow    int64
+	)
+	if err := s.pool.QueryRow(ctx, `
+		select exists (
+		         select 1 from versions
+		          where status in ('published', 'stale', 'building')
+		            and (block_number > $1 or (block_number = $1 and block_hash <> $2))),
+		       coalesce(greatest(
+		         (select max(from_block) from key_version), (select max(to_block) from key_version),
+		         (select max(from_block) from operator_version), (select max(to_block) from operator_version),
+		         (select max(from_block) from module_version), (select max(to_block) from module_version)), 0)`,
+		at.BlockNumber, strings.ToLower(at.BlockHash)).Scan(&newerVersion, &newestRow); err != nil {
+		return nil, fmt.Errorf("begin version: check for newer data: %w", err)
+	}
+	if newerVersion || newestRow > at.BlockNumber {
+		return nil, ErrBuildBehind
+	}
+
 	var id int64
 	err := s.pool.QueryRow(ctx, `
 		insert into versions
