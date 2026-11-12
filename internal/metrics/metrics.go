@@ -284,6 +284,19 @@ func (m *Metrics) SetBuildInfo(name, version, env, network string) {
 	m.BuildInfo.WithLabelValues(name, version, env, network).Set(1)
 }
 
+// SetBuildCommit is separate from build_info, whose label set is the canonical service's.
+func (m *Metrics) SetBuildCommit(namespace, version, commit string) {
+	if namespace == "" {
+		namespace = "keys_api"
+	}
+	info := prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Namespace: namespace, Name: "build_info",
+		Help: "The build this process runs: semantic version and the commit it was built from.",
+	}, []string{"version", "commit"})
+	m.registry.MustRegister(info)
+	info.WithLabelValues(version, commit).Set(1)
+}
+
 func (m *Metrics) Handler() http.Handler {
 	return promhttp.HandlerFor(m.registry, promhttp.HandlerOpts{})
 }

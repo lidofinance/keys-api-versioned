@@ -32,6 +32,9 @@ import (
 // appVersion is read by consumers from /v1/status, so it stays semver, not a build hash.
 const appVersion = "0.1.0-poc"
 
+// commit is set at build time: -ldflags "-X main.commit=<sha>".
+var commit = "unknown"
+
 const metricsNamespace = "keys_api"
 
 func main() {
@@ -94,6 +97,7 @@ func run(log *slog.Logger, masker *logmask.Masker) error {
 	// build_info's `network` label is the chain id: canonical dashboards filter on it.
 	m.SetBuildInfo("keys-api-versioned", appVersion,
 		envOr("KEYS_API_ENV", "unknown"), strconv.FormatInt(chainID, 10))
+	m.SetBuildCommit(metricsNamespace, appVersion, commit)
 
 	// One schema per chain: otherwise a store from another chain looks like a reorg deeper than the
 	// window and is silently rebuilt from scratch.
@@ -116,7 +120,7 @@ func run(log *slog.Logger, masker *logmask.Masker) error {
 
 	log.Info("keys-api starting",
 		"mode", mode, "source", envOr("KEYS_API_SOURCE", "lido-core"),
-		"app_version", appVersion, "providers", redactedProviders(),
+		"app_version", appVersion, "commit", commit, "providers", redactedProviders(),
 		"pin", pin, "ext_pin", extPin)
 
 	var syncer *ingest.Syncer

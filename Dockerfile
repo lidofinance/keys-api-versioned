@@ -8,7 +8,8 @@ COPY go.mod go.sum ./
 RUN go mod download
 
 COPY . .
-RUN CGO_ENABLED=0 go build -trimpath -o /out/keys-api ./cmd/keys-api
+ARG COMMIT=unknown
+RUN CGO_ENABLED=0 go build -trimpath -ldflags "-X main.commit=${COMMIT}" -o /out/keys-api ./cmd/keys-api
 
 FROM building AS building-tools
 RUN CGO_ENABLED=0 go build -trimpath -o /out/diff ./cmd/diff \
