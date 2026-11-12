@@ -18,7 +18,8 @@ import (
 
 func main() {
 	var (
-		rpc         = flag.String("rpc", envOr("PROVIDERS_URLS", ""), "comma separated execution endpoints")
+		// Not defaulted from the environment: -h prints defaults, and a hosted URL carries its key.
+		rpc         = flag.String("rpc", "", "comma separated execution endpoints (default $PROVIDERS_URLS)")
 		locator     = flag.String("locator", envOr("LIDO_LOCATOR", ""), "Lido Locator address (required)")
 		modulesOnly = flag.Bool("modules-only", false, "stop after reading modules and nonces")
 		moduleID    = flag.Int("module", 0, "read one module id only; 0 means every module")
@@ -36,6 +37,9 @@ func main() {
 		verbose     = flag.Bool("v", false, "debug logging: one line per JSON-RPC request")
 	)
 	flag.Parse()
+	if *rpc == "" {
+		*rpc = os.Getenv("PROVIDERS_URLS")
+	}
 
 	level := slog.LevelInfo
 	if *verbose {

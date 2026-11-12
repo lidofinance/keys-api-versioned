@@ -106,14 +106,6 @@ services:
       LOG_LEVEL: ${LOG_LEVEL:-info}
     ports:
       - "3010:3000"
-    healthcheck:
-      # Liveness, not readiness: the first mainnet sync takes minutes and the
-      # container must not be killed while it is doing it.
-      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:3000/health || exit 1"]
-      interval: 10s
-      timeout: 5s
-      retries: 6
-      start_period: 30s
 
   canonical:
     build:
@@ -181,7 +173,9 @@ services:
   # probing a node. Unlimited on CPU because they are the measuring instrument, and
   # a throttled generator measures itself.
   tools:
-    build: .
+    build:
+      context: .
+      target: tools
     profiles: ["tools"]
     environment:
       DATABASE_URL: postgres://postgres:postgres@db:5432/keys_api_app?sslmode=disable
