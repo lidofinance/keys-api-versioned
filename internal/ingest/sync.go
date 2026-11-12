@@ -32,6 +32,8 @@ type Syncer struct {
 	lastFinalizedAt time.Time
 	// finalized is reused between epoch reads: a pin one epoch stale is still final.
 	finalized model.ELBlockSnapshot
+	// retentionHeldAt is the last prune's HeldAt, reported on every cycle.
+	retentionHeldAt int64
 
 	now func() time.Time
 	// wait sleeps between cycles; tests replace it to record the schedule.
@@ -99,6 +101,10 @@ type CycleResult struct {
 	Duration  time.Duration
 	Err       error
 	Panicked  bool
+	// RetentionHeldAt is the last prune's HeldAt (0 = not held). UnfinishedBuilds counts versions left
+	// in building, -1 when the store cannot say.
+	RetentionHeldAt  int64
+	UnfinishedBuilds int64
 }
 
 func NewSyncer(src source.Provider, store Store, cfg SyncConfig, log *slog.Logger) *Syncer {
@@ -184,6 +190,8 @@ func (s *Syncer) Cycle(ctx context.Context) (result CycleResult) {
 			result.Panicked = true
 		}
 		result.Duration = time.Since(started)
+		result.RetentionHeldAt = s.retentionHeldAt
+		result.UnfinishedBuilds = s.unfinishedBuilds(ctx)
 	}()
 
 	head, err := s.source.Head(ctx)
@@ -739,6 +747,7 @@ func (s *Syncer) prune(ctx context.Context) {
 		s.log.Warn("prune failed", "err", err)
 		return
 	}
+	s.retentionHeldAt = pruned.HeldAt
 	if pruned.HeldAt > 0 {
 		// Warn: a slow consumer and a leaked lease look the same for one cycle; only repetition tells.
 		s.log.Warn("retention held back by a reader still streaming an older version",
@@ -753,6 +762,22 @@ func (s *Syncer) prune(ctx context.Context) {
 			"keeping", s.cfg.RetainVersions, "oldest_kept_block", pruned.OldestKept,
 			"versions_dropped", pruned.Versions, "rows_dropped", pruned.Rows)
 	}
+}
+
+// unfinishedBuilds runs after the cycle, when no build of this writer is open, so every building
+// row is one a dead writer left.
+func (s *Syncer) unfinishedBuilds(ctx context.Context) int64 {
+	counter, ok := s.store.(BuildCounter)
+	if !ok {
+		return -1
+	}
+	countCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	defer cancel()
+	n, err := counter.UnfinishedBuilds(countCtx)
+	if err != nil {
+		return -1
+	}
+	return n
 }
 
 func moduleNonces(modules []model.StakingModule) []ModuleNonce {

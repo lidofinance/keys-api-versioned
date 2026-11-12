@@ -35,6 +35,10 @@ type Metrics struct {
 
 	RequestDuration *prometheus.HistogramVec
 	ResponseBytes   *prometheus.CounterVec
+	InFlight        prometheus.Gauge
+
+	RetentionHeldAt  prometheus.Gauge
+	UnfinishedBuilds prometheus.Gauge
 
 	RPCRequests *prometheus.CounterVec
 
@@ -148,6 +152,18 @@ func New(namespace string) *Metrics {
 			Namespace: namespace, Name: "http_response_bytes_total",
 			Help: "Response bytes by route. Dumps are the reason this matters.",
 		}, []string{"route"}),
+		InFlight: prometheus.NewGauge(prometheus.GaugeOpts{
+			Namespace: namespace, Name: "http_requests_in_flight",
+			Help: "Requests being served, dumps included.",
+		}),
+		RetentionHeldAt: prometheus.NewGauge(prometheus.GaugeOpts{
+			Namespace: namespace, Name: "retention_held_at_block",
+			Help: "The block the last prune stopped at below its window, 0 when it did not. A reader's lease or the finalized version holds it; a value that never moves is a leaked lease, and storage grows.",
+		}),
+		UnfinishedBuilds: prometheus.NewGauge(prometheus.GaugeOpts{
+			Namespace: namespace, Name: "unfinished_builds",
+			Help: "Versions left in building between cycles: a writer that died mid-build. They are never served and retention drops them.",
+		}),
 		SecretsReloads: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Namespace: namespace, Name: "secrets_reloads_total",
 			Help: "Secrets picked up from the file, by outcome (success, failure, restart_required). A rising restart_required means the file holds a value this process is not using.",
@@ -221,7 +237,7 @@ func New(namespace string) *Metrics {
 	reg.MustRegister(m.CyclesTotal, m.CyclePanics, m.CycleDuration, m.KeysRead, m.KeysChanged,
 		m.VersionBlock, m.VersionAge, m.ConfirmedAge, m.HeadBlock, m.BlocksBehind, m.VersionStale,
 		m.RebuildsTotal, m.ReorgsTotal, m.AuditsTotal, m.AuditDivergenceTotal,
-		m.RequestDuration, m.ResponseBytes,
+		m.RequestDuration, m.ResponseBytes, m.InFlight, m.RetentionHeldAt, m.UnfinishedBuilds,
 		m.SecretsReloads, m.RPCRequests, m.RPCCalls, m.EndpointRequests, m.RouterChanges, m.RouterVersion, m.VersionChanges,
 		m.ELRPCDuration, m.CanonicalHTTP, m.BuildInfo, m.JobDuration, m.ModuleKeyUpdate,
 		m.LastUpdate, m.LastBlockNumber, m.Nonce, m.KeysByModuleAndOp)
@@ -249,6 +265,74 @@ func (m *Metrics) BindRPCStats(namespace string, snapshot func() RPCStats) {
 			Namespace: namespace, Name: spec.name, Help: spec.help,
 		}, func() float64 { return float64(read(snapshot())) }))
 	}
+}
+
+// PoolStats is pgxpool.Stat, copied so metrics stays a leaf package.
+type PoolStats struct {
+	Acquired, Idle, Total, Max int32
+	Acquires, EmptyAcquires    int64
+	CanceledAcquires           int64
+	AcquireWait                time.Duration
+}
+
+// BindPoolStats: a request holds a connection for its whole response, so saturation (acquired at
+// max, empty acquires climbing) is what a stalled consumer or a slow database looks like.
+func (m *Metrics) BindPoolStats(namespace string, snapshot func() PoolStats) {
+	gauges := []struct {
+		name, help string
+		read       func(PoolStats) float64
+	}{
+		{"db_pool_acquired_connections", "Connections handed out: a dump holds one until its last byte.", func(s PoolStats) float64 { return float64(s.Acquired) }},
+		{"db_pool_idle_connections", "Connections open and free.", func(s PoolStats) float64 { return float64(s.Idle) }},
+		{"db_pool_connections", "Connections open.", func(s PoolStats) float64 { return float64(s.Total) }},
+		{"db_pool_max_connections", "The pool's ceiling (DATABASE_MAX_CONNS).", func(s PoolStats) float64 { return float64(s.Max) }},
+	}
+	for _, g := range gauges {
+		read := g.read
+		m.registry.MustRegister(prometheus.NewGaugeFunc(prometheus.GaugeOpts{
+			Namespace: namespace, Name: g.name, Help: g.help,
+		}, func() float64 { return read(snapshot()) }))
+	}
+	counters := []struct {
+		name, help string
+		read       func(PoolStats) float64
+	}{
+		{"db_pool_acquires_total", "Connections acquired.", func(s PoolStats) float64 { return float64(s.Acquires) }},
+		{"db_pool_empty_acquires_total", "Acquires that had to wait for a connection.", func(s PoolStats) float64 { return float64(s.EmptyAcquires) }},
+		{"db_pool_canceled_acquires_total", "Acquires given up before a connection came free, the acquire timeout included.", func(s PoolStats) float64 { return float64(s.CanceledAcquires) }},
+		{"db_pool_acquire_wait_seconds_total", "Time spent acquiring connections.", func(s PoolStats) float64 { return s.AcquireWait.Seconds() }},
+	}
+	for _, c := range counters {
+		read := c.read
+		m.registry.MustRegister(prometheus.NewCounterFunc(prometheus.CounterOpts{
+			Namespace: namespace, Name: c.name, Help: c.help,
+		}, func() float64 { return read(snapshot()) }))
+	}
+}
+
+// BindAggregation exports the client's aggregate state. A budget stuck low or aggregation off on a
+// metered provider multiplies billed calls, and nothing else shows it.
+func (m *Metrics) BindAggregation(namespace string, read func() (budget int64, enabled bool)) {
+	m.registry.MustRegister(
+		prometheus.NewGaugeFunc(prometheus.GaugeOpts{
+			Namespace: namespace, Name: "rpc_aggregate_budget",
+			Help: "Keys one Multicall3 aggregate may return. It drops when an endpoint refuses a bigger one and comes back after a pause or a rotation.",
+		}, func() float64 { budget, _ := read(); return float64(budget) }),
+		prometheus.NewGaugeFunc(prometheus.GaugeOpts{
+			Namespace: namespace, Name: "rpc_aggregation_enabled",
+			Help: "1 while reads go out as Multicall3 aggregates; 0 before the presence probe, without Multicall3, or while paused after repeated refusals.",
+		}, func() float64 {
+			if _, enabled := read(); enabled {
+				return 1
+			}
+			return 0
+		}))
+}
+
+// CountInFlight wraps the HTTP handler: dumps are long, so the request rate alone hides how many
+// are open at once.
+func (m *Metrics) CountInFlight(next http.Handler) http.Handler {
+	return promhttp.InstrumentHandlerInFlight(m.InFlight, next)
 }
 
 // ObserveRPC: our series is labelled by method, the canonical histogram is not.

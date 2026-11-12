@@ -352,6 +352,12 @@ func (s *PGStore) MarkStale(ctx context.Context, v StoredVersion) error {
 	return nil
 }
 
+func (s *PGStore) UnfinishedBuilds(ctx context.Context) (int64, error) {
+	var n int64
+	err := s.pool.QueryRow(ctx, `select count(*) from versions where status = 'building'`).Scan(&n)
+	return n, err
+}
+
 // SupersedeFrom keeps superseded versions' rows so pins get 409 rather than 404. Rows only on the
 // losing branch are dropped, and rows it closed are reopened.
 func (s *PGStore) SupersedeFrom(ctx context.Context, block int64) (Superseded, error) {

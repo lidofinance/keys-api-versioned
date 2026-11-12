@@ -124,6 +124,14 @@ func run(log *slog.Logger, masker *logmask.Masker) error {
 		return err
 	}
 	defer pgStore.Close()
+	m.BindPoolStats(metricsNamespace, func() metrics.PoolStats {
+		s := pgStore.Pool().Stat()
+		return metrics.PoolStats{
+			Acquired: s.AcquiredConns(), Idle: s.IdleConns(), Total: s.TotalConns(), Max: s.MaxConns(),
+			Acquires: s.AcquireCount(), EmptyAcquires: s.EmptyAcquireCount(),
+			CanceledAcquires: s.CanceledAcquireCount(), AcquireWait: s.AcquireDuration(),
+		}
+	})
 
 	// chain_id and schema on every line: a mainnet node against a Hoodi store looks healthy in the log.
 	schema := pgStore.Schema()
@@ -211,7 +219,7 @@ func run(log *slog.Logger, masker *logmask.Masker) error {
 			Observe:        m.ObserveRequest,
 		}).Handler()
 
-		server = newHTTPServer(":"+envOr("PORT", "3000"), handler)
+		server = newHTTPServer(":"+envOr("PORT", "3000"), m.CountInFlight(handler))
 
 		go func() {
 			log.Info("http listening", "addr", server.Addr, "mode", mode)
@@ -464,6 +472,7 @@ func buildSource(ctx context.Context, chainID int64, log *slog.Logger, m *metric
 		})
 		log.Info("source: lido core",
 			"locator", locator, "module_types", strings.Join(provider.SupportedTypes(), ","))
+		m.BindAggregation(metricsNamespace, client.Aggregation)
 		return provider, client.SetURLs, nil
 
 	case "static":
@@ -513,6 +522,10 @@ func observeCycle(m *metrics.Metrics, r ingest.CycleResult) {
 		m.CyclePanics.Inc()
 	}
 	m.CycleDuration.Observe(r.Duration.Seconds())
+	m.RetentionHeldAt.Set(float64(r.RetentionHeldAt))
+	if r.UnfinishedBuilds >= 0 {
+		m.UnfinishedBuilds.Set(float64(r.UnfinishedBuilds))
+	}
 	m.KeysRead.Add(float64(r.KeysStaged))
 	m.KeysChanged.Add(float64(r.KeysChanged))
 

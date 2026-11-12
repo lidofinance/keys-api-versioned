@@ -152,3 +152,8 @@ func (e ExistingVersionError) Error() string {
 func (e ExistingVersionError) Is(target error) bool { return target == ErrVersionExists }
 
 func (e ExistingVersionError) Done() bool { return e.Status == "published" || e.Status == "stale" }
+
+// BuildCounter is optional: versions in building status, for a gauge.
+type BuildCounter interface {
+	UnfinishedBuilds(ctx context.Context) (int64, error)
+}
