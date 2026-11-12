@@ -1,6 +1,8 @@
 package api
 
 import (
+	"errors"
+	"fmt"
 	"net/http"
 	"slices"
 
@@ -33,9 +35,13 @@ func (s *Server) handleKeysDiff(w http.ResponseWriter, r *http.Request) {
 
 	ctx := r.Context()
 
-	// Buffered so the counts can lead in meta; a diff is small by construction.
+	// Buffered so the counts can lead in meta. Usually kilobytes, but `since` at the oldest retained
+	// version after a module rewrite is the whole registry twice, so the buffer is capped.
 	var removed, added []model.Key
 	meta, err := differ.DiffKeys(ctx, since, q.Get("to"), moduleRef, func(kind store.DiffKind, k *model.Key) error {
+		if len(removed)+len(added) >= s.maxDiffKeys() {
+			return errDiffTooLarge
+		}
 		copied := *k
 		copied.Key = model.EncodeHex(k.PubkeyBin)
 		copied.DepositSignature = model.EncodeHex(k.SignatureBin)
@@ -48,6 +54,11 @@ func (s *Server) handleKeysDiff(w http.ResponseWriter, r *http.Request) {
 		}
 		return nil
 	})
+	if errors.Is(err, errDiffTooLarge) {
+		writeStatusMessage(w, http.StatusRequestEntityTooLarge, fmt.Sprintf(
+			"the diff holds more than %d keys; read a full dump at the newer version instead", s.maxDiffKeys()))
+		return
+	}
 	if err != nil {
 		if !writeStoreError(w, err) {
 			writeError(w, http.StatusBadRequest, err.Error())
@@ -73,6 +84,17 @@ func (s *Server) handleKeysDiff(w http.ResponseWriter, r *http.Request) {
 	bw.WriteString(`, "added": `)
 	bw.Write(marshalCompact(added))
 	bw.WriteString(`}}`)
+}
+
+const maxDiffKeys = 100_000
+
+var errDiffTooLarge = errors.New("diff too large")
+
+func (s *Server) maxDiffKeys() int {
+	if s.cfg.MaxDiffKeys > 0 {
+		return s.cfg.MaxDiffKeys
+	}
+	return maxDiffKeys
 }
 
 // handleModulesDiff is trustworthy where canonical lastChangedBlockHash is not: the stamp moves on

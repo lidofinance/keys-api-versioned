@@ -75,6 +75,8 @@ jobs:
           context: .
           push: true
           tags: ${{ env.REGISTRY }}/${{ env.REPOSITORY }}/${{ env.APP }}:${{ env.IMAGE_TAG }}
+          build-args: |
+            COMMIT=${{ github.sha }}
           # The Go build is the slow part and it is identical between runs that touch
           # neither go.sum nor the sources it compiles.
           cache-from: type=gha

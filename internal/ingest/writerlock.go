@@ -8,11 +8,12 @@ import (
 	"github.com/jackc/pgx/v5"
 )
 
-// The writer lock uses the two-int advisory key; leases use the single-bigint one, and pg_locks
-// tells them apart (objsubid 2 vs 1), so the writer is never read as a lease.
+// Two-int advisory key with a constant class; leases (internal/store) take their class from the
+// schema, so the writer is never read as a lease.
 const (
-	writerLockClass = 0x6b617069 // "kapi"
-	writerLockKey   = `hashtext(current_setting('search_path'))`
+	writerLockClass  = 0x6b617069 // "kapi"
+	migrateLockClass = writerLockClass + 1
+	writerLockKey    = `hashtext(current_setting('search_path'))`
 )
 
 const (

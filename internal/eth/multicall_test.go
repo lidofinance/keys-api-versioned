@@ -603,3 +603,22 @@ func TestSetURLsForgetsWhatWasLearnedAboutTheOldEndpoints(t *testing.T) {
 		t.Error("the new endpoint has multicall but the old probe answer was kept")
 	}
 }
+
+func TestAggregationReportsTheBudgetAndWhetherItIsOn(t *testing.T) {
+	node := &fakeNode{code: []byte{0x60, 0x00}}
+	client := newTestClient(t, node, true)
+	if _, on := client.Aggregation(); on {
+		t.Error("aggregation reported on before the presence probe")
+	}
+	if _, err := client.CallBatch(context.Background(), BlockRef{Tag: "latest"}, nonceCalls(5)); err != nil {
+		t.Fatal(err)
+	}
+	budget, on := client.Aggregation()
+	if !on || budget != defaultMulticallMaxCost {
+		t.Errorf("after a probe: budget %d, on %t; want %d and true", budget, on, defaultMulticallMaxCost)
+	}
+	client.lowerBudget(40)
+	if budget, _ := client.Aggregation(); budget != 40 {
+		t.Errorf("budget %d after a refusal lowered it to 40", budget)
+	}
+}

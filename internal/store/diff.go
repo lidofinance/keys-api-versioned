@@ -2,9 +2,12 @@ package store
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
+
+	"github.com/jackc/pgx/v5"
 
 	"github.com/lidofinance/keys-api-versioned/internal/model"
 )
@@ -49,7 +52,7 @@ func (a *App) DiffKeys(ctx context.Context, since, to string, moduleRef string, 
 	}
 	// Leasing the older end keeps its closed rows (all above it) from retention between the two side
 	// queries.
-	releaseFrom, err := leaseVersion(ctx, conn, fromBlock)
+	releaseFrom, err := LeaseVersion(ctx, conn, fromBlock)
 	if err != nil {
 		return nil, err
 	}
@@ -123,6 +126,10 @@ func versionIdentity(ctx context.Context, conn pinReader, block int64) (*model.E
 		from versions where block_number = $1
 		order by (status = '`+StatusPublished+`') desc, id desc limit 1`, block).
 		Scan(&m.BlockNumber, &m.BlockHash, &m.Timestamp, &m.LastChangedBlockHash)
+	if errors.Is(err, pgx.ErrNoRows) {
+		// Pruned between resolving the pin and leasing it.
+		return nil, ErrPruned{Ref: strconv.FormatInt(block, 10)}
+	}
 	if err != nil {
 		return nil, fmt.Errorf("version identity at %d: %w", block, err)
 	}
@@ -199,7 +206,7 @@ func (a *App) ModuleDiff(ctx context.Context, since, to string) (map[int32]bool,
 		return nil, err
 	}
 	if fromBlock > 0 {
-		release, err := leaseVersion(ctx, conn, fromBlock)
+		release, err := LeaseVersion(ctx, conn, fromBlock)
 		if err != nil {
 			return nil, err
 		}

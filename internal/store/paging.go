@@ -36,7 +36,11 @@ func ParseKeyCursor(s string) (KeyCursor, error) {
 		values [4]int64
 	)
 	for i, p := range parts {
-		n, err := strconv.ParseInt(p, 10, 64)
+		bits := 32
+		if i == 0 {
+			bits = 64
+		}
+		n, err := strconv.ParseInt(p, 10, bits)
 		if err != nil {
 			return KeyCursor{}, fmt.Errorf("cursor part %d is not a number: %q", i+1, p)
 		}

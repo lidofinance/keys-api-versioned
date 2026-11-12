@@ -44,14 +44,15 @@ func decodeStakingModules(v any, version int64) ([]rawModule, error) {
 	out := make([]rawModule, 0, rv.Len())
 	for i := 0; i < rv.Len(); i++ {
 		item := rv.Index(i)
+		id := int32(fieldInt(item, "Id"))
 		m := rawModule{
-			id:                    int32(fieldInt(item, "Id")),
+			id:                    id,
 			address:               strings.ToLower(fieldAddress(item, "StakingModuleAddress")),
 			moduleFee:             int32(fieldInt(item, "StakingModuleFee")),
 			treasuryFee:           int32(fieldInt(item, "TreasuryFee")),
 			targetShare:           int32(fieldInt(item, "StakeShareLimit")),
 			status:                int32(fieldInt(item, "Status")),
-			name:                  fieldString(item, "Name"),
+			name:                  sanitized(fieldString(item, "Name"), "invalidName"+strconv.Itoa(int(id))),
 			lastDepositAt:         fieldInt(item, "LastDepositAt"),
 			lastDepositBlock:      fieldInt(item, "LastDepositBlock"),
 			exitedValidatorsCount: int32(fieldInt(item, "ExitedValidatorsCount")),
@@ -77,9 +78,9 @@ func decodeStakingModules(v any, version int64) ([]rawModule, error) {
 func decodeModuleType(v any) (string, error) {
 	switch t := v.(type) {
 	case string:
-		return t, nil
+		return sanitized(t, "invalidType"), nil
 	case [32]byte:
-		return strings.TrimRight(string(t[:]), "\x00"), nil
+		return sanitized(strings.TrimRight(string(t[:]), "\x00"), "invalidType"), nil
 	default:
 		return "", fmt.Errorf("getType: unexpected type %T", v)
 	}
@@ -165,10 +166,16 @@ func decodeCommunityOperator(index int32, moduleAddress string, values []any) (m
 // operatorName: Postgres text rejects invalid UTF-8 and NUL, so one such name would stop the
 // ingest; the canonical placeholder replaces it.
 func operatorName(name string, index int32) string {
-	if !utf8.ValidString(name) || strings.ContainsRune(name, 0) {
-		return "invalidName" + strconv.Itoa(int(index))
+	return sanitized(name, "invalidName"+strconv.Itoa(int(index)))
+}
+
+// sanitized: Postgres rejects NUL and invalid UTF-8 in text, which failed every build until the
+// chain changed the value.
+func sanitized(s, placeholder string) string {
+	if !utf8.ValidString(s) || strings.ContainsRune(s, 0) {
+		return placeholder
 	}
-	return name
+	return s
 }
 
 // depositableValidatorsCount is the last output of getNodeOperatorSummary in both ABIs.

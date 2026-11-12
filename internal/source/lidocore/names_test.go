@@ -34,3 +34,30 @@ func TestCuratedUndecodableNamesGetThePlaceholder(t *testing.T) {
 		}
 	}
 }
+
+func TestUndecodableModuleNamesAndTypesGetAPlaceholder(t *testing.T) {
+	type tuple struct {
+		Id                   uint16
+		StakingModuleAddress [20]byte
+		Name                 string
+	}
+	modules, err := decodeStakingModules([]tuple{{Id: 3, Name: "nul\x00name"}, {Id: 4, Name: "bad\xc3"}, {Id: 5, Name: "fine"}}, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i, want := range []string{"invalidName3", "invalidName4", "fine"} {
+		if modules[i].name != want {
+			t.Errorf("module %d name %q, want %q", modules[i].id, modules[i].name, want)
+		}
+	}
+
+	var raw [32]byte
+	copy(raw[:], "curated\x00\xffv1")
+	if got, _ := decodeModuleType(raw); got != "invalidType" {
+		t.Errorf("type with NUL and invalid UTF-8 decoded as %q", got)
+	}
+	copy(raw[:], "curated-onchain-v1")
+	if got, _ := decodeModuleType([32]byte(append([]byte("curated-onchain-v1"), make([]byte, 14)...))); got != "curated-onchain-v1" {
+		t.Errorf("a padded type decoded as %q", got)
+	}
+}

@@ -242,6 +242,15 @@ func (c *Client) aggregateFallback(ctx context.Context, at BlockRef, calls []Cal
 	return c.aggregateChunk(ctx, at, calls[mid:], out[mid:])
 }
 
+// Aggregation reports the aggregate cost budget and whether aggregates go out now: false before
+// the presence probe, without Multicall3, or while paused.
+func (c *Client) Aggregation() (budget int64, enabled bool) {
+	c.mcMu.Lock()
+	defer c.mcMu.Unlock()
+	paused := !c.mcPausedUntil.IsZero() && c.now().Before(c.mcPausedUntil)
+	return c.mcMaxCost.Load(), c.multicall && c.mcPresent && !paused
+}
+
 func (c *Client) aggregationEnabled() bool {
 	c.mcMu.Lock()
 	defer c.mcMu.Unlock()

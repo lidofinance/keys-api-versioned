@@ -32,6 +32,8 @@ type Syncer struct {
 	lastFinalizedAt time.Time
 	// finalized is reused between epoch reads: a pin one epoch stale is still final.
 	finalized model.ELBlockSnapshot
+	// retentionHeldAt is the last prune's HeldAt, reported on every cycle.
+	retentionHeldAt int64
 
 	now func() time.Time
 	// wait sleeps between cycles; tests replace it to record the schedule.
@@ -99,6 +101,10 @@ type CycleResult struct {
 	Duration  time.Duration
 	Err       error
 	Panicked  bool
+	// RetentionHeldAt is the last prune's HeldAt (0 = not held). UnfinishedBuilds counts versions left
+	// in building, -1 when the store cannot say.
+	RetentionHeldAt  int64
+	UnfinishedBuilds int64
 }
 
 func NewSyncer(src source.Provider, store Store, cfg SyncConfig, log *slog.Logger) *Syncer {
@@ -184,6 +190,8 @@ func (s *Syncer) Cycle(ctx context.Context) (result CycleResult) {
 			result.Panicked = true
 		}
 		result.Duration = time.Since(started)
+		result.RetentionHeldAt = s.retentionHeldAt
+		result.UnfinishedBuilds = s.unfinishedBuilds(ctx)
 	}()
 
 	head, err := s.source.Head(ctx)
@@ -232,7 +240,7 @@ func (s *Syncer) Cycle(ctx context.Context) (result CycleResult) {
 		result.Reason = "no published version"
 		result.VersionTimestamp = head.Timestamp
 		s.log.Info("cold start: no published version, reading every module", "head", head.BlockNumber)
-		if err := s.rebuild(ctx, readAt, nil, DepthKeys, finalized, &result); err != nil {
+		if err := s.rebuild(ctx, readAt, nil, DepthKeys, 0, true, finalized, &result); err != nil {
 			result.Err = err
 		} else {
 			result.VersionBlock = head.BlockNumber
@@ -308,7 +316,7 @@ func (s *Syncer) Cycle(ctx context.Context) (result CycleResult) {
 			result.Action = ActionSupersede
 			result.Reason = fmt.Sprintf("reorg below the whole retained window (fork at %d): rebuilding from scratch", forkPoint)
 			s.log.Warn("reorg left no version to build on, rebuilding from scratch", "fork_point", forkPoint)
-			if err := s.rebuild(ctx, readAt, nil, DepthKeys, finalized, &result); err != nil {
+			if err := s.rebuild(ctx, readAt, nil, DepthKeys, 0, true, finalized, &result); err != nil {
 				result.Err = err
 			} else {
 				result.VersionBlock = head.BlockNumber
@@ -387,7 +395,7 @@ func (s *Syncer) Cycle(ctx context.Context) (result CycleResult) {
 			result.Err = err
 			return result
 		}
-		if err := s.rebuild(ctx, readAt, decision.ChangedModules, decision.Depth, finalized, &result); err != nil {
+		if err := s.rebuild(ctx, readAt, decision.ChangedModules, decision.Depth, latest.BlockNumber, !decision.Audit, finalized, &result); err != nil {
 			result.Err = err
 			break
 		}
@@ -407,7 +415,8 @@ func (s *Syncer) Cycle(ctx context.Context) (result CycleResult) {
 }
 
 // rebuild inherits modules outside scope (nil = all) at no cost: their rows simply stay open.
-func (s *Syncer) rebuild(ctx context.Context, head model.ELBlockSnapshot, scope []string, depth ReadDepth, finalized int64, result *CycleResult) error {
+// published is the newest published block (0 = none); rows above it are an unfinished attempt's.
+func (s *Syncer) rebuild(ctx context.Context, head model.ELBlockSnapshot, scope []string, depth ReadDepth, published int64, reuse bool, finalized int64, result *CycleResult) error {
 	at := source.Ref{BlockHash: head.BlockHash, BlockNumber: head.BlockNumber}
 
 	modules, err := s.source.Modules(ctx, at)
@@ -419,6 +428,11 @@ func (s *Syncer) rebuild(ctx context.Context, head model.ELBlockSnapshot, scope 
 	}
 	if len(result.Modules) == 0 {
 		result.Modules = moduleNonces(modules)
+	}
+
+	leftovers, err := s.leftovers(ctx, published)
+	if err != nil {
+		return err
 	}
 
 	build, err := s.store.Begin(ctx, head)
@@ -448,6 +462,20 @@ func (s *Syncer) rebuild(ctx context.Context, head model.ELBlockSnapshot, scope 
 		read := depth
 		if inScope != nil && !inScope[m.RawAddress()] {
 			read = DepthModule
+		}
+		keysKept := false
+		if left, ok := leftovers[m.ID]; ok {
+			switch {
+			case reuse && left.reusable(m):
+				// A failed attempt wrote this module's keys at a block still on chain, at today's
+				// nonce: a cold mainnet retry skips 40 s of module 1 reads.
+				read, keysKept = DepthOperators, true
+				s.log.Info("module: keys kept from an unfinished attempt",
+					"module", m.ID, "nonce", m.Nonce, "attempt_block", left.Block)
+			default:
+				// Rows of an attempt that cannot be trusted would be inherited as they are.
+				read = DepthKeys
+			}
 		}
 		if read == DepthModule {
 			s.log.Debug("module: metadata only, contents inherited",
@@ -487,7 +515,7 @@ func (s *Syncer) rebuild(ctx context.Context, head model.ELBlockSnapshot, scope 
 		if err != nil {
 			return err
 		}
-		contentChanged = contentChanged || changed > 0
+		contentChanged = contentChanged || changed > 0 || (keysKept && (inScope == nil || inScope[m.RawAddress()]))
 
 		s.log.Info("module written",
 			"module", m.ID, "type", m.Type, "nonce", m.Nonce, "reads", read.String(),
@@ -523,6 +551,35 @@ func (s *Syncer) rebuild(ctx context.Context, head model.ELBlockSnapshot, scope 
 		"block", head.BlockNumber, "modules", len(modules),
 		"scoped_to", len(inScope), "keys_read", result.KeysStaged, "keys_changed", result.KeysChanged)
 	return nil
+}
+
+func (s *Syncer) leftovers(ctx context.Context, published int64) (map[int32]Leftover, error) {
+	reporter, ok := s.store.(LeftoverReporter)
+	if !ok {
+		return nil, nil
+	}
+	list, err := reporter.Leftovers(ctx, published)
+	if err != nil {
+		return nil, fmt.Errorf("rows of unfinished attempts: %w", err)
+	}
+	out := make(map[int32]Leftover, len(list))
+	canonical := map[int64]bool{}
+	for _, left := range list {
+		if left.Complete {
+			onChain, seen := canonical[left.Block]
+			if !seen {
+				hash, err := s.source.BlockHashAt(ctx, left.Block)
+				if err != nil {
+					return nil, fmt.Errorf("block hash at %d: %w", left.Block, err)
+				}
+				onChain = hash != "" && sameHash(hash, left.BlockHash)
+				canonical[left.Block] = onChain
+			}
+			left.Canonical = onChain
+		}
+		out[left.ModuleID] = left
+	}
+	return out, nil
 }
 
 // writeModuleKeys: the diff runs in the database, so memory stays bounded for any module size.
@@ -690,6 +747,7 @@ func (s *Syncer) prune(ctx context.Context) {
 		s.log.Warn("prune failed", "err", err)
 		return
 	}
+	s.retentionHeldAt = pruned.HeldAt
 	if pruned.HeldAt > 0 {
 		// Warn: a slow consumer and a leaked lease look the same for one cycle; only repetition tells.
 		s.log.Warn("retention held back by a reader still streaming an older version",
@@ -704,6 +762,22 @@ func (s *Syncer) prune(ctx context.Context) {
 			"keeping", s.cfg.RetainVersions, "oldest_kept_block", pruned.OldestKept,
 			"versions_dropped", pruned.Versions, "rows_dropped", pruned.Rows)
 	}
+}
+
+// unfinishedBuilds runs after the cycle, when no build of this writer is open, so every building
+// row is one a dead writer left.
+func (s *Syncer) unfinishedBuilds(ctx context.Context) int64 {
+	counter, ok := s.store.(BuildCounter)
+	if !ok {
+		return -1
+	}
+	countCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	defer cancel()
+	n, err := counter.UnfinishedBuilds(countCtx)
+	if err != nil {
+		return -1
+	}
+	return n
 }
 
 func moduleNonces(modules []model.StakingModule) []ModuleNonce {

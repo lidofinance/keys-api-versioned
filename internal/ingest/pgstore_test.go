@@ -422,3 +422,16 @@ func TestCommentsDoNotCountAsASchemaChange(t *testing.T) {
 		t.Error("changing a column type did not change the fingerprint")
 	}
 }
+
+func TestUnfinishedBuildsCountsWhatADeadWriterLeft(t *testing.T) {
+	db := testpg.New(t)
+	ctx := context.Background()
+	spec := testreg.Spec{Modules: 1, OperatorsPerModule: 1, KeysPerOperator: 1}
+	spec.Publish(ctx, t, db.Writer, testreg.At(db.Block(0)))
+	spec.WithSalt(1).Fill(ctx, t, db.Writer, testreg.At(db.Block(1)), 1) // never published nor aborted
+
+	n, err := db.Writer.UnfinishedBuilds(ctx)
+	if err != nil || n != 1 {
+		t.Fatalf("UnfinishedBuilds = %d, %v; want 1", n, err)
+	}
+}

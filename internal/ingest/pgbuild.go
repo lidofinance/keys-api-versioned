@@ -29,26 +29,27 @@ type pgBuild struct {
 func (b *pgBuild) Block() int64      { return b.at.BlockNumber }
 func (b *pgBuild) BlockHash() string { return b.hash }
 
+// Keys stages into a session temp table with no transaction open: a module's read takes minutes,
+// and an open transaction would hold back vacuum and meet idle_in_transaction_session_timeout.
 func (b *pgBuild) Keys(ctx context.Context, module model.StakingModule) (ModuleKeys, error) {
 	conn, err := b.store.pool.Acquire(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("acquire: %w", err)
 	}
-	tx, err := conn.Begin(ctx)
-	if err != nil {
-		conn.Release()
-		return nil, fmt.Errorf("begin key write: %w", err)
-	}
 
-	if _, err := tx.Exec(ctx, `create temp table staged_keys (
+	// Dropped first: a connection whose last build failed mid-way can come back with it.
+	if _, err := conn.Exec(ctx, `drop table if exists staged_keys`); err != nil {
+		conn.Release()
+		return nil, fmt.Errorf("staging table: %w", err)
+	}
+	if _, err := conn.Exec(ctx, `create temp table staged_keys (
 			operator_index int   not null,
 			key_index      int   not null,
 			pubkey         bytea not null,
 			signature      bytea not null,
 			used           boolean not null,
 			vetted         boolean not null
-		) on commit drop`); err != nil {
-		_ = tx.Rollback(ctx)
+		)`); err != nil {
 		conn.Release()
 		return nil, fmt.Errorf("staging table: %w", err)
 	}
@@ -56,7 +57,6 @@ func (b *pgBuild) Keys(ctx context.Context, module model.StakingModule) (ModuleK
 	return &pgModuleKeys{
 		build:    b,
 		conn:     conn,
-		tx:       tx,
 		moduleID: module.ID,
 		pending:  make([]stagedKey, 0, b.store.keyStageBatch),
 	}, nil
@@ -74,7 +74,6 @@ type stagedKey struct {
 type pgModuleKeys struct {
 	build    *pgBuild
 	conn     *pgxpool.Conn
-	tx       pgx.Tx
 	moduleID int32
 
 	pending []stagedKey
@@ -118,7 +117,7 @@ func (k *pgModuleKeys) flush(ctx context.Context) error {
 		return nil
 	}
 	rows := k.pending
-	n, err := k.tx.CopyFrom(ctx,
+	n, err := k.conn.CopyFrom(ctx,
 		pgx.Identifier{"staged_keys"},
 		[]string{"operator_index", "key_index", "pubkey", "signature", "used", "vetted"},
 		pgx.CopyFromSlice(len(rows), func(i int) ([]any, error) {
@@ -146,14 +145,20 @@ func (k *pgModuleKeys) Commit(ctx context.Context) (KeyDiff, error) {
 		return KeyDiff{}, err
 	}
 
-	if _, err := k.tx.Exec(ctx, `create index on staged_keys (operator_index, key_index)`); err != nil {
+	tx, err := k.conn.Begin(ctx)
+	if err != nil {
+		return KeyDiff{}, fmt.Errorf("begin key write: %w", err)
+	}
+	defer tx.Rollback(ctx)
+
+	if _, err := tx.Exec(ctx, `create index on staged_keys (operator_index, key_index)`); err != nil {
 		return KeyDiff{}, fmt.Errorf("index staging table: %w", err)
 	}
 
 	block := k.build.at.BlockNumber
 	diff := KeyDiff{Staged: k.staged}
 
-	closed, err := k.tx.Exec(ctx, `
+	closed, err := tx.Exec(ctx, `
 		update key_version v set to_block = $2
 		 where v.module_id = $1
 		   and v.to_block is null
@@ -170,7 +175,7 @@ func (k *pgModuleKeys) Commit(ctx context.Context) (KeyDiff, error) {
 	}
 	diff.Closed = closed.RowsAffected()
 
-	opened, err := k.tx.Exec(ctx, `
+	opened, err := tx.Exec(ctx, `
 		insert into key_version
 			(module_id, operator_index, key_index, pubkey, signature, used, vetted, from_block, to_block)
 		select $1, s.operator_index, s.key_index, s.pubkey, s.signature, s.used, s.vetted, $2, null
@@ -187,7 +192,10 @@ func (k *pgModuleKeys) Commit(ctx context.Context) (KeyDiff, error) {
 	diff.Opened = opened.RowsAffected()
 	diff.Unchanged = diff.Staged - diff.Opened
 
-	if err := k.tx.Commit(ctx); err != nil {
+	if _, err := tx.Exec(ctx, `drop table staged_keys`); err != nil {
+		return diff, fmt.Errorf("drop staging table: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
 		return diff, fmt.Errorf("commit key write: %w", err)
 	}
 	if diff.Changed() {
@@ -201,7 +209,7 @@ func (k *pgModuleKeys) Abort(ctx context.Context) {
 		return
 	}
 	k.done = true
-	_ = k.tx.Rollback(ctx)
+	_, _ = k.conn.Exec(ctx, `drop table if exists staged_keys`)
 	k.release()
 }
 

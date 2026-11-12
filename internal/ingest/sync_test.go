@@ -503,6 +503,7 @@ type fakeStore struct {
 	// existing makes Begin find the identity taken by a row in this status.
 	existing    string
 	abortCtxErr *error
+	heldAt      int64
 }
 
 func newFakeStore() *fakeStore { return &fakeStore{} }
@@ -570,7 +571,7 @@ func (s *fakeStore) SupersedeFrom(_ context.Context, block int64) (Superseded, e
 	return Superseded{Versions: int64(dropped)}, nil
 }
 
-func (s *fakeStore) Prune(context.Context, int) (Pruned, error) { return Pruned{}, nil }
+func (s *fakeStore) Prune(context.Context, int) (Pruned, error) { return Pruned{HeldAt: s.heldAt}, nil }
 
 type fakeBuild struct {
 	store  *fakeStore
@@ -701,5 +702,37 @@ func TestCycleStillRollsBackWhenTheModuleSetIsTheSame(t *testing.T) {
 	}
 	if store.supersededFrom != published {
 		t.Errorf("rolled back from %d, want %d", store.supersededFrom, published)
+	}
+}
+
+type countingStore struct {
+	*fakeStore
+	unfinished int64
+}
+
+func (c countingStore) UnfinishedBuilds(context.Context) (int64, error) { return c.unfinished, nil }
+
+// Both were a log line at most: a held retention window and a dead writer's building row.
+func TestACycleReportsHeldRetentionAndUnfinishedBuilds(t *testing.T) {
+	src := newFakeSource(1)
+	store := newFakeStore()
+	store.heldAt = 900
+	s := NewSyncer(src, countingStore{store, 2}, SyncConfig{RetainVersions: 5}, nil)
+
+	r := s.Cycle(context.Background())
+	if r.Err != nil {
+		t.Fatal(r.Err)
+	}
+	if r.RetentionHeldAt != 900 || r.UnfinishedBuilds != 2 {
+		t.Errorf("held at %d, unfinished %d; want 900 and 2", r.RetentionHeldAt, r.UnfinishedBuilds)
+	}
+
+	src.advance()
+	store.heldAt = 0
+	if r := s.Cycle(context.Background()); r.RetentionHeldAt != 0 {
+		t.Errorf("held at %d after a prune that was not held, want 0", r.RetentionHeldAt)
+	}
+	if r := NewSyncer(src, store, SyncConfig{}, nil).Cycle(context.Background()); r.UnfinishedBuilds != -1 {
+		t.Errorf("a store that cannot count reported %d, want -1", r.UnfinishedBuilds)
 	}
 }

@@ -74,8 +74,13 @@ jobs:
       - name: go vet
         run: go vet ./...
 
+      # -race needs cgo, which the image build turns off: this is the only place it runs.
       - name: go test
-        run: go test ./...
+        run: go test -race ./...
+
+      # Pinned, so a new release of the scanner cannot change the verdict on an unchanged tree.
+      - name: govulncheck
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 ./...
 
       # The same packages again, this time with a database, so the tests that skipped
       # above actually run. -count=1 because the first pass cached them as passing-by-
@@ -112,12 +117,12 @@ jobs:
       - name: go test with Postgres — ingest
         env:
           TEST_DATABASE_URL: postgres://postgres:postgres@127.0.0.1:5432/keys_api_test?sslmode=disable
-        run: go test ./internal/ingest/ -count=1 -p 1 -timeout 240s -v
+        run: go test -race ./internal/ingest/ -count=1 -p 1 -timeout 240s -v
 
       - name: go test with Postgres — e2e
         env:
           TEST_DATABASE_URL: postgres://postgres:postgres@127.0.0.1:5432/keys_api_test?sslmode=disable
-        run: go test ./internal/e2e/ -count=1 -p 1 -timeout 240s -v
+        run: go test -race ./internal/e2e/ -count=1 -p 1 -timeout 240s -v
 
       # Not run here, and both for the same reason — they need something this runner has
       # no business holding:

@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/lidofinance/keys-api-versioned/internal/ethaddr"
@@ -99,19 +100,25 @@ func (a *App) Snapshot(ctx context.Context, fn func(Snapshot) error) error {
 	if meta != nil {
 		// Lease the version for the whole response: retention deletes, and a 211 MiB dump to a slow
 		// consumer can outlive the retention window.
-		release, err := leaseVersion(ctx, conn, block)
+		release, err := LeaseVersion(ctx, conn, block)
 		if err != nil {
 			return err
 		}
 		defer release()
 	}
+	snap := &appSnapshot{conn: conn, meta: meta, versionID: versionID, block: block,
+		stale: status == StatusStale, log: a.logger()}
 	if meta != nil {
+		// Retention claims a version's lease before deleting it, so a pin resolved just before a prune
+		// is caught here, after the lease, rather than by a short response.
+		if err := snap.stillOnChain(ctx); err != nil {
+			return err
+		}
 		a.logger().Debug("snapshot resolved", "pin", a.pin, "version_block", block,
 			"confirmed_at", meta.BlockNumber, "status", status,
 			"last_changed", meta.LastChangedBlockHash)
 	}
-	return fn(&appSnapshot{conn: conn, meta: meta, versionID: versionID, block: block,
-		stale: status == StatusStale, log: a.logger()})
+	return fn(snap)
 }
 
 func (a *App) PinnedSnapshot(ctx context.Context, pin string, fn func(Snapshot) error) error {
@@ -177,6 +184,10 @@ func resolveAppPin(ctx context.Context, conn pinReader, pin string) (*model.ELBl
 			return nil, 0, 0, "", nil
 		}
 		return nil, 0, 0, "", classifyMissingAppPin(ctx, conn, pin)
+	}
+	if missingSchema(err) {
+		// Before the writer's first migrate, or while it rebuilds the schema: nothing is published.
+		return nil, 0, 0, "", nil
 	}
 	if err != nil {
 		return nil, 0, 0, "", fmt.Errorf("resolve pin: %w", err)
@@ -245,6 +256,11 @@ func classifyMissingAppPin(ctx context.Context, conn pinReader, pin string) erro
 		return ErrPruned{Ref: pin}
 	}
 	return ErrNotFound{Ref: pin, What: "snapshot"}
+}
+
+func missingSchema(err error) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && (pgErr.Code == "42P01" || pgErr.Code == "3F000")
 }
 
 func appHead(ctx context.Context, conn pinReader) (int64, string, error) {
@@ -468,8 +484,11 @@ func (s *appSnapshot) StreamKeys(ctx context.Context, moduleAddress string, f mo
 		args = append(args, *f.OperatorIndex)
 		q += ` and operator_index = $` + strconv.Itoa(len(args))
 	}
+	// Canonical's order; heap order reshuffles once a module is rewritten. Planned per call: the
+	// cached generic plan sorted module 1 on disk (77 MB, +100 ms a dump) instead of using kv_ident.
+	q += ` order by operator_index, key_index`
 
-	rows, err := s.conn.Query(ctx, q, args...)
+	rows, err := s.conn.Query(ctx, q, append([]any{pgx.QueryExecModeCacheDescribe}, args...)...)
 	if err != nil {
 		return fmt.Errorf("stream keys: %w", err)
 	}
@@ -581,7 +600,15 @@ func (s *appSnapshot) Operators(ctx context.Context, moduleAddress string, f mod
 		o.ModuleAddress = checksummed
 		out = append(out, o)
 	}
-	return out, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	// Checked after, not before: operators are the last statement of the grouped stream, and a
+	// rollback landing before it would pair pre-reorg keys with reopened operator rows.
+	if err := s.stillOnChain(ctx); err != nil {
+		return nil, err
+	}
+	return out, nil
 }
 
 var (

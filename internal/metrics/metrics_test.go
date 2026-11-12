@@ -2,6 +2,7 @@ package metrics
 
 import (
 	"io"
+	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
@@ -86,4 +87,39 @@ func scrape(t *testing.T, m *Metrics) string {
 		t.Fatalf("read scrape: %v", err)
 	}
 	return string(body)
+}
+
+func TestPoolAggregationAndInFlightAreExported(t *testing.T) {
+	m := New("keys_api")
+	m.BindPoolStats("keys_api", func() PoolStats {
+		return PoolStats{Acquired: 10, Max: 10, EmptyAcquires: 7, AcquireWait: 3 * time.Second}
+	})
+	m.BindAggregation("keys_api", func() (int64, bool) { return 250, false })
+
+	release := make(chan struct{})
+	entered := make(chan struct{})
+	handler := m.CountInFlight(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		close(entered)
+		<-release
+	}))
+	go handler.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/v1/keys", nil))
+	<-entered
+	body := scrape(t, m)
+	close(release)
+
+	for _, want := range []string{
+		`keys_api_db_pool_acquired_connections 10`,
+		`keys_api_db_pool_max_connections 10`,
+		`keys_api_db_pool_empty_acquires_total 7`,
+		`keys_api_db_pool_acquire_wait_seconds_total 3`,
+		`keys_api_rpc_aggregate_budget 250`,
+		`keys_api_rpc_aggregation_enabled 0`,
+		`keys_api_http_requests_in_flight 1`,
+		`keys_api_retention_held_at_block 0`,
+		`keys_api_unfinished_builds 0`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("scrape is missing %s", want)
+		}
+	}
 }

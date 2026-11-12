@@ -51,6 +51,11 @@ type ChainIdentifier interface {
 	ChainID(ctx context.Context) (int64, error)
 }
 
+// ChainVerifier: an error for an endpoint on another chain, else how many are on the right one.
+type ChainVerifier interface {
+	VerifyChain(ctx context.Context) (verified int, err error)
+}
+
 // FinalityReporter: reading everything at one finalized hash is as consistent as at head; what is
 // forbidden is mixing a pinned block and a floating tag in one cycle.
 type FinalityReporter interface {

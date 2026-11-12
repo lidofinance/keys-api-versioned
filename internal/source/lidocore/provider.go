@@ -149,6 +149,8 @@ func (p *Provider) ChainID(ctx context.Context) (int64, error) {
 	return p.client.ChainID(ctx)
 }
 
+func (p *Provider) VerifyChain(ctx context.Context) (int, error) { return p.client.VerifyChain(ctx) }
+
 // FinalizedBlock is a header read, never a point state is read at.
 func (p *Provider) FinalizedBlock(ctx context.Context) (model.ELBlockSnapshot, error) {
 	number, hash, timestamp, err := p.client.FinalizedBlock(ctx)

@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -34,10 +35,6 @@ func chainSchema(chainID int64) string {
 	return fmt.Sprintf("chain_%d", chainID)
 }
 
-func dsnHasSearchPath(dsn string) bool {
-	return strings.Contains(dsn, "search_path=")
-}
-
 type PGOptions struct {
 	MaxConns int32
 	Source   string
@@ -45,23 +42,23 @@ type PGOptions struct {
 	ChainID int64
 	// KeyStageBatch is the COPY batch size; 0 means 20 000.
 	KeyStageBatch int
+	// Lazy skips the ping: the pool connects on first use, so a database that is down at boot does
+	// not stop the process (WaitForDatabase is the blocking variant).
+	Lazy bool
 }
 
-func NewPGStore(ctx context.Context, dsn string, o PGOptions) (*PGStore, error) {
-	schema := ""
-	if o.ChainID != 0 && !dsnHasSearchPath(dsn) {
-		schema = chainSchema(o.ChainID)
-		separator := "?"
-		if strings.Contains(dsn, "?") {
-			separator = "&"
-		}
-		// pgx passes unknown DSN keys to the server as runtime parameters; Migrate verifies it took.
-		dsn += separator + "search_path=" + schema
-	}
+const maxConnectBackoff = 30 * time.Second
 
+func NewPGStore(ctx context.Context, dsn string, o PGOptions) (*PGStore, error) {
 	cfg, err := pgxpool.ParseConfig(dsn)
 	if err != nil {
 		return nil, fmt.Errorf("parse dsn: %w", err)
+	}
+	// A runtime parameter, not a suffix on the DSN: that only worked for the URL form.
+	schema := ""
+	if o.ChainID != 0 && cfg.ConnConfig.RuntimeParams["search_path"] == "" {
+		schema = chainSchema(o.ChainID)
+		cfg.ConnConfig.RuntimeParams["search_path"] = schema
 	}
 	if o.MaxConns > 0 {
 		cfg.MaxConns = o.MaxConns
@@ -70,9 +67,11 @@ func NewPGStore(ctx context.Context, dsn string, o PGOptions) (*PGStore, error) 
 	if err != nil {
 		return nil, fmt.Errorf("connect: %w", err)
 	}
-	if err := pool.Ping(ctx); err != nil {
-		pool.Close()
-		return nil, fmt.Errorf("ping: %w", err)
+	if !o.Lazy {
+		if err := pool.Ping(ctx); err != nil {
+			pool.Close()
+			return nil, fmt.Errorf("ping: %w", err)
+		}
 	}
 
 	batch := o.KeyStageBatch
@@ -84,33 +83,66 @@ func NewPGStore(ctx context.Context, dsn string, o PGOptions) (*PGStore, error) 
 
 func (s *PGStore) Close() { s.pool.Close() }
 
+// WaitForDatabase pings with backoff until the database answers or ctx ends.
+func (s *PGStore) WaitForDatabase(ctx context.Context, onRetry func(err error, next time.Duration)) error {
+	for wait := time.Second; ; wait = min(2*wait, maxConnectBackoff) {
+		err := s.pool.Ping(ctx)
+		if err == nil {
+			return nil
+		}
+		if ctx.Err() != nil {
+			return fmt.Errorf("ping: %w", err)
+		}
+		if onRetry != nil {
+			onRetry(err, wait)
+		}
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("ping: %w", ctx.Err())
+		case <-time.After(wait):
+		}
+	}
+}
+
 func (s *PGStore) Pool() *pgxpool.Pool { return s.pool }
 
 // Migrate rebuilds the schema when the schema.sql fingerprint changes; there is no migration path.
 // A refill costs 14 s on Hoodi, 49 s on mainnet; readers get 425 until the cold sync ends.
+//
+// One transaction under an advisory lock: two image versions racing no longer drop each other's
+// schema mid-apply, and readers see the old layout or the new empty one, never half of either.
 func (s *PGStore) Migrate(ctx context.Context) error {
 	fingerprint := schemaFingerprint(schemaSQL)
 
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("migrate: %w", err)
+	}
+	defer tx.Rollback(ctx)
+	if _, err := tx.Exec(ctx, `select pg_advisory_xact_lock($1, `+writerLockKey+`)`, migrateLockClass); err != nil {
+		return fmt.Errorf("migrate: lock: %w", err)
+	}
+
 	if s.schema != "" {
-		stored, err := s.storedFingerprint(ctx)
+		stored, err := storedFingerprint(ctx, tx)
 		if err != nil {
 			return err
 		}
-		if stored != fingerprint && s.schemaHasTables(ctx) {
-			if _, err := s.pool.Exec(ctx, `drop schema `+pgIdentifier(s.schema)+` cascade`); err != nil {
+		if stored != fingerprint && schemaHasTables(ctx, tx) {
+			if _, err := tx.Exec(ctx, `drop schema `+pgIdentifier(s.schema)+` cascade`); err != nil {
 				return fmt.Errorf("drop schema %s for rebuild: %w", s.schema, err)
 			}
 		}
-		if _, err := s.pool.Exec(ctx, `create schema if not exists `+pgIdentifier(s.schema)); err != nil {
+		if _, err := tx.Exec(ctx, `create schema if not exists `+pgIdentifier(s.schema)); err != nil {
 			return fmt.Errorf("create schema %s: %w", s.schema, err)
 		}
 	}
-	if _, err := s.pool.Exec(ctx, schemaSQL); err != nil {
+	if _, err := tx.Exec(ctx, schemaSQL); err != nil {
 		return fmt.Errorf("apply schema: %w", err)
 	}
 	if s.schema != "" {
 		var landed string
-		err := s.pool.QueryRow(ctx, `select n.nspname from pg_class c
+		err := tx.QueryRow(ctx, `select n.nspname from pg_class c
 			join pg_namespace n on n.oid = c.relnamespace
 			where c.oid = to_regclass('versions')`).Scan(&landed)
 		if err != nil {
@@ -122,20 +154,20 @@ func (s *PGStore) Migrate(ctx context.Context) error {
 		}
 	}
 
-	if _, err := s.pool.Exec(ctx, `
+	if _, err := tx.Exec(ctx, `
 		insert into schema_fingerprint (id, fingerprint) values (1, $1)
 		on conflict (id) do update set fingerprint = excluded.fingerprint, applied_at = now()`,
 		fingerprint); err != nil {
 		return fmt.Errorf("record the schema fingerprint: %w", err)
 	}
-	return nil
+	return tx.Commit(ctx)
 }
 
 // storedFingerprint: "" for a schema with tables means an unknown layout, rebuilt like a mismatch.
-func (s *PGStore) storedFingerprint(ctx context.Context) (string, error) {
+func storedFingerprint(ctx context.Context, tx pgx.Tx) (string, error) {
 	// to_regclass answers NULL for a missing name, including a missing schema, instead of failing.
 	var exists bool
-	if err := s.pool.QueryRow(ctx,
+	if err := tx.QueryRow(ctx,
 		`select to_regclass('schema_fingerprint') is not null`).Scan(&exists); err != nil {
 		return "", fmt.Errorf("look for the schema fingerprint: %w", err)
 	}
@@ -144,7 +176,7 @@ func (s *PGStore) storedFingerprint(ctx context.Context) (string, error) {
 	}
 
 	var fingerprint string
-	err := s.pool.QueryRow(ctx, `select fingerprint from schema_fingerprint where id = 1`).Scan(&fingerprint)
+	err := tx.QueryRow(ctx, `select fingerprint from schema_fingerprint where id = 1`).Scan(&fingerprint)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return "", nil
 	}
@@ -154,9 +186,9 @@ func (s *PGStore) storedFingerprint(ctx context.Context) (string, error) {
 	return fingerprint, nil
 }
 
-func (s *PGStore) schemaHasTables(ctx context.Context) bool {
+func schemaHasTables(ctx context.Context, tx pgx.Tx) bool {
 	var exists bool
-	if err := s.pool.QueryRow(ctx,
+	if err := tx.QueryRow(ctx,
 		`select to_regclass('versions') is not null`).Scan(&exists); err != nil {
 		return false
 	}
@@ -242,7 +274,29 @@ func (s *PGStore) Recent(ctx context.Context, limit int) ([]StoredVersion, error
 	return out, rows.Err()
 }
 
+// Begin refuses a block below what the store already holds: Commit closes rows at the build's
+// block, so a lower build after a higher one rewrites ranges the newer version reads.
 func (s *PGStore) Begin(ctx context.Context, at model.ELBlockSnapshot) (Build, error) {
+	var (
+		newerVersion bool
+		newestRow    int64
+	)
+	if err := s.pool.QueryRow(ctx, `
+		select exists (
+		         select 1 from versions
+		          where status in ('published', 'stale', 'building')
+		            and (block_number > $1 or (block_number = $1 and block_hash <> $2))),
+		       coalesce(greatest(
+		         (select max(from_block) from key_version), (select max(to_block) from key_version),
+		         (select max(from_block) from operator_version), (select max(to_block) from operator_version),
+		         (select max(from_block) from module_version), (select max(to_block) from module_version)), 0)`,
+		at.BlockNumber, strings.ToLower(at.BlockHash)).Scan(&newerVersion, &newestRow); err != nil {
+		return nil, fmt.Errorf("begin version: check for newer data: %w", err)
+	}
+	if newerVersion || newestRow > at.BlockNumber {
+		return nil, ErrBuildBehind
+	}
+
 	var id int64
 	err := s.pool.QueryRow(ctx, `
 		insert into versions
@@ -298,6 +352,12 @@ func (s *PGStore) MarkStale(ctx context.Context, v StoredVersion) error {
 	return nil
 }
 
+func (s *PGStore) UnfinishedBuilds(ctx context.Context) (int64, error) {
+	var n int64
+	err := s.pool.QueryRow(ctx, `select count(*) from versions where status = 'building'`).Scan(&n)
+	return n, err
+}
+
 // SupersedeFrom keeps superseded versions' rows so pins get 409 rather than 404. Rows only on the
 // losing branch are dropped, and rows it closed are reopened.
 func (s *PGStore) SupersedeFrom(ctx context.Context, block int64) (Superseded, error) {
@@ -336,11 +396,57 @@ func (s *PGStore) SupersedeFrom(ctx context.Context, block int64) (Superseded, e
 	return out, nil
 }
 
+func (s *PGStore) Leftovers(ctx context.Context, published int64) ([]Leftover, error) {
+	rows, err := s.pool.Query(ctx, `
+		with touched as (
+			select module_id from key_version where from_block > $1 or to_block > $1
+			union select module_id from operator_version where from_block > $1 or to_block > $1
+			union select module_id from module_version where from_block > $1 or to_block > $1
+		)
+		select t.module_id, m.from_block, m.nonce, v.block_hash,
+		       m.row_id is not null and v.block_hash is not null
+		       and not exists (select 1 from key_version k where k.module_id = t.module_id
+		                         and (k.from_block > m.from_block or k.to_block > m.from_block))
+		       and not exists (select 1 from operator_version o where o.module_id = t.module_id
+		                         and (o.from_block > m.from_block or o.to_block > m.from_block))
+		  from touched t
+		  left join module_version m
+		    on m.module_id = t.module_id and m.to_block is null and m.from_block > $1
+		  left join lateral (
+		        select min(block_hash) as block_hash from versions
+		         where block_number = m.from_block and status in ('building', 'superseded')
+		        having count(*) = 1) v on true`, published)
+	if err != nil {
+		return nil, fmt.Errorf("leftovers: %w", err)
+	}
+	defer rows.Close()
+
+	var out []Leftover
+	for rows.Next() {
+		var (
+			l     Leftover
+			id    int16
+			block *int64
+			nonce *int64
+			hash  *string
+		)
+		if err := rows.Scan(&id, &block, &nonce, &hash, &l.Complete); err != nil {
+			return nil, err
+		}
+		l.ModuleID = int32(id)
+		if l.Complete {
+			l.Block, l.Nonce, l.BlockHash = *block, *nonce, *hash
+		}
+		out = append(out, l)
+	}
+	return out, rows.Err()
+}
+
 // finalizedVersionBlock duplicates the reader's predicate in internal/store; a retention test
 // keeps the two in step.
-func (s *PGStore) finalizedVersionBlock(ctx context.Context) (int64, error) {
+func finalizedVersionBlock(ctx context.Context, tx pgx.Tx) (int64, error) {
 	var block int64
-	err := s.pool.QueryRow(ctx, `
+	err := tx.QueryRow(ctx, `
 		select coalesce(max(block_number), 0) from versions
 		 where status in ('published', 'stale')
 		   and block_number <= (select coalesce(max(finalized_block_number), 0) from versions)`).
@@ -351,14 +457,21 @@ func (s *PGStore) finalizedVersionBlock(ctx context.Context) (int64, error) {
 	return block, nil
 }
 
-// Prune never touches rows still open, whatever the window.
+// Prune never touches rows still open, whatever the window. One transaction, versions first: a
+// reader resolving a pin at the same moment sees the version and its rows, or neither.
 func (s *PGStore) Prune(ctx context.Context, keep int) (Pruned, error) {
 	var out Pruned
 	if keep <= 0 {
 		return out, nil
 	}
 
-	err := s.pool.QueryRow(ctx, `
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return out, err
+	}
+	defer tx.Rollback(ctx)
+
+	err = tx.QueryRow(ctx, `
 		select coalesce(min(block_number), 0) from (
 			select block_number from versions order by block_number desc limit $1
 		) k`, keep).Scan(&out.OldestKept)
@@ -368,25 +481,11 @@ func (s *PGStore) Prune(ctx context.Context, keep int) (Pruned, error) {
 	if out.OldestKept == 0 {
 		return out, nil
 	}
-
-	// Hold the boundary at the oldest leased version: deleting rows mid-stream would corrupt a
-	// response. Held versions are pruned on a later cycle.
 	boundary := out.OldestKept
-	leased, err := store.LeasedVersions(ctx, s.pool)
-	if err != nil {
-		// Must not fall back to deleting: an unreadable lease set means usage is unknown.
-		return out, fmt.Errorf("prune held back, lease set unreadable: %w", err)
-	}
-	for _, block := range leased {
-		if block < boundary {
-			boundary = block
-			out.HeldAt = block
-		}
-	}
 
 	// The finalized version is held too: retention counts versions while finality (~13 min) is time,
 	// and at one rebuild per minute or two it sits near the window's edge.
-	finalizedVersion, err := s.finalizedVersionBlock(ctx)
+	finalizedVersion, err := finalizedVersionBlock(ctx, tx)
 	if err != nil {
 		return out, fmt.Errorf("prune held back, finalized version unreadable: %w", err)
 	}
@@ -395,8 +494,32 @@ func (s *PGStore) Prune(ctx context.Context, keep int) (Pruned, error) {
 		out.HeldAt = finalizedVersion
 	}
 
+	// A leased version holds the boundary at itself: deleting rows mid-stream would corrupt a
+	// response. Held versions are pruned on a later cycle.
+	doomed, err := blocksBelow(ctx, tx, boundary)
+	if err != nil {
+		return out, err
+	}
+	for _, block := range doomed {
+		claimed, err := store.TryClaimForPrune(ctx, tx, block)
+		if err != nil {
+			return out, err
+		}
+		if !claimed {
+			boundary = block
+			out.HeldAt = block
+			break
+		}
+	}
+
+	tag, err := tx.Exec(ctx, `delete from versions where block_number < $1`, boundary)
+	if err != nil {
+		return out, fmt.Errorf("prune versions: %w", err)
+	}
+	out.Versions = tag.RowsAffected()
+
 	for _, table := range versionedTables {
-		tag, err := s.pool.Exec(ctx, `delete from `+table+`
+		tag, err := tx.Exec(ctx, `delete from `+table+`
 			where to_block is not null and to_block <= $1`, boundary)
 		if err != nil {
 			return out, fmt.Errorf("prune %s: %w", table, err)
@@ -404,15 +527,30 @@ func (s *PGStore) Prune(ctx context.Context, keep int) (Pruned, error) {
 		out.Rows += tag.RowsAffected()
 	}
 
-	tag, err := s.pool.Exec(ctx, `delete from versions where block_number < $1`, boundary)
-	if err != nil {
-		return out, fmt.Errorf("prune versions: %w", err)
+	if pruneBeforeCommit != nil {
+		pruneBeforeCommit()
 	}
-	out.Versions = tag.RowsAffected()
+	if err := tx.Commit(ctx); err != nil {
+		return out, fmt.Errorf("commit prune: %w", err)
+	}
 	return out, nil
+}
+
+var pruneBeforeCommit func()
+
+func blocksBelow(ctx context.Context, tx pgx.Tx, boundary int64) ([]int64, error) {
+	rows, err := tx.Query(ctx, `select distinct block_number from versions
+		where block_number < $1 order by block_number`, boundary)
+	if err != nil {
+		return nil, fmt.Errorf("versions to prune: %w", err)
+	}
+	return pgx.CollectRows(rows, pgx.RowTo[int64])
 }
 
 // versionedTables in the order a rollback and a prune touch them.
 var versionedTables = []string{"key_version", "operator_version", "module_version"}
 
-var _ Store = (*PGStore)(nil)
+var (
+	_ Store            = (*PGStore)(nil)
+	_ LeftoverReporter = (*PGStore)(nil)
+)

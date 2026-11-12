@@ -115,8 +115,7 @@ registry's. So a fork test injects keys it can recognise into the real contract,
 ## The scenarios
 
 Implemented, in `internal/fork`. Each one that asserts a positive has a control that
-fails on the same behaviour, which is the rule this repo already paid to learn
-(next-steps.md:158).
+fails on the same behaviour, which is the rule this repo already paid to learn.
 
 | Scenario | How it is built | Control |
 |---|---|---|

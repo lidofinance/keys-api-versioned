@@ -65,6 +65,27 @@ type ModuleKeys interface {
 	Abort(ctx context.Context)
 }
 
+// LeftoverReporter (optional) lists modules with rows above block published (0 = all), which only a
+// build that never published can have written.
+type LeftoverReporter interface {
+	Leftovers(ctx context.Context, published int64) ([]Leftover, error)
+}
+
+type Leftover struct {
+	ModuleID int32
+	// Complete: the attempt wrote the module row, which comes after its keys and operators, and
+	// nothing later touched the module. Block, BlockHash and Nonce are that row's.
+	Complete  bool
+	Block     int64
+	BlockHash string
+	Nonce     int64
+	Canonical bool
+}
+
+func (l Leftover) reusable(m model.StakingModule) bool {
+	return l.Complete && l.Canonical && l.Nonce == int64(m.Nonce)
+}
+
 type StoredVersion struct {
 	ID int64
 	// The point the data was read at: the version's identity, never moves.
@@ -114,6 +135,9 @@ type Pruned struct {
 	HeldAt int64
 }
 
+// ErrBuildBehind: the store holds a version or rows above the block a build was asked for.
+var ErrBuildBehind = errors.New("the store holds data above this block; a build here would rewrite it")
+
 // ErrVersionExists: the sync loop treats it as "nothing to do this cycle".
 var ErrVersionExists = errors.New("a version with this block identity already exists")
 
@@ -128,3 +152,8 @@ func (e ExistingVersionError) Error() string {
 func (e ExistingVersionError) Is(target error) bool { return target == ErrVersionExists }
 
 func (e ExistingVersionError) Done() bool { return e.Status == "published" || e.Status == "stale" }
+
+// BuildCounter is optional: versions in building status, for a gauge.
+type BuildCounter interface {
+	UnfinishedBuilds(ctx context.Context) (int64, error)
+}

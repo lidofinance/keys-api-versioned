@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"net/http"
 	"net/url"
 	"os"
@@ -32,6 +33,9 @@ import (
 // appVersion is read by consumers from /v1/status, so it stays semver, not a build hash.
 const appVersion = "0.1.0-poc"
 
+// commit is set at build time: -ldflags "-X main.commit=<sha>".
+var commit = "unknown"
+
 const metricsNamespace = "keys_api"
 
 func main() {
@@ -51,15 +55,26 @@ func run(log *slog.Logger, masker *logmask.Masker) error {
 	// Before anything reads the environment, so the file is the source for every envOr below.
 	// A broken file is logged and ignored: the environment still holds a working configuration.
 	secretsPath := envOr("SECRETS_FILE_PATH", secrets.DefaultPath)
-	appliedSecrets, err := secrets.LoadIntoEnv(secretsPath)
+	appliedSecrets, ignoredSecrets, err := secrets.LoadIntoEnv(secretsPath)
 	addSecrets(masker, appliedSecrets)
 	if err != nil {
 		log.Error("secrets file unusable, reading configuration from the environment", "path", secretsPath, "err", err)
+	}
+	if len(ignoredSecrets) > 0 {
+		log.Warn("secrets file: only credentials are read from it, other keys are ignored",
+			"path", secretsPath, "ignored", strings.Join(ignoredSecrets, ","))
+	}
+	if mode, loose := secrets.LooseMode(secretsPath); loose {
+		log.Warn("secrets file is readable by group or others", "path", secretsPath, "mode", mode.String())
 	}
 	if len(appliedSecrets) > 0 {
 		log.Info("configuration: secrets file over the environment", "path", secretsPath)
 	} else {
 		log.Info("configuration: the environment", "path", secretsPath, "reason", "no secrets file")
+	}
+
+	if err := validateEnv(); err != nil {
+		return err
 	}
 
 	var setEndpoints func(string) error
@@ -94,6 +109,7 @@ func run(log *slog.Logger, masker *logmask.Masker) error {
 	// build_info's `network` label is the chain id: canonical dashboards filter on it.
 	m.SetBuildInfo("keys-api-versioned", appVersion,
 		envOr("KEYS_API_ENV", "unknown"), strconv.FormatInt(chainID, 10))
+	m.SetBuildCommit(metricsNamespace, appVersion, commit)
 
 	// One schema per chain: otherwise a store from another chain looks like a reorg deeper than the
 	// window and is silently rebuilt from scratch.
@@ -101,11 +117,21 @@ func run(log *slog.Logger, masker *logmask.Masker) error {
 		MaxConns: int32(envInt("DATABASE_MAX_CONNS", 10)),
 		Source:   envOr("KEYS_API_SOURCE", "lido-core"),
 		ChainID:  chainID,
+		// The API comes up anyway: liveness passes, readiness says 503 until a version is served.
+		Lazy: true,
 	})
 	if err != nil {
 		return err
 	}
 	defer pgStore.Close()
+	m.BindPoolStats(metricsNamespace, func() metrics.PoolStats {
+		s := pgStore.Pool().Stat()
+		return metrics.PoolStats{
+			Acquired: s.AcquiredConns(), Idle: s.IdleConns(), Total: s.TotalConns(), Max: s.MaxConns(),
+			Acquires: s.AcquireCount(), EmptyAcquires: s.EmptyAcquireCount(),
+			CanceledAcquires: s.CanceledAcquireCount(), AcquireWait: s.AcquireDuration(),
+		}
+	})
 
 	// chain_id and schema on every line: a mainnet node against a Hoodi store looks healthy in the log.
 	schema := pgStore.Schema()
@@ -116,10 +142,13 @@ func run(log *slog.Logger, masker *logmask.Masker) error {
 
 	log.Info("keys-api starting",
 		"mode", mode, "source", envOr("KEYS_API_SOURCE", "lido-core"),
-		"app_version", appVersion, "providers", redactedProviders(),
+		"app_version", appVersion, "commit", commit, "providers", redactedProviders(),
 		"pin", pin, "ext_pin", extPin)
 
-	var syncer *ingest.Syncer
+	var (
+		syncer       *ingest.Syncer
+		syncerSource source.Provider
+	)
 	if mode != "server" {
 		provider, rotateEndpoints, err := buildSource(ctx, chainID, log, m)
 		if err != nil {
@@ -127,8 +156,10 @@ func run(log *slog.Logger, masker *logmask.Masker) error {
 		}
 		setEndpoints = rotateEndpoints
 
-		// A node on the wrong chain returns plausible, wrong keys.
-		if identifier, ok := provider.(source.ChainIdentifier); ok {
+		// A node on the wrong chain returns plausible, wrong keys. Endpoint sources are checked per
+		// endpoint by the writer before it starts (verifyChain); this covers a file.
+		_, perEndpoint := provider.(source.ChainVerifier)
+		if identifier, ok := provider.(source.ChainIdentifier); ok && !perEndpoint {
 			actual, err := identifier.ChainID(ctx)
 			if err != nil {
 				log.Warn("could not verify the chain id", "err", err)
@@ -137,6 +168,7 @@ func run(log *slog.Logger, masker *logmask.Masker) error {
 			}
 		}
 
+		syncerSource = provider
 		syncer = ingest.NewSyncer(provider, pgStore, ingest.SyncConfig{
 			Interval:         time.Duration(envInt("UPDATE_KEYS_INTERVAL_MS", 5000)) * time.Millisecond,
 			MaxBlockGap:      int64(envInt("MAX_BLOCKS_OVERLAP", 1000)),
@@ -166,6 +198,10 @@ func run(log *slog.Logger, masker *logmask.Masker) error {
 	} else {
 		go func() {
 			defer close(syncDone)
+			if err := verifyChain(ctx, syncerSource, log); err != nil {
+				errs <- err
+				return
+			}
 			errs <- runWriter(ctx, pgStore, syncer, log)
 		}()
 	}
@@ -183,7 +219,7 @@ func run(log *slog.Logger, masker *logmask.Masker) error {
 			Observe:        m.ObserveRequest,
 		}).Handler()
 
-		server = newHTTPServer(":"+envOr("PORT", "3000"), handler)
+		server = newHTTPServer(":"+envOr("PORT", "3000"), m.CountInFlight(handler))
 
 		go func() {
 			log.Info("http listening", "addr", server.Addr, "mode", mode)
@@ -195,21 +231,23 @@ func run(log *slog.Logger, masker *logmask.Masker) error {
 		}()
 	}
 
-	// Rotation, once everything that could consume a credential exists.
-	if len(appliedSecrets) > 0 {
-		interval := time.Duration(envInt("SECRETS_POLL_INTERVAL_IN_SECONDS", int(secrets.DefaultPollInterval/time.Second))) * time.Second
-		watcher := secrets.NewWatcher(secretsPath, interval,
-			func(values map[string]string) error {
-				addSecrets(masker, values)
-				return applyRotatedSecrets(values, appliedSecrets, setEndpoints, log, m)
-			},
-			func(err error) {
-				log.Error("secrets rotation", "err", err)
-				m.SecretsReloads.WithLabelValues("failure").Inc()
-			})
-		go watcher.Run(ctx)
-	}
+	// Rotation, once everything that could consume a credential exists. Watched even when the file
+	// was missing or broken at boot: one that appears later is still read.
+	restart := make(chan error, 1)
+	interval := time.Duration(envInt("SECRETS_POLL_INTERVAL_IN_SECONDS", int(secrets.DefaultPollInterval/time.Second))) * time.Second
+	watcher := secrets.NewWatcher(secretsPath, interval,
+		func(values map[string]string) error {
+			values, _ = secrets.Split(values)
+			addSecrets(masker, values)
+			return applyRotatedSecrets(values, setEndpoints, restart, log, m)
+		},
+		func(err error) {
+			log.Error("secrets rotation", "err", err)
+			m.SecretsReloads.WithLabelValues("failure").Inc()
+		})
+	go watcher.Run(ctx)
 
+	var exitErr error
 	select {
 	case <-ctx.Done():
 		log.Info("shutting down")
@@ -218,6 +256,8 @@ func run(log *slog.Logger, masker *logmask.Masker) error {
 			stop()
 			return err
 		}
+	case exitErr = <-restart:
+		log.Warn("shutting down for a restart", "reason", exitErr)
 	}
 
 	if server != nil {
@@ -227,12 +267,43 @@ func run(log *slog.Logger, masker *logmask.Masker) error {
 			log.Warn("http shutdown", "err", err)
 		}
 	}
-	return nil
+	return exitErr
 }
+
+// verifyChain refuses an endpoint on another chain, and waits with backoff while none answers
+// rather than starting unverified; the API keeps serving meanwhile.
+func verifyChain(ctx context.Context, provider any, log *slog.Logger) error {
+	verifier, ok := provider.(source.ChainVerifier)
+	if !ok {
+		return nil
+	}
+	for wait := chainRetryStart; ; wait = min(2*wait, 30*time.Second) {
+		verified, err := verifier.VerifyChain(ctx)
+		if err != nil {
+			return err
+		}
+		if verified > 0 {
+			return nil
+		}
+		log.Warn("no endpoint has confirmed the chain id yet, retrying", "in", wait.String())
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(wait):
+		}
+	}
+}
+
+var chainRetryStart = time.Second
 
 // runWriter waits for the writer lock without holding up the API: in KEYS_API_MODE=all a rollout
 // keeps the old pod, and its lock, until the new one is ready. Only the writer applies the schema.
 func runWriter(ctx context.Context, pgStore *ingest.PGStore, syncer *ingest.Syncer, log *slog.Logger) error {
+	if err := pgStore.WaitForDatabase(ctx, func(err error, next time.Duration) {
+		log.Warn("database unreachable, retrying", "err", err, "in", next.String())
+	}); err != nil {
+		return err
+	}
 	return pgStore.RunExclusive(ctx, ingest.WriterLockOptions{
 		OnWait: func() { log.Warn("another writer holds the writer lock for this schema; waiting for it to stop") },
 		OnStop: func(err error) { log.Error("writer stopped; taking the writer lock again", "err", err) },
@@ -284,42 +355,59 @@ func addSecrets(masker *logmask.Masker, fileValues map[string]string) {
 	}
 }
 
-// applyRotatedSecrets: PROVIDERS_URLS applies live (the client copies endpoints per request). Other
-// keys need a restart and are not recorded as applied, so they keep being reported.
+// applyRotatedSecrets compares with the environment, which the file was loaded into at boot.
+// PROVIDERS_URLS applies live once it validates (the client copies endpoints per request);
+// DATABASE_URL asks for a restart, since the pool holds connections made with the old one.
 func applyRotatedSecrets(
-	values, applied map[string]string,
+	values map[string]string,
 	setEndpoints func(string) error,
+	restart chan<- error,
 	log *slog.Logger,
 	m *metrics.Metrics,
 ) error {
-	var live, needRestart []string
-	for key, value := range values {
-		if value == applied[key] {
-			continue
+	if value, ok := values["DATABASE_URL"]; ok && value != os.Getenv("DATABASE_URL") {
+		m.SecretsReloads.WithLabelValues("restart_required").Inc()
+		select {
+		case restart <- errors.New("DATABASE_URL changed in the secrets file; exiting so the orchestrator restarts with it"):
+		default:
 		}
-		if key == "PROVIDERS_URLS" && setEndpoints != nil {
-			if err := setEndpoints(value); err != nil {
-				return fmt.Errorf("PROVIDERS_URLS: %w", err)
-			}
-			applied[key] = value
-			if err := os.Setenv(key, value); err != nil {
-				return err
-			}
-			live = append(live, key)
-			continue
-		}
-		needRestart = append(needRestart, key)
+		return nil
 	}
 
-	if len(live) > 0 {
-		sort.Strings(live)
-		log.Info("applied rotated secrets", "keys", strings.Join(live, ","))
-		m.SecretsReloads.WithLabelValues("success").Inc()
+	value, ok := values["PROVIDERS_URLS"]
+	if !ok || value == os.Getenv("PROVIDERS_URLS") || setEndpoints == nil {
+		return nil
 	}
-	if len(needRestart) > 0 {
-		sort.Strings(needRestart)
-		log.Warn("rotated secrets need a restart to take effect", "keys", strings.Join(needRestart, ","))
-		m.SecretsReloads.WithLabelValues("restart_required").Inc()
+	if err := validateProviderURLs(value); err != nil {
+		return fmt.Errorf("PROVIDERS_URLS: %w; keeping the previous endpoints", err)
+	}
+	if err := setEndpoints(value); err != nil {
+		return fmt.Errorf("PROVIDERS_URLS: %w", err)
+	}
+	if err := os.Setenv("PROVIDERS_URLS", value); err != nil {
+		return err
+	}
+	log.Info("applied rotated secrets", "keys", "PROVIDERS_URLS")
+	m.SecretsReloads.WithLabelValues("success").Inc()
+	return nil
+}
+
+// validateProviderURLs names entries by position: the URL itself carries the provider key.
+func validateProviderURLs(list string) error {
+	n := 0
+	for _, raw := range strings.Split(list, ",") {
+		raw = strings.TrimSpace(raw)
+		if raw == "" {
+			continue
+		}
+		n++
+		u, err := url.Parse(raw)
+		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+			return fmt.Errorf("entry %d is not an http(s) URL with a host", n)
+		}
+	}
+	if n == 0 {
+		return errors.New("no endpoints")
 	}
 	return nil
 }
@@ -333,6 +421,9 @@ func buildSource(ctx context.Context, chainID int64, log *slog.Logger, m *metric
 		if urls == "" {
 			return nil, nil, errors.New("PROVIDERS_URLS is required for KEYS_API_SOURCE=lido-core")
 		}
+		if err := validateProviderURLs(urls); err != nil {
+			return nil, nil, fmt.Errorf("PROVIDERS_URLS: %w", err)
+		}
 
 		// No compiled-in per-chain addresses: devnets are the main use case.
 		locator := envOr("LIDO_LOCATOR", "")
@@ -343,6 +434,7 @@ func buildSource(ctx context.Context, chainID int64, log *slog.Logger, m *metric
 		}
 
 		client := eth.NewClient(urls, eth.Options{
+			ChainID:     chainID,
 			Concurrency: envInt("PROVIDER_CONCURRENT_REQUESTS", 8),
 			BatchSize:   envInt("PROVIDER_JSON_RPC_MAX_BATCH_SIZE", 100),
 			Timeout:     time.Duration(envInt("PROVIDER_TIMEOUT_MS", 120_000)) * time.Millisecond,
@@ -362,6 +454,7 @@ func buildSource(ctx context.Context, chainID int64, log *slog.Logger, m *metric
 			return metrics.RPCStats{
 				Requests: s.Requests, Calls: s.Calls,
 				Aggregates: s.Aggregates, Splits: s.Splits, Fallbacks: s.Fallbacks,
+				Unclassified: s.Unclassified,
 			}
 		})
 		provider := lidocore.NewProvider(client, locator, lidocore.Options{
@@ -379,6 +472,7 @@ func buildSource(ctx context.Context, chainID int64, log *slog.Logger, m *metric
 		})
 		log.Info("source: lido core",
 			"locator", locator, "module_types", strings.Join(provider.SupportedTypes(), ","))
+		m.BindAggregation(metricsNamespace, client.Aggregation)
 		return provider, client.SetURLs, nil
 
 	case "static":
@@ -428,6 +522,10 @@ func observeCycle(m *metrics.Metrics, r ingest.CycleResult) {
 		m.CyclePanics.Inc()
 	}
 	m.CycleDuration.Observe(r.Duration.Seconds())
+	m.RetentionHeldAt.Set(float64(r.RetentionHeldAt))
+	if r.UnfinishedBuilds >= 0 {
+		m.UnfinishedBuilds.Set(float64(r.UnfinishedBuilds))
+	}
 	m.KeysRead.Add(float64(r.KeysStaged))
 	m.KeysChanged.Add(float64(r.KeysChanged))
 
@@ -557,6 +655,56 @@ func defaultExtPin(source string) string {
 		return "latest"
 	}
 	return "finalized"
+}
+
+// envLimits: a typo or a negative used to fall back to the default without a line in the log.
+var envLimits = map[string][2]int64{
+	"CHAIN_ID":                         {0, math.MaxInt64},
+	"DATABASE_MAX_CONNS":               {1, 1000},
+	"PORT":                             {1, 65535},
+	"UPDATE_KEYS_INTERVAL_MS":          {1, 86_400_000},
+	"MAX_BLOCKS_OVERLAP":               {1, math.MaxInt32},
+	"RETAIN_VERSIONS":                  {0, 1_000_000},
+	"SECONDS_PER_SLOT":                 {0, 3600},
+	"SLOTS_PER_EPOCH":                  {0, 1 << 16},
+	"SECRETS_POLL_INTERVAL_IN_SECONDS": {1, 86_400},
+	"PROVIDER_CONCURRENT_REQUESTS":     {1, 1024},
+	"PROVIDER_JSON_RPC_MAX_BATCH_SIZE": {1, 10_000},
+	"PROVIDER_TIMEOUT_MS":              {1, 3_600_000},
+	"PROVIDER_MULTICALL_MAX_CALLS":     {0, 100_000},
+	"PROVIDER_MULTICALL_MAX_KEYS":      {0, 10_000_000},
+	"KEYS_BATCH_SIZE":                  {1, 100_000},
+	"KEYS_CALLS_PER_REQUEST":           {1, 100_000},
+	"KEYS_PER_REQUEST":                 {1, 10_000_000},
+	"KEYS_READ_CONCURRENCY":            {1, 1024},
+}
+
+var envBools = []string{"KEYS_API_BUILD_AT_FINALIZED", "PROVIDER_METERED", "PROVIDER_MULTICALL"}
+
+// validateEnv does not echo values: a credential pasted into the wrong variable stays out of the log.
+func validateEnv() error {
+	var errs []string
+	for key, limits := range envLimits {
+		v := os.Getenv(key)
+		if v == "" {
+			continue
+		}
+		if n, err := strconv.ParseInt(v, 10, 64); err != nil || n < limits[0] || n > limits[1] {
+			errs = append(errs, fmt.Sprintf("%s must be an integer from %d to %d", key, limits[0], limits[1]))
+		}
+	}
+	for _, key := range envBools {
+		if v := os.Getenv(key); v != "" {
+			if _, err := strconv.ParseBool(v); err != nil {
+				errs = append(errs, key+" must be true or false")
+			}
+		}
+	}
+	if len(errs) == 0 {
+		return nil
+	}
+	sort.Strings(errs)
+	return errors.New(strings.Join(errs, "; "))
 }
 
 func envInt(key string, def int) int {

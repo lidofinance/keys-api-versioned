@@ -17,13 +17,16 @@ func handleOpenAPISpec(w http.ResponseWriter, _ *http.Request) {
 }
 
 // Swagger UI from a CDN rather than ~1 MB vendored JS; if it fails, the page links the raw document.
+// Exact version plus SRI: a moved tag or a tampered file fails to load instead of running here.
 const docsPage = `<!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
   <title>Lido Keys API (versioned)</title>
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <link rel="stylesheet" href="https://unpkg.com/swagger-ui-dist@5/swagger-ui.css">
+  <link rel="stylesheet" href="https://unpkg.com/swagger-ui-dist@5.34.0/swagger-ui.css"
+        integrity="sha384-4c3vsE5f+trhFyHrFrLM1fFGUn531NIaC7dcqEWIJdoRQJ5CkJbSuSCwXLpaS1KF"
+        crossorigin="anonymous">
   <style>
     body { margin: 0; font: 16px/1.5 system-ui, sans-serif; }
     #offline { display: none; padding: 2rem 2.5rem; max-width: 40rem; }
@@ -38,7 +41,9 @@ const docsPage = `<!doctype html>
     <p><a href="/openapi.yaml"><code>/openapi.yaml</code></a></p>
   </div>
   <div id="swagger"></div>
-  <script src="https://unpkg.com/swagger-ui-dist@5/swagger-ui-bundle.js"
+  <script src="https://unpkg.com/swagger-ui-dist@5.34.0/swagger-ui-bundle.js"
+          integrity="sha384-9Td7MKiIr2S83E1kZyyVi8KdJw/S8CpAvu0llLyMeg0xq/hDGiZJfVn0fV4llCmK"
+          crossorigin="anonymous"
           onerror="document.getElementById('offline').style.display='block'"></script>
   <script>
     window.addEventListener('load', function () {
