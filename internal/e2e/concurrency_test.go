@@ -7,7 +7,9 @@ import (
 	"io"
 	"net/http"
 	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/lidofinance/keys-api-versioned/internal/ingest"
 	"github.com/lidofinance/keys-api-versioned/internal/model"
@@ -204,13 +206,9 @@ func (b byteReaderAt) ReadAt(p []byte, off int64) (int, error) {
 	return n, nil
 }
 
-// Two builds rewriting one module at once must each fail or be correct, never silently swap content.
+// Two writers over one module must each fail or be correct. Without the writer lock the second
+// publishes a newer block while the first stalls, then the first rewrites rows that version shares.
 func TestTwoConcurrentBuildsOverOneModuleFailRatherThanCorrupt(t *testing.T) {
-	// Known defect: both builds succeed and swap content. Commit's close-then-open answers from each
-	// build's own snapshot; a per-module advisory lock around it would serialise them.
-	t.Skip("reproduces a known writer defect: concurrent builds over one module corrupt " +
-		"each other's versions silently; see docs/next-steps.md")
-
 	db := testpg.New(t)
 	ctx := context.Background()
 
@@ -224,16 +222,27 @@ func TestTwoConcurrentBuildsOverOneModuleFailRatherThanCorrupt(t *testing.T) {
 	}
 	results := make(chan outcome, 2)
 
-	var wg sync.WaitGroup
-	for i, salt := range []uint64{11, 12} {
-		wg.Add(1)
-		go func(i int, salt uint64) {
-			defer wg.Done()
-			generation := spec.WithSalt(salt)
-			at := testreg.At(db.Block(int64(i) + 1))
-			results <- outcome{generation, at.BlockNumber, buildAndPublish(ctx, db, generation, at)}
-		}(i, salt)
+	var (
+		wg        sync.WaitGroup
+		head      atomic.Int64
+		firstRead = make(chan struct{})
+	)
+	nextHead := func() model.ELBlockSnapshot { return testreg.At(db.Block(head.Add(1))) }
+	write := func(salt uint64, afterHead func()) {
+		defer wg.Done()
+		generation := spec.WithSalt(salt)
+		block, err := writeAsASeparateWriter(ctx, db, generation, nextHead, afterHead)
+		results <- outcome{generation, block, err}
 	}
+	wg.Add(2)
+	go write(11, func() {
+		close(firstRead)
+		time.Sleep(200 * time.Millisecond)
+	})
+	go func() {
+		<-firstRead
+		write(12, func() {})
+	}()
 	wg.Wait()
 	close(results)
 
@@ -264,7 +273,24 @@ func TestTwoConcurrentBuildsOverOneModuleFailRatherThanCorrupt(t *testing.T) {
 	}
 }
 
-func buildAndPublish(ctx context.Context, db *testpg.DB, spec testreg.Spec, at model.ELBlockSnapshot) (err error) {
+// writeAsASeparateWriter is a writer process in miniature: its own store, the writer lock, one build.
+func writeAsASeparateWriter(ctx context.Context, db *testpg.DB, spec testreg.Spec, head func() model.ELBlockSnapshot, afterHead func()) (int64, error) {
+	writer, err := ingest.NewPGStore(ctx, db.DSN, ingest.PGOptions{Source: "test"})
+	if err != nil {
+		return 0, err
+	}
+	defer writer.Close()
+	lock, err := writer.LockWriter(ctx, ingest.WriterLockOptions{})
+	if err != nil {
+		return 0, err
+	}
+	defer lock.Release()
+	at := head()
+	afterHead()
+	return at.BlockNumber, buildAndPublish(ctx, writer, spec, at)
+}
+
+func buildAndPublish(ctx context.Context, writer *ingest.PGStore, spec testreg.Spec, at model.ELBlockSnapshot) (err error) {
 	defer func() {
 		// testreg helpers fail the test by panicking through here; this turns that into an error.
 		if p := recover(); p != nil {
@@ -272,7 +298,7 @@ func buildAndPublish(ctx context.Context, db *testpg.DB, spec testreg.Spec, at m
 		}
 	}()
 
-	build, err := db.Writer.Begin(ctx, at)
+	build, err := writer.Begin(ctx, at)
 	if err != nil {
 		return err
 	}

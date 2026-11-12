@@ -119,14 +119,6 @@ func run(log *slog.Logger, masker *logmask.Masker) error {
 		"app_version", appVersion, "providers", redactedProviders(),
 		"pin", pin, "ext_pin", extPin)
 
-	// Only the writer applies the schema; a replica with missing tables is a deploy-order problem.
-	if mode != "server" {
-		if err := pgStore.Migrate(ctx); err != nil {
-			return err
-		}
-		log.Info("schema applied")
-	}
-
 	var syncer *ingest.Syncer
 	if mode != "server" {
 		provider, rotateEndpoints, err := buildSource(ctx, chainID, log, m)
@@ -156,7 +148,7 @@ func run(log *slog.Logger, masker *logmask.Masker) error {
 		syncer.OnModule = func(r ingest.ModuleResult) { observeModule(m, r) }
 	}
 
-	errs := make(chan error, 2)
+	errs := make(chan error, 3)
 
 	syncDone := make(chan struct{})
 	// Runs before the deferred pool close: a build cut short by shutdown still needs it to abort.
@@ -174,13 +166,7 @@ func run(log *slog.Logger, masker *logmask.Masker) error {
 	} else {
 		go func() {
 			defer close(syncDone)
-			log.Info("ingest starting",
-				"source", envOr("KEYS_API_SOURCE", "lido-core"),
-				"interval_ms", envInt("UPDATE_KEYS_INTERVAL_MS", 5000),
-				"retain_versions", envInt("RETAIN_VERSIONS", 20),
-				"epoch", epochDuration().String(),
-				"metered", meteredEndpoints())
-			errs <- syncer.Run(ctx)
+			errs <- runWriter(ctx, pgStore, syncer, log)
 		}()
 	}
 
@@ -242,6 +228,28 @@ func run(log *slog.Logger, masker *logmask.Masker) error {
 		}
 	}
 	return nil
+}
+
+// runWriter waits for the writer lock without holding up the API: in KEYS_API_MODE=all a rollout
+// keeps the old pod, and its lock, until the new one is ready. Only the writer applies the schema.
+func runWriter(ctx context.Context, pgStore *ingest.PGStore, syncer *ingest.Syncer, log *slog.Logger) error {
+	return pgStore.RunExclusive(ctx, ingest.WriterLockOptions{
+		OnWait: func() { log.Warn("another writer holds the writer lock for this schema; waiting for it to stop") },
+		OnStop: func(err error) { log.Error("writer stopped; taking the writer lock again", "err", err) },
+	}, func(ctx context.Context) error {
+		log.Info("writer lock acquired")
+		if err := pgStore.Migrate(ctx); err != nil {
+			return err
+		}
+		log.Info("schema applied")
+		log.Info("ingest starting",
+			"source", envOr("KEYS_API_SOURCE", "lido-core"),
+			"interval_ms", envInt("UPDATE_KEYS_INTERVAL_MS", 5000),
+			"retain_versions", envInt("RETAIN_VERSIONS", 20),
+			"epoch", epochDuration().String(),
+			"metered", meteredEndpoints())
+		return syncer.Run(ctx)
+	})
 }
 
 // newHTTPServer has no WriteTimeout: a full dump is 200 MiB, so streams move a per-write deadline
