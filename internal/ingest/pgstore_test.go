@@ -2,6 +2,7 @@ package ingest_test
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"os"
@@ -224,6 +225,28 @@ func readUsed(ctx context.Context, t *testing.T, s *store.App, m model.StakingMo
 		t.Fatalf("key %d of module %d is missing at this pin", index, m.ID)
 	}
 	return used
+}
+
+// Begin reports what holds the identity, so the loop can tell a built version from an abandoned try.
+func TestBeginNamesTheStatusOfAnExistingVersion(t *testing.T) {
+	db := testpg.New(t)
+	ctx := context.Background()
+	at := testreg.At(db.Block(0))
+
+	build, err := db.Writer.Begin(ctx, at)
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	build.Abort(ctx)
+
+	_, err = db.Writer.Begin(ctx, at)
+	var existing ingest.ExistingVersionError
+	if !errors.As(err, &existing) || !errors.Is(err, ingest.ErrVersionExists) {
+		t.Fatalf("second begin: got %v, want ExistingVersionError", err)
+	}
+	if existing.Status != "superseded" || existing.Done() {
+		t.Errorf("got status %q (done %t), want an unfinished superseded row", existing.Status, existing.Done())
+	}
 }
 
 // Before chain-named schemas, a database from another chain looked like a deep reorg and was

@@ -4,6 +4,7 @@ package ingest
 import (
 	"context"
 	"errors"
+	"fmt"
 
 	"github.com/lidofinance/keys-api-versioned/internal/model"
 )
@@ -115,3 +116,15 @@ type Pruned struct {
 
 // ErrVersionExists: the sync loop treats it as "nothing to do this cycle".
 var ErrVersionExists = errors.New("a version with this block identity already exists")
+
+// ExistingVersionError is ErrVersionExists with the row's status: a building or superseded row is
+// an attempt that did not finish, and skipping it must not count as having built the version.
+type ExistingVersionError struct{ Status string }
+
+func (e ExistingVersionError) Error() string {
+	return fmt.Sprintf("%s (status %s)", ErrVersionExists, e.Status)
+}
+
+func (e ExistingVersionError) Is(target error) bool { return target == ErrVersionExists }
+
+func (e ExistingVersionError) Done() bool { return e.Status == "published" || e.Status == "stale" }

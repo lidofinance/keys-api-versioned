@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/lidofinance/keys-api-versioned/internal/model"
 	"github.com/lidofinance/keys-api-versioned/internal/source"
@@ -272,6 +273,108 @@ func TestCyclePanicFailsTheCycleAndTheNextOneRecovers(t *testing.T) {
 	}
 }
 
+func TestFailedCyclesBackOffAndASuccessResetsTheSchedule(t *testing.T) {
+	src := &failingSource{fakeSource: newFakeSource(1), fail: 4}
+	s := NewSyncer(src, newFakeStore(), SyncConfig{Interval: 5 * time.Second}, nil)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	var waits []time.Duration
+	s.wait = func(_ context.Context, d time.Duration) error {
+		waits = append(waits, d)
+		if len(waits) == 6 {
+			cancel()
+			return ctx.Err()
+		}
+		return nil
+	}
+	if err := s.Run(ctx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("Run: %v", err)
+	}
+
+	// Four failures: the jittered upper halves of 5, 10, 20 and 40 s; then success, back to the interval.
+	for i, upper := range []time.Duration{5 * time.Second, 10 * time.Second, 20 * time.Second, 40 * time.Second} {
+		if waits[i] < upper/2 || waits[i] > upper {
+			t.Errorf("wait after failure %d is %s, want within [%s, %s]", i+1, waits[i], upper/2, upper)
+		}
+	}
+	for i := 4; i < 6; i++ {
+		if waits[i] > 5*time.Second {
+			t.Errorf("wait %d after recovering is %s, want at most the 5s interval", i+1, waits[i])
+		}
+	}
+}
+
+func TestTheRetryDelayIsCapped(t *testing.T) {
+	for _, jitter := range []float64{0, 0.5, 1} {
+		got := retryDelay(5*time.Second, 1000, jitter)
+		if got > maxRetryBackoff || got < maxRetryBackoff/2 {
+			t.Errorf("jitter %.1f: delay after 1000 failures is %s, want within [%s, %s]",
+				jitter, got, maxRetryBackoff/2, maxRetryBackoff)
+		}
+	}
+}
+
+// A shutdown cancels the cycle context; an abort on it left the row building.
+func TestABuildCutShortByShutdownIsStillAborted(t *testing.T) {
+	src := &failingSource{fakeSource: newFakeSource(1)}
+	store := newFakeStore()
+	s := NewSyncer(src, store, SyncConfig{}, nil)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	src.onKeys = cancel
+	if result := s.Cycle(ctx); result.Err == nil {
+		t.Fatal("a cycle cancelled mid-build reported success")
+	}
+	if store.abortCtxErr == nil {
+		t.Fatal("the unfinished build was never aborted")
+	}
+	if err := *store.abortCtxErr; err != nil {
+		t.Fatalf("abort ran on a context already done (%v), so the row stays building", err)
+	}
+}
+
+// Re-reading a block whose earlier attempt was aborted used to report the version as built.
+func TestASkippedRebuildOverAnUnfinishedAttemptIsNotASuccess(t *testing.T) {
+	for status, wantErr := range map[string]bool{"superseded": true, "building": true, "published": false} {
+		t.Run(status, func(t *testing.T) {
+			src := newFakeSource(1)
+			store := newFakeStore()
+			store.existing = status
+			s := NewSyncer(src, store, SyncConfig{}, nil)
+
+			result := s.Cycle(context.Background())
+			if (result.Err != nil) != wantErr {
+				t.Fatalf("existing %s row: got err %v, want error %t", status, result.Err, wantErr)
+			}
+			if wantErr && result.VersionBlock == src.block {
+				t.Errorf("reported version %d as built", result.VersionBlock)
+			}
+		})
+	}
+}
+
+type failingSource struct {
+	*fakeSource
+	fail   int
+	onKeys func()
+}
+
+func (f *failingSource) Head(ctx context.Context) (model.ELBlockSnapshot, error) {
+	if f.fail > 0 {
+		f.fail--
+		return model.ELBlockSnapshot{}, errors.New("endpoint down")
+	}
+	return f.fakeSource.Head(ctx)
+}
+
+func (f *failingSource) Keys(ctx context.Context, at source.Ref, m model.StakingModule, fn func(model.Key) error) error {
+	if f.onKeys != nil {
+		f.onKeys()
+		return ctx.Err()
+	}
+	return f.fakeSource.Keys(ctx, at, m, fn)
+}
+
 type panickingSource struct {
 	*fakeSource
 	panics int
@@ -397,6 +500,9 @@ type fakeStore struct {
 	extends        int
 	staled         int
 	supersededFrom int64
+	// existing makes Begin find the identity taken by a row in this status.
+	existing    string
+	abortCtxErr *error
 }
 
 func newFakeStore() *fakeStore { return &fakeStore{} }
@@ -415,6 +521,9 @@ func (s *fakeStore) Recent(_ context.Context, limit int) ([]StoredVersion, error
 }
 
 func (s *fakeStore) Begin(_ context.Context, at model.ELBlockSnapshot) (Build, error) {
+	if s.existing != "" {
+		return nil, ExistingVersionError{Status: s.existing}
+	}
 	s.nextID++
 	return &fakeBuild{store: s, id: s.nextID, at: at}, nil
 }
@@ -518,7 +627,10 @@ func (b *fakeBuild) Publish(_ context.Context, label string, finalized int64) er
 	return nil
 }
 
-func (b *fakeBuild) Abort(context.Context) {}
+func (b *fakeBuild) Abort(ctx context.Context) {
+	err := ctx.Err()
+	b.store.abortCtxErr = &err
+}
 
 type fakeModuleKeys struct{ staged int64 }
 

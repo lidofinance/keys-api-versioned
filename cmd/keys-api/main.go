@@ -158,8 +158,22 @@ func run(log *slog.Logger, masker *logmask.Masker) error {
 
 	errs := make(chan error, 2)
 
-	if syncer != nil {
+	syncDone := make(chan struct{})
+	// Runs before the deferred pool close: a build cut short by shutdown still needs it to abort.
+	defer func() {
+		stop()
+		select {
+		case <-syncDone:
+		case <-time.After(15 * time.Second):
+			log.Warn("ingest did not stop within 15s; closing the database pool anyway")
+		}
+	}()
+
+	if syncer == nil {
+		close(syncDone)
+	} else {
 		go func() {
+			defer close(syncDone)
 			log.Info("ingest starting",
 				"source", envOr("KEYS_API_SOURCE", "lido-core"),
 				"interval_ms", envInt("UPDATE_KEYS_INTERVAL_MS", 5000),

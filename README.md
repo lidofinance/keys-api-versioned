@@ -262,6 +262,8 @@ An attempt fails early on a dead endpoint (5 s to connect, 30 s to the response 
 
 A cold sync is a few hundred requests once. The poll runs every `UPDATE_KEYS_INTERVAL_MS` forever, so on a metered endpoint it is the poll that decides the bill — and the number nobody had was how many requests one iteration makes. `keys_api_rpc_requests_total{method,result}` now answers it from the service instead of from arithmetic; the counts below are that arithmetic, read off both implementations at four mainnet modules with nothing changed.
 
+A failing cycle does not keep that pace: consecutive failures back off from the interval, doubling each time with jitter, up to five minutes, and the first success restores the interval.
+
 | | this service | canonical |
 |---|---|---|
 | head | 1 `eth_getBlockByNumber(latest)` | 1 `eth_getBlockByNumber(latest)` |

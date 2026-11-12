@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math/rand/v2"
 	"runtime/debug"
 	"sort"
 	"strings"
@@ -33,6 +34,8 @@ type Syncer struct {
 	finalized model.ELBlockSnapshot
 
 	now func() time.Time
+	// wait sleeps between cycles; tests replace it to record the schedule.
+	wait func(ctx context.Context, d time.Duration) error
 
 	// hooks let the app observe cycles without this package importing metrics.
 	OnCycle func(CycleResult)
@@ -112,28 +115,61 @@ func NewSyncer(src source.Provider, store Store, cfg SyncConfig, log *slog.Logge
 	if log == nil {
 		log = slog.New(slog.NewTextHandler(io.Discard, nil))
 	}
-	return &Syncer{source: src, store: store, cfg: cfg, log: log, now: time.Now}
+	return &Syncer{source: src, store: store, cfg: cfg, log: log, now: time.Now, wait: sleep}
 }
 
-func (s *Syncer) Run(ctx context.Context) error {
-	ticker := time.NewTicker(s.cfg.Interval)
-	defer ticker.Stop()
+// Consecutive failed cycles back off exponentially from the interval up to maxRetryBackoff:
+// against a metered provider a fixed-rate retry spends the quota it is failing on.
+const maxRetryBackoff = 5 * time.Minute
 
+// abortTimeout: an abort runs on a context of its own, so a shutdown still marks the row.
+const abortTimeout = 10 * time.Second
+
+func (s *Syncer) Run(ctx context.Context) error {
+	failures := 0
 	for {
 		result := s.Cycle(ctx)
-		if result.Err != nil && !errors.Is(result.Err, context.Canceled) {
+		failed := result.Err != nil && !errors.Is(result.Err, context.Canceled)
+		if failed {
+			failures++
 			s.log.Error("sync cycle failed", "err", result.Err,
-				"head", result.HeadBlock, "version", result.VersionBlock)
+				"head", result.HeadBlock, "version", result.VersionBlock, "consecutive_failures", failures)
+		} else {
+			failures = 0
 		}
 		if s.OnCycle != nil {
 			s.OnCycle(result)
 		}
 
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-ticker.C:
+		delay := max(s.cfg.Interval-result.Duration, 0)
+		if failures > 0 {
+			delay = retryDelay(s.cfg.Interval, failures, rand.Float64())
 		}
+		if err := s.wait(ctx, delay); err != nil {
+			return err
+		}
+	}
+}
+
+// retryDelay is interval·2^(failures-1), capped, then jittered into its upper half so replicas
+// that failed together do not retry together.
+func retryDelay(interval time.Duration, failures int, jitter float64) time.Duration {
+	d := interval
+	for i := 1; i < failures && d < maxRetryBackoff; i++ {
+		d *= 2
+	}
+	d = min(d, maxRetryBackoff)
+	return d/2 + time.Duration(jitter*float64(d/2))
+}
+
+func sleep(ctx context.Context, d time.Duration) error {
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
 	}
 }
 
@@ -387,6 +423,10 @@ func (s *Syncer) rebuild(ctx context.Context, head model.ELBlockSnapshot, scope 
 
 	build, err := s.store.Begin(ctx, head)
 	if errors.Is(err, ErrVersionExists) {
+		var existing ExistingVersionError
+		if errors.As(err, &existing) && !existing.Done() {
+			return fmt.Errorf("block %d: %w; building again needs a new block", head.BlockNumber, err)
+		}
 		s.log.Debug("version already stored, skipping rebuild", "block", head.BlockNumber)
 		return nil
 	}
@@ -397,7 +437,9 @@ func (s *Syncer) rebuild(ctx context.Context, head model.ELBlockSnapshot, scope 
 	committed := false
 	defer func() {
 		if !committed {
-			build.Abort(ctx)
+			abortCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), abortTimeout)
+			defer cancel()
+			build.Abort(abortCtx)
 		}
 	}()
 

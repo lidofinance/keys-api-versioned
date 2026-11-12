@@ -253,7 +253,12 @@ func (s *PGStore) Begin(ctx context.Context, at model.ELBlockSnapshot) (Build, e
 		returning id`,
 		at.BlockNumber, strings.ToLower(at.BlockHash), at.Timestamp, s.source).Scan(&id)
 	if errors.Is(err, pgx.ErrNoRows) {
-		return nil, ErrVersionExists
+		var status string
+		if err := s.pool.QueryRow(ctx, `select status from versions where block_number = $1 and block_hash = $2`,
+			at.BlockNumber, strings.ToLower(at.BlockHash)).Scan(&status); err != nil {
+			return nil, ErrVersionExists
+		}
+		return nil, ExistingVersionError{Status: status}
 	}
 	if err != nil {
 		return nil, fmt.Errorf("begin version: %w", err)
