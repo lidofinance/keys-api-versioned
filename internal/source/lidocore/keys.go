@@ -103,7 +103,11 @@ func streamKeys(
 	fn func(model.Key) error,
 ) error {
 	pacing = pacing.withDefaults()
+	if err := checkKeyTotals(operators); err != nil {
+		return err
+	}
 	groups := groupKeyReads(planKeyReads(operators, pacing.keysBatch), pacing.callsPerRequest, pacing.keysPerRequest)
+	emitted := make(map[int32]int64, len(operators))
 
 	started := time.Now()
 	var read int
@@ -121,6 +125,17 @@ func streamKeys(
 			wg.Add(1)
 			go func(i int, group []keyRead) {
 				defer wg.Done()
+				// A panic here would bypass the cycle's recover and stop the process.
+				defer func() {
+					if r := recover(); r != nil {
+						err := fmt.Errorf("panic reading %s keys: %v", moduleAddress, r)
+						firstMu.Lock()
+						if firstEr == nil {
+							firstEr = err
+						}
+						firstMu.Unlock()
+					}
+				}()
 				keys, err := readKeyGroup(ctx, c, at, moduleAddress, spec, group)
 				if err != nil {
 					firstMu.Lock()
@@ -143,6 +158,7 @@ func streamKeys(
 				if err := fn(keys[i]); err != nil {
 					return err
 				}
+				emitted[keys[i].OperatorIndex]++
 				read++
 			}
 		}
@@ -150,6 +166,28 @@ func streamKeys(
 		// Without this a slow node was indistinguishable from a hang.
 		lastGroup := window[len(window)-1]
 		logProgress(log, moduleAddress, lastGroup[len(lastGroup)-1], end, len(groups), read, started)
+	}
+	for _, op := range operators {
+		if emitted[op.Index] != int64(op.TotalSigningKeys) {
+			return fmt.Errorf("operator %d of %s: read %d keys, totalSigningKeys is %d",
+				op.Index, moduleAddress, emitted[op.Index], op.TotalSigningKeys)
+		}
+	}
+	return nil
+}
+
+// checkKeyTotals runs before planning: the plan holds one entry per batch of keys.
+func checkKeyTotals(operators []model.Operator) error {
+	var total int64
+	for _, op := range operators {
+		if op.TotalSigningKeys < 0 || int64(op.TotalSigningKeys) > maxKeysPerOperator {
+			return fmt.Errorf("operator %d: totalSigningKeys %d is out of range [0, %d]",
+				op.Index, op.TotalSigningKeys, maxKeysPerOperator)
+		}
+		total += int64(op.TotalSigningKeys)
+	}
+	if total > maxKeysPerModule {
+		return fmt.Errorf("module holds %d keys, more than %d", total, maxKeysPerModule)
 	}
 	return nil
 }
@@ -190,6 +228,10 @@ func readKeyGroup(
 		if err != nil {
 			return nil, fmt.Errorf("%s(op %d, offset %d): %w",
 				spec.method, read.op.Index, read.span.offset, err)
+		}
+		if uint64(len(decoded)) != read.span.limit {
+			return nil, fmt.Errorf("%s(op %d, offset %d): got %d keys, asked for %d",
+				spec.method, read.op.Index, read.span.offset, len(decoded), read.span.limit)
 		}
 		keys = append(keys, decoded...)
 	}

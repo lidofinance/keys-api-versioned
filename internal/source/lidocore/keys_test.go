@@ -182,7 +182,10 @@ func equalBytes(a, b []byte) bool {
 	return true
 }
 
-type keysNode struct{}
+// delta changes how many keys an answer carries for an operator, against what was asked.
+type keysNode struct {
+	delta map[int32]int
+}
 
 type aggregateCall struct {
 	Target       common.Address
@@ -269,7 +272,7 @@ func (n *keysNode) answerKeys(data []byte) (string, error) {
 	}
 	operator := int32(args[0].(*big.Int).Int64())
 	offset := int32(args[1].(*big.Int).Int64())
-	limit := int(args[2].(*big.Int).Int64())
+	limit := int(args[2].(*big.Int).Int64()) + n.delta[operator]
 
 	var (
 		pubkeys    []byte

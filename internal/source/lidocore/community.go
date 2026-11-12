@@ -66,11 +66,10 @@ func (r *CommunityReader) Operators(ctx context.Context, c *eth.Client, at eth.B
 	if err != nil {
 		return nil, fmt.Errorf("getNodeOperatorsCount: %w", err)
 	}
-	count, ok := out[0].(*big.Int)
-	if !ok {
-		return nil, fmt.Errorf("unexpected operator count type %T", out[0])
+	n, err := operatorCount(out)
+	if err != nil {
+		return nil, err
 	}
-	n := int(count.Int64())
 
 	operators := make([]model.Operator, n)
 	for start := 0; start < n; start += operatorBatchSize {
@@ -101,7 +100,10 @@ func (r *CommunityReader) Operators(ctx context.Context, c *eth.Client, at eth.B
 			if err != nil {
 				return nil, err
 			}
-			op.DepositableValidatorsCount = int32(depositableFromSummary(results[width+i]))
+			op.DepositableValidatorsCount, err = depositableFromSummary(int32(start+i), results[width+i])
+			if err != nil {
+				return nil, err
+			}
 			operators[start+i] = op
 		}
 	}

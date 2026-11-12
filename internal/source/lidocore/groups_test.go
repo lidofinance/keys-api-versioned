@@ -232,6 +232,8 @@ type operatorsNode struct {
 	mu         sync.Mutex
 	registry   string
 	operators  int64
+	count      *big.Int // overrides operators in the count answer
+	addedKeys  uint32
 	groups     map[int64]int64
 	names      map[int64]string
 	metadataTo string
@@ -302,10 +304,13 @@ func (n *operatorsNode) answer(method string, params []any) (string, error) {
 		return packAddress(registry), nil
 
 	case selector == [4]byte(eth.CSMABI.Methods["getNodeOperatorsCount"].ID):
+		if n.count != nil {
+			return packUint(n.count), nil
+		}
 		return packUint(big.NewInt(n.operators)), nil
 
 	case selector == [4]byte(eth.CSMABI.Methods["getNodeOperator"].ID):
-		return packNodeOperator(argID(data))
+		return packNodeOperator(argID(data), n.addedKeys)
 
 	case selector == [4]byte(eth.CSMABI.Methods["getNodeOperatorSummary"].ID):
 		return packSummary()
@@ -358,9 +363,12 @@ type nodeOperator struct {
 	UsedPriorityQueue          bool
 }
 
-func packNodeOperator(id int64) (string, error) {
+func packNodeOperator(id int64, added uint32) (string, error) {
+	if added == 0 {
+		added = 2
+	}
 	op := nodeOperator{
-		TotalAddedKeys:     2,
+		TotalAddedKeys:     added,
 		TotalWithdrawnKeys: uint32(id),
 		TotalDepositedKeys: 1,
 		TotalVettedKeys:    2,

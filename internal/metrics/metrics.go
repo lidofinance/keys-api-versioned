@@ -16,6 +16,7 @@ type Metrics struct {
 	registry *prometheus.Registry
 
 	CyclesTotal   *prometheus.CounterVec
+	CyclePanics   prometheus.Counter
 	CycleDuration prometheus.Histogram
 	KeysRead      prometheus.Counter
 	KeysChanged   prometheus.Counter
@@ -80,6 +81,10 @@ func New(namespace string) *Metrics {
 			Namespace: namespace, Name: "sync_cycles_total",
 			Help: "Sync cycles by action (extend, rebuild, supersede) and outcome.",
 		}, []string{"action", "outcome"}),
+		CyclePanics: prometheus.NewCounter(prometheus.CounterOpts{
+			Namespace: namespace, Name: "sync_cycle_panics_total",
+			Help: "Sync cycles that panicked. The cycle counts as failed and the API keeps serving; any increase is a bug or a malformed source answer.",
+		}),
 		CycleDuration: prometheus.NewHistogram(prometheus.HistogramOpts{
 			Namespace: namespace, Name: "sync_cycle_duration_seconds",
 			Help:    "Duration of one sync cycle.",
@@ -212,7 +217,7 @@ func New(namespace string) *Metrics {
 		}, []string{"operator", "srModuleId", "used"}),
 	}
 
-	reg.MustRegister(m.CyclesTotal, m.CycleDuration, m.KeysRead, m.KeysChanged,
+	reg.MustRegister(m.CyclesTotal, m.CyclePanics, m.CycleDuration, m.KeysRead, m.KeysChanged,
 		m.VersionBlock, m.VersionAge, m.ConfirmedAge, m.HeadBlock, m.BlocksBehind, m.VersionStale,
 		m.RebuildsTotal, m.ReorgsTotal, m.AuditsTotal, m.AuditDivergenceTotal,
 		m.RequestDuration, m.ResponseBytes,

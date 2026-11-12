@@ -248,6 +248,44 @@ func TestCycleBlockGapForcesRebuild(t *testing.T) {
 	}
 }
 
+// In the combined mode the API shares the process with ingest, so a malformed source answer that
+// panics must fail one cycle, not exit.
+func TestCyclePanicFailsTheCycleAndTheNextOneRecovers(t *testing.T) {
+	src := &panickingSource{fakeSource: newFakeSource(2), panics: 1}
+	store := newFakeStore()
+	s := NewSyncer(src, store, SyncConfig{}, nil)
+
+	result := s.Cycle(context.Background())
+	if result.Err == nil || !result.Panicked {
+		t.Fatalf("got err %v, panicked %t, want a failed cycle marked as panicked", result.Err, result.Panicked)
+	}
+	if len(store.published) != 0 {
+		t.Fatalf("published %d versions from a panicked build, want none", len(store.published))
+	}
+
+	result = s.Cycle(context.Background())
+	if result.Err != nil || result.Panicked {
+		t.Fatalf("next cycle: err %v, panicked %t, want a clean rebuild", result.Err, result.Panicked)
+	}
+	if len(store.published) != 1 {
+		t.Fatalf("published %d versions after recovering, want 1", len(store.published))
+	}
+}
+
+type panickingSource struct {
+	*fakeSource
+	panics int
+}
+
+func (p *panickingSource) Keys(ctx context.Context, at source.Ref, m model.StakingModule, fn func(model.Key) error) error {
+	if p.panics > 0 {
+		p.panics--
+		var operators []model.Operator
+		_ = operators[m.ID] // index out of range, as a malformed count would cause
+	}
+	return p.fakeSource.Keys(ctx, at, m, fn)
+}
+
 type fakeSource struct {
 	block   int64
 	branch  string

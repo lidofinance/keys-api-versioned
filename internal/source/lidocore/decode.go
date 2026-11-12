@@ -101,13 +101,22 @@ func decodeCuratedOperator(index int32, moduleAddress string, values []any) (mod
 		return model.Operator{}, fmt.Errorf("getNodeOperator: name is %T", values[1])
 	}
 
+	var counts [4]int32
+	for i, field := range []string{"totalVetted", "totalExited", "totalAdded", "totalDeposited"} {
+		n, err := keyCount(values[3+i])
+		if err != nil {
+			return model.Operator{}, fmt.Errorf("getNodeOperator(%d) %s: %w", index, field, err)
+		}
+		counts[i] = n
+	}
+
 	return model.Operator{
 		Name:              operatorName(name, index),
 		RewardAddress:     strings.ToLower(addressOf(values[2])),
-		StakingLimit:      int32(intOf(values[3])),
-		StoppedValidators: int32(intOf(values[4])),
-		TotalSigningKeys:  int32(intOf(values[5])),
-		UsedSigningKeys:   int32(intOf(values[6])),
+		StakingLimit:      counts[0],
+		StoppedValidators: counts[1],
+		TotalSigningKeys:  counts[2],
+		UsedSigningKeys:   counts[3],
 		Index:             index,
 		Active:            active,
 		ModuleAddress:     moduleAddress,
@@ -125,13 +134,27 @@ func decodeCommunityOperator(index int32, moduleAddress string, values []any) (m
 		return model.Operator{}, fmt.Errorf("getNodeOperator: expected a struct, got %T", values[0])
 	}
 
-	withdrawn := int32(fieldInt(s, "TotalWithdrawnKeys"))
+	fields := []string{"TotalVettedKeys", "TotalExitedKeys", "TotalAddedKeys", "TotalDepositedKeys", "TotalWithdrawnKeys"}
+	var counts [5]int32
+	for i, field := range fields {
+		f := s.FieldByName(field)
+		if !f.IsValid() {
+			return model.Operator{}, fmt.Errorf("getNodeOperator(%d): no field %s", index, field)
+		}
+		n, err := keyCount(f.Interface())
+		if err != nil {
+			return model.Operator{}, fmt.Errorf("getNodeOperator(%d) %s: %w", index, field, err)
+		}
+		counts[i] = n
+	}
+
+	withdrawn := counts[4]
 	return model.Operator{
 		RewardAddress:      strings.ToLower(fieldAddress(s, "RewardAddress")),
-		StakingLimit:       int32(fieldInt(s, "TotalVettedKeys")),
-		StoppedValidators:  int32(fieldInt(s, "TotalExitedKeys")),
-		TotalSigningKeys:   int32(fieldInt(s, "TotalAddedKeys")),
-		UsedSigningKeys:    int32(fieldInt(s, "TotalDepositedKeys")),
+		StakingLimit:       counts[0],
+		StoppedValidators:  counts[1],
+		TotalSigningKeys:   counts[2],
+		UsedSigningKeys:    counts[3],
 		Index:              index,
 		Active:             true,
 		ModuleAddress:      moduleAddress,
@@ -149,11 +172,15 @@ func operatorName(name string, index int32) string {
 }
 
 // depositableValidatorsCount is the last output of getNodeOperatorSummary in both ABIs.
-func depositableFromSummary(values []any) int64 {
+func depositableFromSummary(index int32, values []any) (int32, error) {
 	if len(values) == 0 {
-		return 0
+		return 0, fmt.Errorf("getNodeOperatorSummary(%d): empty result", index)
 	}
-	return intOf(values[len(values)-1])
+	n, err := keyCount(values[len(values)-1])
+	if err != nil {
+		return 0, fmt.Errorf("getNodeOperatorSummary(%d) depositableValidatorsCount: %w", index, err)
+	}
+	return n, nil
 }
 
 func firstValue(values []any) any {
@@ -277,6 +304,55 @@ func fieldAddress(v reflect.Value, name string) string {
 		return ""
 	}
 	return addressOf(f.Interface())
+}
+
+// Ceilings on counts read from the chain; mainnet modules hold under a thousand operators. Past
+// them a provider answer is treated as wrong data, not allocated for.
+const (
+	maxOperatorsPerModule = 100_000
+	maxKeysPerOperator    = 10_000_000
+	maxKeysPerModule      = 50_000_000
+)
+
+func operatorCount(out []any) (int, error) {
+	if len(out) == 0 {
+		return 0, fmt.Errorf("getNodeOperatorsCount: empty result")
+	}
+	n, err := countOf(out[0], maxOperatorsPerModule)
+	if err != nil {
+		return 0, fmt.Errorf("getNodeOperatorsCount: %w", err)
+	}
+	return int(n), nil
+}
+
+func keyCount(v any) (int32, error) {
+	n, err := countOf(v, maxKeysPerOperator)
+	return int32(n), err
+}
+
+// countOf is intOf without the wrap-around: a negative, an oversized or an unknown value is an error.
+func countOf(v any, limit int64) (int64, error) {
+	var n int64
+	switch t := v.(type) {
+	case *big.Int:
+		if t == nil || !t.IsInt64() {
+			return 0, fmt.Errorf("count %v is out of range [0, %d]", t, limit)
+		}
+		n = t.Int64()
+	case uint64:
+		if t > uint64(limit) {
+			return 0, fmt.Errorf("count %d is out of range [0, %d]", t, limit)
+		}
+		n = int64(t)
+	case uint8, uint16, uint32, int64, int:
+		n = intOf(t)
+	default:
+		return 0, fmt.Errorf("count has unexpected type %T", v)
+	}
+	if n < 0 || n > limit {
+		return 0, fmt.Errorf("count %d is out of range [0, %d]", n, limit)
+	}
+	return n, nil
 }
 
 func intOf(v any) int64 {

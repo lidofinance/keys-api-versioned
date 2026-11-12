@@ -394,6 +394,9 @@ func observeCycle(m *metrics.Metrics, r ingest.CycleResult) {
 	}
 
 	m.CyclesTotal.WithLabelValues(action, outcome).Inc()
+	if r.Panicked {
+		m.CyclePanics.Inc()
+	}
 	m.CycleDuration.Observe(r.Duration.Seconds())
 	m.KeysRead.Add(float64(r.KeysStaged))
 	m.KeysChanged.Add(float64(r.KeysChanged))

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"runtime/debug"
 	"sort"
 	"strings"
 	"time"
@@ -94,6 +95,7 @@ type CycleResult struct {
 	ReorgFrom int64
 	Duration  time.Duration
 	Err       error
+	Panicked  bool
 }
 
 func NewSyncer(src source.Provider, store Store, cfg SyncConfig, log *slog.Logger) *Syncer {
@@ -135,11 +137,18 @@ func (s *Syncer) Run(ctx context.Context) error {
 	}
 }
 
-// The return is named so the deferred duration lands in it: an unnamed return copies the struct
-// before the defer runs and every cycle reports zero.
+// Named return, or the deferred duration is lost (every cycle reported zero). A panic becomes a
+// failed cycle: in the combined mode the API shares this process.
 func (s *Syncer) Cycle(ctx context.Context) (result CycleResult) {
 	started := time.Now()
-	defer func() { result.Duration = time.Since(started) }()
+	defer func() {
+		if r := recover(); r != nil {
+			s.log.Error("sync cycle panicked", "panic", r, "stack", string(debug.Stack()))
+			result.Err = fmt.Errorf("sync cycle panicked: %v", r)
+			result.Panicked = true
+		}
+		result.Duration = time.Since(started)
+	}()
 
 	head, err := s.source.Head(ctx)
 	if err != nil {
