@@ -105,6 +105,8 @@ func run(log *slog.Logger, masker *logmask.Masker) error {
 		MaxConns: int32(envInt("DATABASE_MAX_CONNS", 10)),
 		Source:   envOr("KEYS_API_SOURCE", "lido-core"),
 		ChainID:  chainID,
+		// The API comes up anyway: liveness passes, readiness says 503 until a version is served.
+		Lazy: true,
 	})
 	if err != nil {
 		return err
@@ -237,6 +239,11 @@ func run(log *slog.Logger, masker *logmask.Masker) error {
 // runWriter waits for the writer lock without holding up the API: in KEYS_API_MODE=all a rollout
 // keeps the old pod, and its lock, until the new one is ready. Only the writer applies the schema.
 func runWriter(ctx context.Context, pgStore *ingest.PGStore, syncer *ingest.Syncer, log *slog.Logger) error {
+	if err := pgStore.WaitForDatabase(ctx, func(err error, next time.Duration) {
+		log.Warn("database unreachable, retrying", "err", err, "in", next.String())
+	}); err != nil {
+		return err
+	}
 	return pgStore.RunExclusive(ctx, ingest.WriterLockOptions{
 		OnWait: func() { log.Warn("another writer holds the writer lock for this schema; waiting for it to stop") },
 		OnStop: func(err error) { log.Error("writer stopped; taking the writer lock again", "err", err) },

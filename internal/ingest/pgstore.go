@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -34,10 +35,6 @@ func chainSchema(chainID int64) string {
 	return fmt.Sprintf("chain_%d", chainID)
 }
 
-func dsnHasSearchPath(dsn string) bool {
-	return strings.Contains(dsn, "search_path=")
-}
-
 type PGOptions struct {
 	MaxConns int32
 	Source   string
@@ -45,23 +42,23 @@ type PGOptions struct {
 	ChainID int64
 	// KeyStageBatch is the COPY batch size; 0 means 20 000.
 	KeyStageBatch int
+	// Lazy skips the ping: the pool connects on first use, so a database that is down at boot does
+	// not stop the process (WaitForDatabase is the blocking variant).
+	Lazy bool
 }
 
-func NewPGStore(ctx context.Context, dsn string, o PGOptions) (*PGStore, error) {
-	schema := ""
-	if o.ChainID != 0 && !dsnHasSearchPath(dsn) {
-		schema = chainSchema(o.ChainID)
-		separator := "?"
-		if strings.Contains(dsn, "?") {
-			separator = "&"
-		}
-		// pgx passes unknown DSN keys to the server as runtime parameters; Migrate verifies it took.
-		dsn += separator + "search_path=" + schema
-	}
+const maxConnectBackoff = 30 * time.Second
 
+func NewPGStore(ctx context.Context, dsn string, o PGOptions) (*PGStore, error) {
 	cfg, err := pgxpool.ParseConfig(dsn)
 	if err != nil {
 		return nil, fmt.Errorf("parse dsn: %w", err)
+	}
+	// A runtime parameter, not a suffix on the DSN: that only worked for the URL form.
+	schema := ""
+	if o.ChainID != 0 && cfg.ConnConfig.RuntimeParams["search_path"] == "" {
+		schema = chainSchema(o.ChainID)
+		cfg.ConnConfig.RuntimeParams["search_path"] = schema
 	}
 	if o.MaxConns > 0 {
 		cfg.MaxConns = o.MaxConns
@@ -70,9 +67,11 @@ func NewPGStore(ctx context.Context, dsn string, o PGOptions) (*PGStore, error) 
 	if err != nil {
 		return nil, fmt.Errorf("connect: %w", err)
 	}
-	if err := pool.Ping(ctx); err != nil {
-		pool.Close()
-		return nil, fmt.Errorf("ping: %w", err)
+	if !o.Lazy {
+		if err := pool.Ping(ctx); err != nil {
+			pool.Close()
+			return nil, fmt.Errorf("ping: %w", err)
+		}
 	}
 
 	batch := o.KeyStageBatch
@@ -83,6 +82,27 @@ func NewPGStore(ctx context.Context, dsn string, o PGOptions) (*PGStore, error) 
 }
 
 func (s *PGStore) Close() { s.pool.Close() }
+
+// WaitForDatabase pings with backoff until the database answers or ctx ends.
+func (s *PGStore) WaitForDatabase(ctx context.Context, onRetry func(err error, next time.Duration)) error {
+	for wait := time.Second; ; wait = min(2*wait, maxConnectBackoff) {
+		err := s.pool.Ping(ctx)
+		if err == nil {
+			return nil
+		}
+		if ctx.Err() != nil {
+			return fmt.Errorf("ping: %w", err)
+		}
+		if onRetry != nil {
+			onRetry(err, wait)
+		}
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("ping: %w", ctx.Err())
+		case <-time.After(wait):
+		}
+	}
+}
 
 func (s *PGStore) Pool() *pgxpool.Pool { return s.pool }
 
