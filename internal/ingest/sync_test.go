@@ -6,15 +6,13 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/lidofinance/keys-api-versioned/internal/model"
 	"github.com/lidofinance/keys-api-versioned/internal/source"
 )
 
-// These tests run the loop against a fake source and an in-memory store, so the
-// three transitions and the scoping rule are checked without a database or a chain.
-// The store here is deliberately naive — it records calls rather than implementing
-// ranges — because what is under test is the loop's decisions, not SQL.
+// A naive store that records calls: the loop's decisions are under test, not SQL.
 
 func TestCycleColdStartBuildsEveryModule(t *testing.T) {
 	src := newFakeSource(2)
@@ -89,8 +87,6 @@ func TestCycleNonceChangeRebuildsOnlyThatModule(t *testing.T) {
 	if got := store.keyWriteModules[0]; got != 2 {
 		t.Fatalf("rebuilt module %d, want 2", got)
 	}
-	// The version being replaced is marked stale before the rebuild starts, so a
-	// reader holding it knows what it has while the new one is being written.
 	if store.staled != 1 {
 		t.Fatalf("staled %d versions, want 1", store.staled)
 	}
@@ -106,7 +102,6 @@ func TestCycleReorgRollsBackToForkPoint(t *testing.T) {
 	}
 	published := store.latest.BlockNumber
 
-	// The chain replaces the block the version was built on.
 	src.advance()
 	src.forkAt(published)
 
@@ -125,10 +120,7 @@ func TestCycleReorgRollsBackToForkPoint(t *testing.T) {
 	}
 }
 
-// A reorg is a rollback plus the ordinary incremental check, so a fork that changed
-// nothing must cost no key reads at all. This is the threshold the design claimed
-// and the code did not meet: it used to rebuild every module after any rollback,
-// which on mainnet is a 512 000-key read for a one-block fork.
+// A fork that changed nothing must cost no key reads (it used to be a 512 000-key mainnet read).
 func TestCycleReorgWithNoChangeReadsNoKeys(t *testing.T) {
 	src := newFakeSource(3)
 	store := newFakeStore()
@@ -137,7 +129,6 @@ func TestCycleReorgWithNoChangeReadsNoKeys(t *testing.T) {
 	if result := s.Cycle(context.Background()); result.Err != nil {
 		t.Fatalf("cold start: %v", result.Err)
 	}
-	// A second version, so the rollback has something to land on.
 	src.advance()
 	src.bumpNonce(1)
 	if result := s.Cycle(context.Background()); result.Err != nil {
@@ -147,9 +138,7 @@ func TestCycleReorgWithNoChangeReadsNoKeys(t *testing.T) {
 	reorged := store.latest.BlockNumber
 	keyWritesBefore := store.keyWrites
 
-	// The chain replaces the block the newest version was built on, and the nonce bump
-	// that block carried is not on the new branch — the transaction was dropped. So
-	// the chain now matches what the surviving version recorded.
+	// The nonce bump was in the dropped block, so the chain matches the surviving version again.
 	src.advance()
 	src.forkAt(reorged)
 	src.dropNonce(1)
@@ -178,8 +167,6 @@ func TestCycleReorgWithNoChangeReadsNoKeys(t *testing.T) {
 	}
 }
 
-// The other half: a reorg that did change one module re-reads that module and only
-// that one, so the incremental path is what decides rather than the rollback.
 func TestCycleReorgWithOneChangedModuleScopesTheRebuild(t *testing.T) {
 	src := newFakeSource(3)
 	store := newFakeStore()
@@ -196,8 +183,7 @@ func TestCycleReorgWithOneChangedModuleScopesTheRebuild(t *testing.T) {
 	reorged := store.latest.BlockNumber
 	store.keyWriteModules = nil
 
-	// On the new branch module 1's bump is gone with its block, and module 2 moved
-	// instead. Only module 2 differs from what the surviving version recorded.
+	// Module 1's bump is gone with its block; only module 2 differs from the survivor.
 	src.advance()
 	src.forkAt(reorged)
 	src.dropNonce(1)
@@ -215,9 +201,7 @@ func TestCycleReorgWithOneChangedModuleScopesTheRebuild(t *testing.T) {
 	}
 }
 
-// When the fork is below everything held, there is nothing to build on. That is the
-// one case E2 says does force a full rebuild, and it has to be a defined answer
-// rather than an error.
+// A fork below everything held must be a defined full rebuild, not an error.
 func TestCycleReorgBelowRetainedWindowRebuildsFromScratch(t *testing.T) {
 	src := newFakeSource(2)
 	store := newFakeStore()
@@ -265,7 +249,146 @@ func TestCycleBlockGapForcesRebuild(t *testing.T) {
 	}
 }
 
-// fakeSource is a source.Provider with a controllable head, nonces and branch.
+// In the combined mode the API shares the process with ingest, so a malformed source answer that
+// panics must fail one cycle, not exit.
+func TestCyclePanicFailsTheCycleAndTheNextOneRecovers(t *testing.T) {
+	src := &panickingSource{fakeSource: newFakeSource(2), panics: 1}
+	store := newFakeStore()
+	s := NewSyncer(src, store, SyncConfig{}, nil)
+
+	result := s.Cycle(context.Background())
+	if result.Err == nil || !result.Panicked {
+		t.Fatalf("got err %v, panicked %t, want a failed cycle marked as panicked", result.Err, result.Panicked)
+	}
+	if len(store.published) != 0 {
+		t.Fatalf("published %d versions from a panicked build, want none", len(store.published))
+	}
+
+	result = s.Cycle(context.Background())
+	if result.Err != nil || result.Panicked {
+		t.Fatalf("next cycle: err %v, panicked %t, want a clean rebuild", result.Err, result.Panicked)
+	}
+	if len(store.published) != 1 {
+		t.Fatalf("published %d versions after recovering, want 1", len(store.published))
+	}
+}
+
+func TestFailedCyclesBackOffAndASuccessResetsTheSchedule(t *testing.T) {
+	src := &failingSource{fakeSource: newFakeSource(1), fail: 4}
+	s := NewSyncer(src, newFakeStore(), SyncConfig{Interval: 5 * time.Second}, nil)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	var waits []time.Duration
+	s.wait = func(_ context.Context, d time.Duration) error {
+		waits = append(waits, d)
+		if len(waits) == 6 {
+			cancel()
+			return ctx.Err()
+		}
+		return nil
+	}
+	if err := s.Run(ctx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("Run: %v", err)
+	}
+
+	// Four failures: the jittered upper halves of 5, 10, 20 and 40 s; then success, back to the interval.
+	for i, upper := range []time.Duration{5 * time.Second, 10 * time.Second, 20 * time.Second, 40 * time.Second} {
+		if waits[i] < upper/2 || waits[i] > upper {
+			t.Errorf("wait after failure %d is %s, want within [%s, %s]", i+1, waits[i], upper/2, upper)
+		}
+	}
+	for i := 4; i < 6; i++ {
+		if waits[i] > 5*time.Second {
+			t.Errorf("wait %d after recovering is %s, want at most the 5s interval", i+1, waits[i])
+		}
+	}
+}
+
+func TestTheRetryDelayIsCapped(t *testing.T) {
+	for _, jitter := range []float64{0, 0.5, 1} {
+		got := retryDelay(5*time.Second, 1000, jitter)
+		if got > maxRetryBackoff || got < maxRetryBackoff/2 {
+			t.Errorf("jitter %.1f: delay after 1000 failures is %s, want within [%s, %s]",
+				jitter, got, maxRetryBackoff/2, maxRetryBackoff)
+		}
+	}
+}
+
+// A shutdown cancels the cycle context; an abort on it left the row building.
+func TestABuildCutShortByShutdownIsStillAborted(t *testing.T) {
+	src := &failingSource{fakeSource: newFakeSource(1)}
+	store := newFakeStore()
+	s := NewSyncer(src, store, SyncConfig{}, nil)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	src.onKeys = cancel
+	if result := s.Cycle(ctx); result.Err == nil {
+		t.Fatal("a cycle cancelled mid-build reported success")
+	}
+	if store.abortCtxErr == nil {
+		t.Fatal("the unfinished build was never aborted")
+	}
+	if err := *store.abortCtxErr; err != nil {
+		t.Fatalf("abort ran on a context already done (%v), so the row stays building", err)
+	}
+}
+
+// Re-reading a block whose earlier attempt was aborted used to report the version as built.
+func TestASkippedRebuildOverAnUnfinishedAttemptIsNotASuccess(t *testing.T) {
+	for status, wantErr := range map[string]bool{"superseded": true, "building": true, "published": false} {
+		t.Run(status, func(t *testing.T) {
+			src := newFakeSource(1)
+			store := newFakeStore()
+			store.existing = status
+			s := NewSyncer(src, store, SyncConfig{}, nil)
+
+			result := s.Cycle(context.Background())
+			if (result.Err != nil) != wantErr {
+				t.Fatalf("existing %s row: got err %v, want error %t", status, result.Err, wantErr)
+			}
+			if wantErr && result.VersionBlock == src.block {
+				t.Errorf("reported version %d as built", result.VersionBlock)
+			}
+		})
+	}
+}
+
+type failingSource struct {
+	*fakeSource
+	fail   int
+	onKeys func()
+}
+
+func (f *failingSource) Head(ctx context.Context) (model.ELBlockSnapshot, error) {
+	if f.fail > 0 {
+		f.fail--
+		return model.ELBlockSnapshot{}, errors.New("endpoint down")
+	}
+	return f.fakeSource.Head(ctx)
+}
+
+func (f *failingSource) Keys(ctx context.Context, at source.Ref, m model.StakingModule, fn func(model.Key) error) error {
+	if f.onKeys != nil {
+		f.onKeys()
+		return ctx.Err()
+	}
+	return f.fakeSource.Keys(ctx, at, m, fn)
+}
+
+type panickingSource struct {
+	*fakeSource
+	panics int
+}
+
+func (p *panickingSource) Keys(ctx context.Context, at source.Ref, m model.StakingModule, fn func(model.Key) error) error {
+	if p.panics > 0 {
+		p.panics--
+		var operators []model.Operator
+		_ = operators[m.ID] // index out of range, as a malformed count would cause
+	}
+	return p.fakeSource.Keys(ctx, at, m, fn)
+}
+
 type fakeSource struct {
 	block   int64
 	branch  string
@@ -303,8 +426,7 @@ func (f *fakeSource) bumpNonce(id int32) {
 	}
 }
 
-// dropNonce undoes a bump, which is what a reorg does to the transaction that caused
-// it: the key addition was in the orphaned block and is not on the new branch.
+// dropNonce undoes a bump: the transaction was in the orphaned block.
 func (f *fakeSource) dropNonce(id int32) {
 	for i := range f.modules {
 		if f.modules[i].ID == id {
@@ -313,7 +435,6 @@ func (f *fakeSource) dropNonce(id int32) {
 	}
 }
 
-// forkAt makes the hash at a height differ from what was published there.
 func (f *fakeSource) forkAt(block int64) { f.forks[block] = true }
 
 func (f *fakeSource) hashAt(block int64) string {
@@ -365,7 +486,6 @@ func (f *fakeSource) Keys(_ context.Context, _ source.Ref, m model.StakingModule
 
 var _ source.Provider = (*fakeSource)(nil)
 
-// fakeStore records what the loop asked of it.
 type fakeStore struct {
 	latest    *StoredVersion
 	published []StoredVersion
@@ -375,12 +495,14 @@ type fakeStore struct {
 	keyWriteModules []int32
 	operatorWrites  []int32
 	moduleWrites    []int32
-	// failOperators makes the operator write fail, which is how a test gets a rebuild
-	// that starts and does not finish.
+	// failOperators gives a rebuild that starts and does not finish.
 	failOperators  bool
 	extends        int
 	staled         int
 	supersededFrom int64
+	// existing makes Begin find the identity taken by a row in this status.
+	existing    string
+	abortCtxErr *error
 }
 
 func newFakeStore() *fakeStore { return &fakeStore{} }
@@ -399,14 +521,15 @@ func (s *fakeStore) Recent(_ context.Context, limit int) ([]StoredVersion, error
 }
 
 func (s *fakeStore) Begin(_ context.Context, at model.ELBlockSnapshot) (Build, error) {
+	if s.existing != "" {
+		return nil, ExistingVersionError{Status: s.existing}
+	}
 	s.nextID++
 	return &fakeBuild{store: s, id: s.nextID, at: at}, nil
 }
 
-// Extend moves only the confirmed-at fields, like the real store: a version's own
-// block is its identity and never moves. Modelling it the other way made the reorg
-// walk probe the head instead of the version's own height, which is the difference
-// between finding the fork point and not.
+// Extend moves only the confirmed-at fields, like the real store; otherwise the reorg walk probes
+// the head instead of the version's own height.
 func (s *fakeStore) Extend(_ context.Context, v StoredVersion, at model.ELBlockSnapshot, nonces map[string]int64, finalized int64) error {
 	s.extends++
 	v.HeadBlockNumber = at.BlockNumber
@@ -427,8 +550,6 @@ func (s *fakeStore) MarkStale(_ context.Context, v StoredVersion) error {
 	return nil
 }
 
-// SupersedeFrom drops every version at or above the block and leaves the newest
-// survivor as the latest, which is what the reorg path then decides against.
 func (s *fakeStore) SupersedeFrom(_ context.Context, block int64) (Superseded, error) {
 	s.supersededFrom = block
 
@@ -485,10 +606,8 @@ func (b *fakeBuild) Module(_ context.Context, m model.StakingModule, _ bool) err
 }
 
 func (b *fakeBuild) Publish(_ context.Context, label string, finalized int64) error {
-	// The head fields start out equal to the version's own block, exactly as the real
-	// store's INSERT does ($1, $2, $3 reused for both). They matter: the cycle compares
-	// the observed head hash against HeadBlockHash to decide whether anything can have
-	// changed, and a fake that left it empty would never exercise that path.
+	// Head fields start equal to the version's block, as the real INSERT does: the unchanged-head
+	// short-circuit compares against HeadBlockHash.
 	v := StoredVersion{
 		ID:                   b.id,
 		BlockNumber:          b.at.BlockNumber,
@@ -508,7 +627,10 @@ func (b *fakeBuild) Publish(_ context.Context, label string, finalized int64) er
 	return nil
 }
 
-func (b *fakeBuild) Abort(context.Context) {}
+func (b *fakeBuild) Abort(ctx context.Context) {
+	err := ctx.Err()
+	b.store.abortCtxErr = &err
+}
 
 type fakeModuleKeys struct{ staged int64 }
 
@@ -520,25 +642,11 @@ func (k *fakeModuleKeys) Abort(context.Context) {}
 
 var _ Store = (*fakeStore)(nil)
 
-// StatusPublished mirrors the store package's constant without importing it, which
-// would be a cycle. Keeping it here also documents that the loop only ever writes
-// two of the four statuses; the others are the store's business.
+// StatusPublished mirrors the store package's constant; importing it would be a cycle.
 const StatusPublished = "published"
 
-// TestCycleRefusesToRollBackAForeignModuleSet is the guard against the most destructive
-// thing this loop can do for the least interesting reason.
-//
-// Every stored hash disagreeing with the chain is what a reorg looks like — and it is
-// also what somebody's mainnet node pointed at a Hoodi database looks like. The
-// responses are opposite: a reorg wants the rollback, a different chain wants a refusal,
-// because those rows are not stale, they belong to another network. Without this the
-// store was superseded and cold-rebuilt with nothing logged above "reorg deeper than the
-// retained window".
-//
-// Schemas named after the chain make the common form of this impossible, but they cannot
-// help when the chain id is the same and the deployment is not — a devnet reusing chain
-// id 1, which happens here. The module set is what tells those apart, and it costs no
-// query: the version row's nonces are keyed by module address.
+// A mainnet node on a Hoodi database, or a devnet reusing chain id 1, looks like a reorg. A module
+// set sharing no address must refuse rather than roll back.
 func TestCycleRefusesToRollBackAForeignModuleSet(t *testing.T) {
 	src := newFakeSource(2)
 	store := newFakeStore()
@@ -573,8 +681,7 @@ func TestCycleRefusesToRollBackAForeignModuleSet(t *testing.T) {
 	}
 }
 
-// The control: the same fork with the module set unchanged still rolls back. Without it,
-// the guard above would pass on a loop that had simply stopped handling reorgs.
+// Control: an unchanged module set still rolls back, or the guard above proves nothing.
 func TestCycleStillRollsBackWhenTheModuleSetIsTheSame(t *testing.T) {
 	src := newFakeSource(2)
 	store := newFakeStore()

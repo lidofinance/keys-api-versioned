@@ -11,15 +11,8 @@ import (
 	"github.com/lidofinance/keys-api-versioned/internal/testreg"
 )
 
-// The lease is what keeps retention from deleting rows a reader is still streaming. The
-// store-level version of this lives in internal/ingest; these are the HTTP-level and
-// lifetime properties, which is where the mechanism can go wrong in ways the store test
-// cannot see: a lock left on a pooled connection, or one not returned when a client
-// disappears.
-//
-// All of them are exclusive. Advisory locks are per-database rather than per-schema, and
-// retention lowers its boundary to any leased block below it, so another test's lease
-// would show up as this one's.
+// HTTP-level lease properties the store test cannot see: a lock left on a pooled connection, or not
+// returned when a client disappears. All exclusive: advisory locks are per-database.
 
 func TestRetentionHoldsForAStreamingReaderOverHTTP(t *testing.T) {
 	testpg.Exclusive(t)
@@ -31,8 +24,6 @@ func TestRetentionHoldsForAStreamingReaderOverHTTP(t *testing.T) {
 	old := testreg.At(db.Block(0))
 	spec.Publish(ctx, t, db.Writer, old)
 
-	// The pin is explicit, so this reader is on the version about to leave the window
-	// rather than on whatever is newest.
 	srv := testpg.NewServer(t, db.Reader(t, fmt.Sprint(old.BlockNumber), 3))
 
 	resp, body := srv.GetHeld(t, "/v1/keys", 64<<10)
@@ -47,8 +38,7 @@ func TestRetentionHoldsForAStreamingReaderOverHTTP(t *testing.T) {
 		t.Fatalf("leases are %v, want just the version being streamed (%d)", leases, old.BlockNumber)
 	}
 
-	// A newer version, then retention keeping only it: without the lease this deletes
-	// the rows the held dump is in the middle of reading.
+	// Without the lease, keeping only the newer version deletes rows the held dump is reading.
 	next := spec.WithSalt(spec.Salt + 1)
 	next.Publish(ctx, t, db.Writer, testreg.At(db.Block(1)))
 
@@ -69,8 +59,7 @@ func TestRetentionHoldsForAStreamingReaderOverHTTP(t *testing.T) {
 		t.Fatalf("retention took rows from under the reader: %v", err)
 	}
 
-	// Control: once the reader is gone, the same prune must delete. Otherwise the
-	// assertion above would also pass on a retention that had nothing to do.
+	// Control: once the reader is gone the same prune must delete.
 	srv.WaitForEvents(t, 1, waitLong)
 	waitForNoLeases(t, db, waitShort)
 
@@ -86,11 +75,8 @@ func TestRetentionHoldsForAStreamingReaderOverHTTP(t *testing.T) {
 	}
 }
 
-// TestALeaseLeftOnAPooledConnectionHoldsRetention encodes the pgx rule that makes a
-// leaked lease dangerous: a connection returned to the pool keeps its session state, so
-// an advisory lock outlives the request that took it and looks exactly like healthy
-// back-pressure. The visible difference is that it never goes away, which is why
-// retention reports what held it.
+// A pooled connection keeps session state, so a leaked advisory lock outlives its request and looks
+// like healthy back-pressure, except it never goes away.
 func TestALeaseLeftOnAPooledConnectionHoldsRetention(t *testing.T) {
 	testpg.Exclusive(t)
 
@@ -124,8 +110,6 @@ func TestALeaseLeftOnAPooledConnectionHoldsRetention(t *testing.T) {
 		t.Errorf("prune dropped %d versions while a lease was held", pruned.Versions)
 	}
 
-	// Released by hand, and then retention proceeds — which is the observable difference
-	// between a slow reader and a leak.
 	released, err := pool.Acquire(ctx)
 	if err != nil {
 		t.Fatalf("acquire to release: %v", err)
@@ -146,10 +130,8 @@ func TestALeaseLeftOnAPooledConnectionHoldsRetention(t *testing.T) {
 	}
 }
 
-// A client that disappears mid-dump must not hold retention open. The release is
-// eventual rather than immediate: pgx may destroy a connection whose query was
-// cancelled instead of running the unlock on it, in which case the lock goes when the
-// backend session ends — so this polls rather than sampling once.
+// Release is eventual: pgx may destroy a cancelled connection rather than unlock on it, and the lock
+// goes when the backend session ends. Hence polling.
 func TestACancelledDumpReleasesItsLease(t *testing.T) {
 	testpg.Exclusive(t)
 
@@ -168,7 +150,6 @@ func TestACancelledDumpReleasesItsLease(t *testing.T) {
 		t.Fatalf("leases are %v, want one for the dump in flight", leases)
 	}
 
-	// The client goes away without reading the rest.
 	resp.Body.Close()
 
 	waitForNoLeases(t, db, waitLong)

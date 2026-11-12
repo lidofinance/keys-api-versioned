@@ -11,17 +11,8 @@ import (
 	"github.com/lidofinance/keys-api-versioned/internal/testreg"
 )
 
-// A reorg is the one case where rows must disappear from under a reader: a version off
-// the chain has to stop being current, or the next one would inherit the losing
-// branch's keys. So a lease cannot save an in-flight dump, and the only question is
-// whether the consumer is told.
-//
-// It was not. A dump runs one query per module, the rollback landed between two of
-// them, and the remaining modules came back empty while the handler finished the JSON —
-// a valid, complete-looking answer assembled from a branch that no longer existed. The
-// fix re-checks the version at every query that continues a response. These tests are
-// what makes that claim checkable, because the failure they describe is invisible from
-// the status code: it is 200 either way.
+// A reorg must remove rows under a reader, so a lease cannot save the dump. A rollback between module
+// queries once left the rest empty under a 200; now every continuing query re-checks the version.
 
 func TestAReorgDuringADumpFailsLoudlyRatherThanCompletingShort(t *testing.T) {
 	db := testpg.New(t)
@@ -33,9 +24,7 @@ func TestAReorgDuringADumpFailsLoudlyRatherThanCompletingShort(t *testing.T) {
 
 	srv := testpg.NewServer(t, db.Reader(t, "latest", 4))
 
-	// A complete dump first, for its byte count: "fewer bytes than a whole dump" is the
-	// assertion that survives any change to HTTP framing, and it needs a baseline
-	// measured on this machine with this dataset rather than a guess.
+	// Baseline byte count: "fewer bytes than a whole dump" survives any change to HTTP framing.
 	quiet := srv.Get(t, "/v1/keys")
 	whole, err := io.Copy(io.Discard, quiet.Body)
 	quiet.Body.Close()
@@ -44,7 +33,6 @@ func TestAReorgDuringADumpFailsLoudlyRatherThanCompletingShort(t *testing.T) {
 	}
 	srv.WaitForEvents(t, 1, waitShort)
 
-	// Now hold a dump open inside the first module and take its version off the chain.
 	resp, body := srv.GetHeld(t, "/v1/keys", 64<<10)
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
@@ -58,9 +46,7 @@ func TestAReorgDuringADumpFailsLoudlyRatherThanCompletingShort(t *testing.T) {
 		t.Fatalf("roll the version back: %v", err)
 	}
 
-	// The client must not be handed a document that parses. Draining the body and
-	// decoding it is the check: a clean parse means a complete-looking answer from a
-	// branch that is gone, which is the defect.
+	// A clean parse here would be a complete-looking answer from a branch that is gone.
 	drained, readErr := io.ReadAll(body())
 	if json.Valid(drained) {
 		t.Errorf("the body parsed as a complete document (%d bytes, read error %v): "+
@@ -83,9 +69,8 @@ func TestAReorgDuringADumpFailsLoudlyRatherThanCompletingShort(t *testing.T) {
 	}
 }
 
-// A request that arrives after the rollback is a different case, and an easier one: no
-// bytes have gone out, so it gets a status. 409 rather than 404 or 410 because the
-// version existed and the consumer needs to know where the chain went instead.
+// After the rollback no bytes went out, so it gets 409: the version existed, and the head fields say
+// where the chain went.
 func TestAPinnedReadOfASupersededVersionAnswers409(t *testing.T) {
 	db := testpg.New(t)
 	ctx := context.Background()
@@ -119,13 +104,10 @@ func TestAPinnedReadOfASupersededVersionAnswers409(t *testing.T) {
 	if err := json.NewDecoder(resp.Body).Decode(&conflict); err != nil {
 		t.Fatalf("decode the conflict body: %v", err)
 	}
-	// The head fields are the point of 409 over 410: they let a consumer jump straight
-	// to the version that replaced the one it asked for.
 	if conflict.HeadBlockNumber != first.BlockNumber {
 		t.Errorf("409 reports head block %d, want %d", conflict.HeadBlockNumber, first.BlockNumber)
 	}
 
-	// And the version that survived the rollback still serves.
 	current := srv.Get(t, "/v1/keys")
 	defer current.Body.Close()
 	if current.StatusCode != http.StatusOK {

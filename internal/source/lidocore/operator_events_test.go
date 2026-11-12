@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -13,19 +14,15 @@ import (
 	"github.com/lidofinance/keys-api-versioned/internal/model"
 )
 
-// The operator event scan is what a quiet cycle spends most of its requests on, and
-// eth_getLogs is the method a metered provider bills hardest. What matters here is
-// not that the boolean is right — one filter is one filter — but how many requests
-// the answer costs, and that the topics asked of each contract are the ones it can
-// actually emit.
+// What matters is not the boolean but how many eth_getLogs it costs, and that each contract is
+// asked only for topics it can emit.
 
-// logsNode answers eth_getLogs and records the filters it was asked.
 type logsNode struct {
-	// hits addresses that should return a log, lower-cased.
 	hits map[string]bool
 
-	mu      sync.Mutex
-	filters []logFilter
+	mu            sync.Mutex
+	filters       []logFilter
+	registryReads int
 }
 
 type logFilter struct {
@@ -41,12 +38,9 @@ func (n *logsNode) recorded() []logFilter {
 
 func (n *logsNode) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	var reqs []struct {
-		ID     int    `json:"id"`
-		Method string `json:"method"`
-		Params []struct {
-			Address any     `json:"address"`
-			Topics  [][]any `json:"topics"`
-		} `json:"params"`
+		ID     int               `json:"id"`
+		Method string            `json:"method"`
+		Params []json.RawMessage `json:"params"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&reqs); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
@@ -54,18 +48,38 @@ func (n *logsNode) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	type response struct {
-		ID     int   `json:"id"`
-		Result []any `json:"result"`
+		ID     int `json:"id"`
+		Result any `json:"result"`
 	}
 	out := make([]response, 0, len(reqs))
 	for _, req := range reqs {
-		if req.Method != "eth_getLogs" || len(req.Params) == 0 {
+		if len(req.Params) == 0 {
+			http.Error(w, "no params", http.StatusBadRequest)
+			return
+		}
+		// The CMv2 MetaRegistry, resolved once per process for the scan.
+		if req.Method == "eth_call" {
+			n.mu.Lock()
+			n.registryReads++
+			n.mu.Unlock()
+			out = append(out, response{ID: req.ID, Result: packAddress(metaRegistryUnderTest)})
+			continue
+		}
+		if req.Method != "eth_getLogs" {
 			http.Error(w, "unexpected method "+req.Method, http.StatusBadRequest)
+			return
+		}
+		var params struct {
+			Address any     `json:"address"`
+			Topics  [][]any `json:"topics"`
+		}
+		if err := json.Unmarshal(req.Params[0], &params); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
 
 		filter := logFilter{}
-		switch addr := req.Params[0].Address.(type) {
+		switch addr := params.Address.(type) {
 		case string:
 			filter.addresses = []string{strings.ToLower(addr)}
 		case []any:
@@ -73,8 +87,8 @@ func (n *logsNode) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				filter.addresses = append(filter.addresses, strings.ToLower(a.(string)))
 			}
 		}
-		if len(req.Params[0].Topics) > 0 {
-			for _, topic := range req.Params[0].Topics[0] {
+		if len(params.Topics) > 0 {
+			for _, topic := range params.Topics[0] {
 				filter.topics = append(filter.topics, topic.(string))
 			}
 		}
@@ -97,8 +111,7 @@ func (n *logsNode) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(out)
 }
 
-// The four mainnet modules are two families: curated and SimpleDVT share the curated
-// reader, CSM and CMv2 the community one.
+// Mainnet's four modules are two reader families: curated + SimpleDVT, CSM + CMv2.
 var eventScanModules = []model.StakingModule{
 	stakingModule(1, "curated-onchain-v1", "0x1111111111111111111111111111111111111111"),
 	stakingModule(2, "curated-onchain-v1", "0x2222222222222222222222222222222222222222"),
@@ -106,9 +119,7 @@ var eventScanModules = []model.StakingModule{
 	stakingModule(4, "curated-onchain-v2", "0x4444444444444444444444444444444444444444"),
 }
 
-// The locator is never read here: the scan needs no router address, which is itself
-// worth pinning — a filter is a filter, and resolving contracts for it would be a
-// request the answer does not need.
+// The scan never reads the locator; only CMv2's MetaRegistry is resolved, once per process.
 const locatorForEventScan = "0x00000000000000000000000000000000000010c8"
 
 func stakingModule(id int32, moduleType, address string) model.StakingModule {
@@ -138,31 +149,72 @@ func TestOperatorScanCostsOneRequestPerModuleFamily(t *testing.T) {
 		t.Fatalf("got %d eth_getLogs for 4 modules, want 2 — one per module family: %+v", len(filters), filters)
 	}
 
-	// Curated carries three topics and two addresses; community one topic and two.
-	byTopicCount := map[int]logFilter{}
-	for _, f := range filters {
-		byTopicCount[len(f.topics)] = f
+	var curated, community *logFilter
+	for i := range filters {
+		if slices.Contains(filters[i].addresses, "0x1111111111111111111111111111111111111111") {
+			curated = &filters[i]
+		} else {
+			community = &filters[i]
+		}
 	}
-	curated, ok := byTopicCount[3]
-	if !ok {
-		t.Fatalf("no filter with the three curated topics: %+v", filters)
+	if curated == nil || community == nil {
+		t.Fatalf("filters do not split by family: %+v", filters)
 	}
-	if len(curated.addresses) != 2 {
-		t.Fatalf("curated filter asked about %v, want both curated module addresses", curated.addresses)
+	if len(curated.topics) != 3 || len(curated.addresses) != 2 {
+		t.Fatalf("curated filter %+v, want three topics over both curated modules", *curated)
 	}
-	community, ok := byTopicCount[1]
-	if !ok {
-		t.Fatalf("no filter with the single community topic: %+v", filters)
+
+	wantAddresses := []string{
+		"0x3333333333333333333333333333333333333333",
+		"0x4444444444444444444444444444444444444444",
+		metaRegistryUnderTest,
 	}
-	if len(community.addresses) != 2 {
-		t.Fatalf("community filter asked about %v, want both CSM-shaped module addresses", community.addresses)
+	if !slices.Equal(community.addresses, wantAddresses) {
+		t.Fatalf("community filter asked about %v, want %v", community.addresses, wantAddresses)
+	}
+	wantTopics := []string{
+		eventTopicHex(t, "NodeOperatorRewardAddressChanged"),
+		eventTopicHex(t, "VettedSigningKeysCountChanged(uint256,uint256)"),
+		eventTopicHex(t, "OperatorMetadataSet(uint256,(string,string,bool))"),
+	}
+	if !slices.Equal(community.topics, wantTopics) {
+		t.Fatalf("community filter topics %v, want %v", community.topics, wantTopics)
+	}
+
+	if _, err := provider.OperatorsChangedAny(context.Background(), eventScanModules, 201, 300); err != nil {
+		t.Fatalf("second scan: %v", err)
+	}
+	node.mu.Lock()
+	reads := node.registryReads
+	node.mu.Unlock()
+	if reads != 1 {
+		t.Errorf("META_REGISTRY read %d times over two scans, want 1", reads)
 	}
 }
 
+// Hashes computed independently with `cast keccak`, so a signature typo fails here.
+func TestOperatorEventTopicsHashToTheCanonicalValues(t *testing.T) {
+	for signature, want := range map[string]string{
+		"VettedSigningKeysCountChanged(uint256,uint256)":    "0x947f955eec7e1f626bee3afd2aa47b5de04ddcdd3fe78dc8838213015ef58dfd",
+		"OperatorMetadataSet(uint256,(string,string,bool))": "0x27c4b5559e9eb92ed9a6cba3ab99a51ef6b41103e9eaae8877132a3d680dc8c5",
+	} {
+		if got := eventTopicHex(t, signature); got != want {
+			t.Errorf("%s hashes to %s, want %s", signature, got, want)
+		}
+	}
+}
+
+func eventTopicHex(t *testing.T, name string) string {
+	t.Helper()
+	topic, err := eth.EventTopic(name)
+	if err != nil {
+		t.Fatalf("EventTopic(%q): %v", name, err)
+	}
+	return topic.Hex()
+}
+
 func TestOperatorScanStopsAtTheFirstChange(t *testing.T) {
-	// The curated family is scanned first and reports a change, so the community
-	// filter is never sent: the caller wants one boolean and a rebuild follows either
-	// way.
+	// The curated family reports a change first, so the community filter is never sent.
 	node := &logsNode{hits: map[string]bool{"0x2222222222222222222222222222222222222222": true}}
 	server := httptest.NewServer(node)
 	defer server.Close()
@@ -190,9 +242,7 @@ func TestOperatorScanSkipsUnreadableModules(t *testing.T) {
 	client := eth.NewClient(server.URL, eth.Options{Concurrency: 2, BatchSize: 8})
 	provider := NewProvider(client, locatorForEventScan, Options{})
 
-	// A module type this provider has no reader for holds no keys in any version, so
-	// it has no operator metadata here to go stale — and it must not turn the scan
-	// into an error, which is what the per-module path avoided by never asking.
+	// A module with no reader holds no keys in any version; it must not turn the scan into an error.
 	modules := []model.StakingModule{
 		stakingModule(9, "some-future-module-type", "0x9999999999999999999999999999999999999999"),
 	}

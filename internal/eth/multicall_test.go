@@ -10,32 +10,34 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/ethereum/go-ethereum/accounts/abi"
 	"github.com/ethereum/go-ethereum/common"
 )
 
-// The tests below run against a node that speaks just enough JSON-RPC to answer
-// eth_getCode and eth_call, because what needs proving is not the ABI coding but
-// the behaviour around it: that aggregated results come back matched to their
-// calls, and that an endpoint refusing an aggregate — the case a hosted provider
-// with a low eth_call ceiling produces — still returns the right answers.
-
-// fakeNode answers eth_getCode and eth_call, and can refuse aggregates the way an
-// endpoint with a low gas or response ceiling does.
+// fakeNode can refuse aggregates the way an endpoint with a low gas or response ceiling does.
 type fakeNode struct {
-	// code is what eth_getCode returns for the multicall address. Empty means the
-	// contract is not deployed on this chain.
+	// Empty code means the contract is not deployed.
 	code []byte
-	// maxAggregate refuses any aggregate carrying more calls than this. Zero means
-	// no limit; refuseAll refuses every aggregate whatever its size.
+	// Zero means no limit.
 	maxAggregate int
 	refuseAll    bool
+	// refusal replaces "out of gas" as the message an aggregate is refused with.
+	refusal string
 
-	mu         sync.Mutex
+	mu sync.Mutex
+	// outage is the number of next requests answered with a 503.
+	outage     int
 	requests   int
 	plainCalls int
 	aggregates []int
+}
+
+func (n *fakeNode) set(f func(n *fakeNode)) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	f(n)
 }
 
 func (n *fakeNode) counts() (requests, plainCalls int, aggregates []int) {
@@ -53,7 +55,15 @@ func (n *fakeNode) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	n.mu.Lock()
 	n.requests++
+	down := n.outage > 0
+	if down {
+		n.outage--
+	}
 	n.mu.Unlock()
+	if down {
+		http.Error(w, "service unavailable", http.StatusServiceUnavailable)
+		return
+	}
 
 	out := make([]rpcResponse, 0, len(reqs))
 	for _, req := range reqs {
@@ -90,8 +100,15 @@ func (n *fakeNode) answerAggregate(id int, data []byte) rpcResponse {
 	}
 	calls := *abi.ConvertType(values[0], new([]call3)).(*[]call3)
 
-	if n.refuseAll || (n.maxAggregate > 0 && len(calls) > n.maxAggregate) {
-		return rpcError(id, "out of gas")
+	n.mu.Lock()
+	refuse := n.refuseAll || (n.maxAggregate > 0 && len(calls) > n.maxAggregate)
+	refusal := n.refusal
+	n.mu.Unlock()
+	if refuse {
+		if refusal == "" {
+			refusal = "out of gas"
+		}
+		return rpcError(id, refusal)
 	}
 
 	n.mu.Lock()
@@ -126,15 +143,12 @@ func rpcError(id int, message string) rpcResponse {
 	return resp
 }
 
-// encodeNonce is the fake getNonce return: the address's last byte, so every call
-// has an answer only that call can have, which is what makes a mismatched result
-// order visible.
+// A per-address answer, so a mismatched result order is visible.
 func encodeNonce(address string) string {
 	addr := common.HexToAddress(address)
 	return "0x" + common.Bytes2Hex(common.LeftPadBytes(big.NewInt(int64(addr[19])).Bytes(), 32))
 }
 
-// nonceCalls builds n reads of getNonce, each against its own address.
 func nonceCalls(n int) []Call {
 	if err := loadABIs(); err != nil {
 		panic(err)
@@ -150,7 +164,6 @@ func nonceCalls(n int) []Call {
 	return calls
 }
 
-// assertNonces checks each result is the one belonging to its call.
 func assertNonces(t *testing.T, calls []Call, results [][]any) {
 	t.Helper()
 	if len(results) != len(calls) {
@@ -189,8 +202,7 @@ func TestCallBatchAggregatesIntoOneRequest(t *testing.T) {
 	assertNonces(t, calls, results)
 
 	requests, _, aggregates := node.counts()
-	// One probe plus one aggregate: five reads, two round trips, and the probe is
-	// paid once for the life of the client.
+	// One probe plus one aggregate; the probe is paid once per client.
 	if requests != 2 {
 		t.Errorf("got %d requests, want 2 (probe plus aggregate)", requests)
 	}
@@ -260,9 +272,6 @@ func TestAggregateBisectsWhenRefused(t *testing.T) {
 	if stats := client.Stats(); stats.Splits == 0 {
 		t.Errorf("got stats %+v, want at least one split", stats)
 	}
-	// The discovered budget sticks, so the next chunk does not rediscover it. These
-	// reads cost one each, so for an endpoint that limits the number of inner calls
-	// the budget doubles as a call cap.
 	if got := client.mcMaxCost.Load(); got > 2 {
 		t.Errorf("cost budget stayed at %d after a refusal", got)
 	}
@@ -272,9 +281,7 @@ func TestReadsTooBigToShareGasSkipAggregation(t *testing.T) {
 	node := &fakeNode{code: []byte{0x60, 0x00}}
 	client := newTestClient(t, node, true)
 
-	// Two full key batches and then a tail of one-key reads: the shape of a real
-	// module. Only the tail can share a gas budget, and the two big reads must not
-	// be quietly dropped into an aggregate that comes back "out of gas".
+	// Only the one-key tail may share a gas budget; the two full key batches must stay out.
 	calls := nonceCalls(202)
 	calls[0].Cost = 1100
 	calls[1].Cost = 1100
@@ -298,8 +305,6 @@ func TestAggregationStopsAfterRepeatedRefusals(t *testing.T) {
 	node := &fakeNode{code: []byte{0x60, 0x00}, refuseAll: true}
 	client := newTestClient(t, node, true)
 
-	// Every aggregate is refused, so each group bisects down to single calls and
-	// those go out plainly. The results still have to be right.
 	for round := 0; round < 3; round++ {
 		calls := nonceCalls(4)
 		results, err := client.CallBatch(context.Background(), BlockRef{Tag: "latest"}, calls)
@@ -316,7 +321,6 @@ func TestAggregationStopsAfterRepeatedRefusals(t *testing.T) {
 		t.Error("aggregation is still on after an endpoint refused it repeatedly")
 	}
 
-	// And once it is off, nothing else is spent discovering that again.
 	before := client.Stats()
 	calls := nonceCalls(4)
 	results, err := client.CallBatch(context.Background(), BlockRef{Tag: "latest"}, calls)
@@ -341,15 +345,12 @@ func TestAggregateReportsTheCallThatReverted(t *testing.T) {
 	if err == nil {
 		t.Fatal("a reverting call inside an aggregate returned no error")
 	}
-	// Naming the call is the point: a JSON-RPC batch cannot say which read failed,
-	// an aggregate can, and one bad operator index in a group of 200 is otherwise
-	// a whole group to bisect by hand.
+	// A JSON-RPC batch cannot say which read failed; an aggregate can.
 	if !strings.Contains(err.Error(), calls[2].To) || !strings.Contains(err.Error(), "OPERATOR_NOT_FOUND") {
 		t.Errorf("error does not identify the failing call and its reason: %v", err)
 	}
 }
 
-// revertingNode answers like fakeNode but marks one call in each aggregate failed.
 type revertingNode struct {
 	fakeNode
 	failAt int
@@ -376,7 +377,6 @@ func (n *revertingNode) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(out)
 }
 
-// patch rewrites an aggregate's answer so the call at failAt comes back reverted.
 func (n *revertingNode) patch(req rpcRequest, resp rpcResponse) (rpcResponse, bool) {
 	call, _ := req.Params[0].(map[string]any)
 	to, _ := call["to"].(string)
@@ -413,10 +413,6 @@ func (n *revertingNode) patch(req rpcRequest, resp rpcResponse) (rpcResponse, bo
 	return result(req.ID, "0x"+common.Bytes2Hex(packed)), true
 }
 
-// On a metered endpoint the billed unit is the call, not the round trip, so the
-// aggregation rule inverts: a group that fits one JSON-RPC batch should still be
-// aggregated. This is the difference between eleven billed calls per cycle and one, on
-// a read that runs for the life of the deployment.
 func TestMeteredAggregatesGroupsThatFitOneBatch(t *testing.T) {
 	for _, tc := range []struct {
 		name           string
@@ -424,8 +420,6 @@ func TestMeteredAggregatesGroupsThatFitOneBatch(t *testing.T) {
 		wantAggregates []int
 		wantPlain      int
 	}{
-		// Eight getters, batch size 100: the plain path carries them in one request, so
-		// the default rule leaves them alone.
 		{"own node keeps the plain path", false, nil, 8},
 		{"metered wraps them into one aggregate", true, []int{8}, 0},
 	} {
@@ -458,8 +452,6 @@ func TestMeteredAggregatesGroupsThatFitOneBatch(t *testing.T) {
 	}
 }
 
-// A lone read is never wrapped, metered or not: it would cost the same call and add the
-// dispatcher on top of it.
 func TestMeteredDoesNotWrapASingleCall(t *testing.T) {
 	node := &fakeNode{code: []byte{0x60, 0x00}}
 	server := httptest.NewServer(node)
@@ -476,5 +468,138 @@ func TestMeteredDoesNotWrapASingleCall(t *testing.T) {
 	_, plain, aggregates := node.counts()
 	if plain != 1 || len(aggregates) != 0 {
 		t.Errorf("plain=%d aggregates=%v, want one plain call and no aggregate", plain, aggregates)
+	}
+}
+
+// An outage is not a size limit: bisecting on it once left the budget at 1 for the rest of the run.
+func TestAnOutageDoesNotShrinkTheAggregateBudget(t *testing.T) {
+	node := &fakeNode{code: []byte{0x60, 0x00}}
+	client := newTestClient(t, node, true)
+	ctx := context.Background()
+
+	if _, err := client.CallBatch(ctx, BlockRef{Tag: "latest"}, nonceCalls(8)); err != nil {
+		t.Fatalf("warm-up: %v", err)
+	}
+	budget := client.mcMaxCost.Load()
+
+	node.set(func(n *fakeNode) { n.outage = 1 })
+	if _, err := client.CallBatch(ctx, BlockRef{Tag: "latest"}, nonceCalls(8)); err == nil {
+		t.Fatal("got an answer through a 503 from the only endpoint")
+	}
+	if got := client.mcMaxCost.Load(); got != budget {
+		t.Errorf("budget went from %d to %d after a 503", budget, got)
+	}
+	if stats := client.Stats(); stats.Splits != 0 || stats.Fallbacks != 0 {
+		t.Errorf("got stats %+v, want no split and no fallback for an outage", stats)
+	}
+
+	calls := nonceCalls(8)
+	results, err := client.CallBatch(ctx, BlockRef{Tag: "latest"}, calls)
+	if err != nil {
+		t.Fatalf("after the outage: %v", err)
+	}
+	assertNonces(t, calls, results)
+	if _, _, aggregates := node.counts(); aggregates[len(aggregates)-1] != 8 {
+		t.Errorf("got aggregates %v, want the last one to carry all 8 calls", aggregates)
+	}
+}
+
+// Providers report a size limit as an endpoint error; it must still bisect, not fail the read.
+func TestASizeRefusalStillBisects(t *testing.T) {
+	node := &fakeNode{code: []byte{0x60, 0x00}, maxAggregate: 2, refusal: "response size exceeded"}
+	client := newTestClient(t, node, true)
+
+	calls := nonceCalls(5)
+	results, err := client.CallBatch(context.Background(), BlockRef{Tag: "latest"}, calls)
+	if err != nil {
+		t.Fatalf("CallBatch: %v", err)
+	}
+	assertNonces(t, calls, results)
+	if stats := client.Stats(); stats.Splits == 0 {
+		t.Errorf("got stats %+v, want the refused aggregate split", stats)
+	}
+}
+
+func TestAggregationResumesAfterThePause(t *testing.T) {
+	node := &fakeNode{code: []byte{0x60, 0x00}, refuseAll: true}
+	client := newTestClient(t, node, true)
+	clock := newFakeClock()
+	client.now = clock.Now
+	ctx := context.Background()
+
+	for round := 0; round < maxAggregateFallbacks; round++ {
+		if _, err := client.CallBatch(ctx, BlockRef{Tag: "latest"}, nonceCalls(4)); err != nil {
+			t.Fatalf("round %d: %v", round, err)
+		}
+	}
+	if client.aggregationEnabled() {
+		t.Fatal("aggregation still on after repeated single-call refusals")
+	}
+
+	node.set(func(n *fakeNode) { n.refuseAll = false })
+	clock.advance(aggregationPause + time.Second)
+	if !client.aggregationEnabled() {
+		t.Fatal("aggregation still off after the pause")
+	}
+	if got := client.mcMaxCost.Load(); got != defaultMulticallMaxCost {
+		t.Errorf("budget is %d after the pause, want the configured %d", got, defaultMulticallMaxCost)
+	}
+	before := client.Stats().Aggregates
+	if _, err := client.CallBatch(ctx, BlockRef{Tag: "latest"}, nonceCalls(4)); err != nil {
+		t.Fatalf("after the pause: %v", err)
+	}
+	if client.Stats().Aggregates == before {
+		t.Error("no aggregate went out after the pause")
+	}
+}
+
+func TestRefusalsSpreadOverTimeDoNotPauseAggregation(t *testing.T) {
+	client := NewClient("http://unused", Options{Multicall: true})
+	clock := newFakeClock()
+	client.now = clock.Now
+	client.mcProbed, client.mcPresent = true, true
+
+	for i := 0; i < 2*maxAggregateFallbacks; i++ {
+		client.noteSingleCallRefusal()
+		if !client.aggregationEnabled() {
+			t.Fatalf("paused after refusal %d, %s apart", i+1, aggregateFallbackWindow/2)
+		}
+		clock.advance(aggregateFallbackWindow/2 + time.Second)
+	}
+}
+
+func TestSetURLsForgetsWhatWasLearnedAboutTheOldEndpoints(t *testing.T) {
+	bare := &fakeNode{}
+	bareServer := httptest.NewServer(bare)
+	t.Cleanup(bareServer.Close)
+	withMulticall := &fakeNode{code: []byte{0x60, 0x00}}
+	multicallServer := httptest.NewServer(withMulticall)
+	t.Cleanup(multicallServer.Close)
+
+	client := NewClient(bareServer.URL, Options{Concurrency: 1, BatchSize: 2, Multicall: true})
+	ctx := context.Background()
+	if _, err := client.CallBatch(ctx, BlockRef{Tag: "latest"}, nonceCalls(4)); err != nil {
+		t.Fatalf("before rotation: %v", err)
+	}
+	client.lowerBudget(1)
+	client.endpointFailed(bareServer.URL)
+
+	if err := client.SetURLs(multicallServer.URL); err != nil {
+		t.Fatalf("SetURLs: %v", err)
+	}
+	if got := client.mcMaxCost.Load(); got != defaultMulticallMaxCost {
+		t.Errorf("budget is %d after rotation, want the configured %d", got, defaultMulticallMaxCost)
+	}
+	if len(client.health) != 0 {
+		t.Errorf("failure counts of the old endpoints survived rotation: %v", client.health)
+	}
+	calls := nonceCalls(4)
+	results, err := client.CallBatch(ctx, BlockRef{Tag: "latest"}, calls)
+	if err != nil {
+		t.Fatalf("after rotation: %v", err)
+	}
+	assertNonces(t, calls, results)
+	if _, _, aggregates := withMulticall.counts(); len(aggregates) == 0 {
+		t.Error("the new endpoint has multicall but the old probe answer was kept")
 	}
 }

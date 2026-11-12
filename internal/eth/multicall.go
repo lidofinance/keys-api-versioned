@@ -3,52 +3,36 @@ package eth
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"net/http"
 	"strings"
+	"time"
 
 	"github.com/ethereum/go-ethereum/accounts/abi"
 	"github.com/ethereum/go-ethereum/common"
 )
 
-// MulticallAddress is the Multicall3 deployment. It is the same address on every
-// chain it exists on, mainnet and Hoodi included, because it is deployed with a
-// fixed nonce from a fixed deployer.
-//
-// Devnets built from scratch usually have nothing there, which is why presence is
-// probed rather than assumed.
+// MulticallAddress is the same on every chain that has Multicall3 (fixed deployer and nonce).
+// Fresh devnets usually have nothing there, hence the presence probe.
 const MulticallAddress = "0xca11bde05977b3631167028862be2a173976ca11"
 
-// defaultMulticallMaxCalls caps how many reads travel in one aggregate, and
-// defaultMulticallMaxCost caps what they may return in total.
-//
-// The cost budget is the one that binds. An aggregate's inner calls share a single
-// eth_call gas budget, and reading keys is what spends it: measured against mainnet
-// geth, two reads of 1100 curated keys in one aggregate come back "out of gas",
-// while 200 reads of one key each are fine. So the budget is set below one full key
-// batch, which puts the split exactly where the win is — the tail of small
-// operators aggregates, the big sequential reads do not, and they never needed to,
-// because separate eth_calls in a JSON-RPC batch each get their own gas.
-//
-// Neither number is a correctness bound: an endpoint that refuses an aggregate has
-// it bisected and the budget lowered to what worked.
+// The cost cap binds: inner calls share one eth_call gas budget, and two 1100-key reads in one
+// aggregate run out of gas on mainnet geth. Neither is a correctness bound; refusals bisect.
 const (
 	defaultMulticallMaxCalls = 200
 	defaultMulticallMaxCost  = 1000
 )
 
-// maxAggregateFallbacks is how many times a lone aggregated call may fail before
-// the client stops aggregating altogether.
-//
-// The limits that make an aggregate fail are set by whoever runs the endpoint —
-// a hosted provider caps eth_call gas, response size or compute units far below a
-// self-hosted node — and one that refuses an aggregate of one refuses all of them.
-// Without this latch the client would pay the whole bisection ladder on every group
-// for the rest of the process; with it, an endpoint that dislikes aggregation costs
-// three wasted requests and then behaves exactly as it did before this existed.
-const maxAggregateFallbacks = 3
+// An endpoint refusing an aggregate of one refuses all of them: after maxAggregateFallbacks such
+// refusals within the window, aggregation pauses, then resumes with the configured budget.
+const (
+	maxAggregateFallbacks   = 3
+	aggregateFallbackWindow = 10 * time.Minute
+	aggregationPause        = 30 * time.Minute
+)
 
-// Call3 and multicallResult mirror Multicall3's own structs. The field names have
-// to match the ABI's, since that is how the tuple coder maps them.
+// Field names must match the ABI's: that is how the tuple coder maps them.
 type call3 struct {
 	Target       common.Address
 	AllowFailure bool
@@ -60,13 +44,8 @@ type multicallResult struct {
 	ReturnData []byte
 }
 
-// aggregateReady reports whether reads can go through Multicall3.
-//
-// One eth_getCode answers it, and the answer is cached for the life of the client:
-// a deployment does not come and go. A failed probe is not cached — a node hiccup
-// at the wrong moment would otherwise cost aggregation for the whole process.
-// The lock is held across the probe so a burst of concurrent batches produces one
-// probe rather than one each.
+// aggregateReady caches a successful eth_getCode probe for the client's life; a failed probe is
+// not cached. The lock is held across it so concurrent batches probe once.
 func (c *Client) aggregateReady(ctx context.Context, at BlockRef) bool {
 	if !c.multicall {
 		return false
@@ -75,7 +54,7 @@ func (c *Client) aggregateReady(ctx context.Context, at BlockRef) bool {
 	c.mcMu.Lock()
 	defer c.mcMu.Unlock()
 	if c.mcProbed {
-		return c.mcPresent
+		return c.aggregationOnLocked()
 	}
 
 	code, err := c.Code(ctx, c.mcAddress, at)
@@ -96,7 +75,6 @@ func (c *Client) aggregateReady(ctx context.Context, at BlockRef) bool {
 	return c.mcPresent
 }
 
-// Code returns the deployed bytecode at an address, empty if there is none.
 func (c *Client) Code(ctx context.Context, address string, at BlockRef) ([]byte, error) {
 	res, err := c.do(ctx, []rpcRequest{{
 		JSONRPC: "2.0", ID: c.id(), Method: "eth_getCode",
@@ -112,12 +90,7 @@ func (c *Client) Code(ctx context.Context, address string, at BlockRef) ([]byte,
 	return common.FromHex(hexCode), nil
 }
 
-// callAggregate performs reads by packing them into aggregate3, in chunks bounded
-// by cost, and sends whatever is too expensive to aggregate on the plain path.
-//
-// The budget is re-read each time round because a refused aggregate lowers it: once
-// an endpoint has shown what it tolerates, later chunks start there instead of
-// rediscovering it by bisection.
+// callAggregate re-reads the budget each chunk: a refused aggregate lowers it.
 func (c *Client) callAggregate(ctx context.Context, at BlockRef, calls []Call, out [][]any) error {
 	for start := 0; start < len(calls); {
 		if !c.aggregationEnabled() {
@@ -127,11 +100,8 @@ func (c *Client) callAggregate(ctx context.Context, at BlockRef, calls []Call, o
 		budget := int(c.mcMaxCost.Load())
 		end := c.aggregateChunkEnd(calls, start, budget)
 
-		// A chunk of one gains nothing from being wrapped: a lone read costs the same
-		// eth_call either way, and one too expensive to share a gas budget cannot be
-		// aggregated at all. Those go on the plain path — where a JSON-RPC batch still
-		// packs them into one request and each gets its own gas — and the run extends
-		// over every following read too big to pair with another.
+		// A chunk of one gains nothing from wrapping; it goes plain, along with every following read too
+		// big to pair with another.
 		if end == start+1 {
 			for end < len(calls) && 2*calls[end].cost() > budget {
 				end++
@@ -151,8 +121,6 @@ func (c *Client) callAggregate(ctx context.Context, at BlockRef, calls []Call, o
 	return nil
 }
 
-// aggregateChunkEnd finds how far a chunk starting at start may reach. A chunk
-// always carries at least one call, whatever it costs.
 func (c *Client) aggregateChunkEnd(calls []Call, start, budget int) int {
 	cost := 0
 	end := start
@@ -167,12 +135,8 @@ func (c *Client) aggregateChunkEnd(calls []Call, start, budget int) int {
 	return end
 }
 
-// aggregateChunk sends one aggregate3 and unpacks each result with its own ABI.
-//
-// Calls go in with allowFailure set, so one revert comes back as a flag on that
-// result instead of failing the whole aggregate — and is then reported naming the
-// call that reverted, which the plain path cannot do because a revert there fails
-// the JSON-RPC batch as a whole.
+// allowFailure is set so a revert names the call that reverted; on the plain path a revert fails
+// the whole JSON-RPC batch.
 func (c *Client) aggregateChunk(ctx context.Context, at BlockRef, calls []Call, out [][]any) error {
 	packed := make([]call3, 0, len(calls))
 	for _, call := range calls {
@@ -201,6 +165,9 @@ func (c *Client) aggregateChunk(ctx context.Context, at BlockRef, calls []Call, 
 		},
 	}})
 	if err != nil {
+		if !aggregateRefused(err) {
+			return err
+		}
 		return c.aggregateFallback(ctx, at, calls, out, err)
 	}
 
@@ -234,14 +201,21 @@ func (c *Client) aggregateChunk(ctx context.Context, at BlockRef, calls []Call, 
 	return nil
 }
 
-// aggregateFallback recovers from an endpoint refusing an aggregate.
-//
-// The ceilings that cause it — eth_call gas cap, response size, a hosted
-// provider's own request limits — are per-endpoint and invisible from here, so the
-// size that works is found by bisection instead of being configured, and the
-// working size is remembered. One call that still fails goes out as a plain
-// eth_call: at that point the aggregate is not the problem, and the plain path
-// reports whatever is.
+// aggregateRefused: an outage read as a size limit would shrink the budget for the rest of the run.
+func aggregateRefused(err error) bool {
+	var status *httpStatusError
+	if errors.As(err, &status) {
+		return status.status == http.StatusRequestEntityTooLarge
+	}
+	var rpcErr *jsonRPCError
+	if !errors.As(err, &rpcErr) {
+		return false
+	}
+	return !endpointFailure(rpcErr.code, rpcErr.message) || sizeRefusal(rpcErr.message)
+}
+
+// aggregateFallback finds the size an endpoint tolerates by bisection and remembers it. A single
+// call that still fails goes plain, which reports the real error.
 func (c *Client) aggregateFallback(ctx context.Context, at BlockRef, calls []Call, out [][]any, cause error) error {
 	if ctx.Err() != nil {
 		return cause
@@ -251,9 +225,7 @@ func (c *Client) aggregateFallback(ctx context.Context, at BlockRef, calls []Cal
 		c.stats.fallbacks.Add(1)
 		c.log.Warn("aggregate failed for a single call, sending it plainly",
 			"method", calls[0].Method, "to", calls[0].To, "err", cause)
-		if c.stats.fallbacks.Load() >= maxAggregateFallbacks {
-			c.disableAggregation("this endpoint refuses aggregated calls even one at a time")
-		}
+		c.noteSingleCallRefusal()
 		return c.callPlain(ctx, at, calls, out)
 	}
 
@@ -270,33 +242,47 @@ func (c *Client) aggregateFallback(ctx context.Context, at BlockRef, calls []Cal
 	return c.aggregateChunk(ctx, at, calls[mid:], out[mid:])
 }
 
-// aggregationEnabled reports whether aggregation is still in use. It can be turned
-// off mid-run by disableAggregation.
 func (c *Client) aggregationEnabled() bool {
 	c.mcMu.Lock()
 	defer c.mcMu.Unlock()
-	return c.mcPresent
+	return c.aggregationOnLocked()
 }
 
-// disableAggregation stops aggregating for the life of the client and says why.
-// Info rather than warn: falling back to one call per read is the behaviour every
-// deployment had before aggregation existed, so it degrades throughput, not
-// correctness.
-func (c *Client) disableAggregation(reason string) {
+func (c *Client) aggregationOnLocked() bool {
+	if !c.mcPresent {
+		return false
+	}
+	if c.mcPausedUntil.IsZero() {
+		return true
+	}
+	if c.now().Before(c.mcPausedUntil) {
+		return false
+	}
+	c.mcPausedUntil = time.Time{}
+	c.mcMaxCost.Store(c.mcInitialCost)
+	c.log.Info("multicall resumed", "budget", c.mcInitialCost)
+	return true
+}
+
+// Info, not warn: one call per read degrades throughput, not correctness.
+func (c *Client) noteSingleCallRefusal() {
 	c.mcMu.Lock()
 	defer c.mcMu.Unlock()
-	if !c.mcPresent {
+	now := c.now()
+	if now.Sub(c.mcWindowStart) > aggregateFallbackWindow {
+		c.mcWindowStart, c.mcFallbacks = now, 0
+	}
+	c.mcFallbacks++
+	if c.mcFallbacks < maxAggregateFallbacks || now.Before(c.mcPausedUntil) {
 		return
 	}
-	c.mcPresent = false
-	c.log.Info("multicall disabled, calls go one per read from here on",
-		"reason", reason, "fallbacks", c.stats.fallbacks.Load())
+	c.mcPausedUntil = now.Add(aggregationPause)
+	c.mcFallbacks = 0
+	c.log.Info("multicall paused, calls go one per read: the endpoint refuses aggregates even one at a time",
+		"pause", aggregationPause.String(), "fallbacks", c.stats.fallbacks.Load())
 }
 
-// lowerBudget lowers the cost budget to the half being retried. One-way: the
-// budget only ever comes down, because an endpoint's limits do not move during a
-// run, and a budget that keeps bouncing back up would pay the bisection ladder on
-// every chunk.
+// lowerBudget only lowers: a limit seen once holds until a pause or an endpoint rotation resets it.
 func (c *Client) lowerBudget(to int) {
 	if to < 1 {
 		to = 1
@@ -314,7 +300,6 @@ func (c *Client) lowerBudget(to int) {
 	}
 }
 
-// totalCost is what a chunk asks the endpoint to return.
 func totalCost(calls []Call) int {
 	total := 0
 	for _, call := range calls {
@@ -323,7 +308,6 @@ func totalCost(calls []Call) int {
 	return total
 }
 
-// revertSuffix renders a revert reason if the returned data carries one.
 func revertSuffix(data []byte) string {
 	reason := revertReason(data)
 	if reason == "" {
@@ -332,9 +316,7 @@ func revertSuffix(data []byte) string {
 	return ": " + reason
 }
 
-// revertReason decodes the standard Error(string) revert payload. Custom errors
-// and empty reverts come back as the raw selector, which is still more than
-// nothing when a getter starts refusing.
+// Custom errors and empty reverts come back as the raw selector.
 func revertReason(data []byte) string {
 	if len(data) < 4 {
 		return ""

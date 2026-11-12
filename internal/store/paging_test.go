@@ -15,9 +15,7 @@ func TestKeyCursorRoundTrip(t *testing.T) {
 }
 
 func TestKeyCursorRejectsGarbage(t *testing.T) {
-	// A cursor comes from a client, so every one of these is reachable input. A
-	// silent zero value would restart the walk from the top and the consumer would
-	// see duplicates rather than an error.
+	// Client input: a silent zero value would restart the walk and the consumer would see duplicates.
 	for _, s := range []string{"", "1", "1.2.3", "1.2.3.4.5", "a.2.3.4", "1.2.3.x", "latest"} {
 		if _, err := ParseKeyCursor(s); err == nil {
 			t.Errorf("ParseKeyCursor(%q) accepted a malformed cursor", s)

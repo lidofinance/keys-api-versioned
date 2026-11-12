@@ -8,13 +8,11 @@ import (
 	"github.com/lidofinance/keys-api-versioned/internal/store"
 )
 
-// asNotFound reports whether err is a module-not-found error.
 func asNotFound(err error, target *store.ErrNotFound) bool {
 	return errors.As(err, target)
 }
 
-// handleModules lists staking modules. Note the envelope: canonical puts
-// elBlockSnapshot at the top level here, not under meta.
+// Canonical puts elBlockSnapshot at the top level here, not under meta.
 func (s *Server) handleModules(w http.ResponseWriter, r *http.Request) {
 	type response struct {
 		Data            []model.StakingModule  `json:"data"`
@@ -45,11 +43,10 @@ func (s *Server) handleModules(w http.ResponseWriter, r *http.Request) {
 		return writeJSON(w, response{Data: modules, ELBlockSnapshot: elMeta})
 	})
 	if err != nil && !writeStoreError(w, err) {
-		writeError(w, http.StatusInternalServerError, err.Error())
+		s.internalError(w, r, err)
 	}
 }
 
-// handleModule returns one module by id or address.
 func (s *Server) handleModule(w http.ResponseWriter, r *http.Request) {
 	type response struct {
 		Data            model.StakingModule    `json:"data"`
@@ -84,12 +81,10 @@ func (s *Server) handleModule(w http.ResponseWriter, r *http.Request) {
 		return writeJSON(w, response{Data: *module, ELBlockSnapshot: elMeta})
 	})
 	if err != nil && !writeStoreError(w, err) {
-		writeError(w, http.StatusInternalServerError, err.Error())
+		s.internalError(w, r, err)
 	}
 }
 
-// handleStatus reports the app version, chain id and the EL snapshot.
-// clBlockSnapshot is always null: the PoC does not ingest validators.
 func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	err := s.snapshot(ctx, r, func(snap store.Snapshot) error {
@@ -108,6 +103,6 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		})
 	})
 	if err != nil && !writeStoreError(w, err) {
-		writeError(w, http.StatusInternalServerError, err.Error())
+		s.internalError(w, r, err)
 	}
 }

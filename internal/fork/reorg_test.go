@@ -8,43 +8,10 @@ import (
 	"github.com/lidofinance/keys-api-versioned/internal/ingest"
 )
 
-// The reorg family. What a fork adds over the scripted double in internal/ingest is
-// the only thing that matters here: a branch whose blocks have the same heights, hashes
-// that differ, and *different registry content* produced by the same contract. The
-// double can express the first two — hashAt flips a letter — and structurally cannot
-// express the third, because its nonce is an int32 with no causal link to any key.
-//
-// docs/next-steps.md:112 records the open question these are written against:
-//
-//	"Nonce equality across a reorg is not sufficient on its own. A counter can roll
-//	 back two increments and take two different ones on the new branch, arriving at
-//	 the same value with different content."
-//
-// # Two primitives, and they are not interchangeable
-//
-// anvil has both anvil_reorg and evm_snapshot/evm_revert, and picking the wrong one
-// makes a test that proves nothing. Measured here rather than taken from the docs:
-//
-//   - anvil_reorg re-mines the rewound blocks *with their original transactions*. The
-//     block hashes change and the head keeps moving forward, which is what a node
-//     reports during a real reorg — but the state does not diverge. It is the right
-//     tool for the common mainnet case, a short reorg that touched nothing of ours,
-//     and the wrong one for a branch that has to hold different keys.
-//   - evm_revert restores the state, so the new branch can be built with different
-//     content. The cost is that the head jumps backwards to the snapshot, which the
-//     sync loop reads as a lagging endpoint rather than a fork, so the scenario has to
-//     mine back up to the old height before the next cycle.
-//
-// It also only rewrites blocks anvil produced itself; Anvil.Reorg checks that rather
-// than letting it fail as a bare "Resource not found".
+// anvil_reorg re-mines with the original transactions: hashes change, state does not diverge.
+// evm_revert diverges state but the head jumps back, so scenarios mine back to the old height.
 
-// TestAReorgThatSwapsAKeyIsNotServedFromTheLosingBranch is the scenario the caveat
-// describes, built on the chain rather than argued about.
-//
-// One key is added on branch A and the version that reads it is published; then the
-// same height is re-mined carrying a *different* key. Both branches move the nonce by
-// exactly one, so the counter is identical on either side of the fork and cannot tell
-// them apart. What the service serves afterwards has to be branch B's key.
+// Both branches move the nonce by exactly one, so only a re-read can tell them apart.
 func TestAReorgThatSwapsAKeyIsNotServedFromTheLosingBranch(t *testing.T) {
 	h := NewHarness(t, HarnessOpts{})
 	h.requireSandboxPreconditions()
@@ -56,7 +23,6 @@ func TestAReorgThatSwapsAKeyIsNotServedFromTheLosingBranch(t *testing.T) {
 	index := int(h.Sandbox.Operator(SandboxOperator).TotalSigningKeys)
 	fork := h.Anvil.Snapshot()
 
-	// Branch A: one key, one nonce increment, one version that holds it.
 	branchA := MintKey(SandboxModuleID, SandboxOperator, index, 1)
 	h.Sandbox.AddKeys(SandboxOperator, [][]byte{branchA})
 	if got := h.Sandbox.Nonce(); got != baseNonce+1 {
@@ -72,7 +38,6 @@ func TestAReorgThatSwapsAKeyIsNotServedFromTheLosingBranch(t *testing.T) {
 		t.Fatal("branch A's key was added and read, but is not in the published version")
 	}
 
-	// Branch B: the same height, a different key.
 	h.Anvil.Revert(fork)
 	branchB := MintKey(SandboxModuleID, SandboxOperator, index, 2)
 	h.Sandbox.AddKeys(SandboxOperator, [][]byte{branchB})
@@ -107,15 +72,7 @@ func TestAReorgThatSwapsAKeyIsNotServedFromTheLosingBranch(t *testing.T) {
 	}
 }
 
-// TestAReorgThatDropsItsOnlyChangeCostsNoKeyReads is the control for the test above,
-// and the threshold E2 was written around: a fork whose change vanished with its block
-// must cost nothing.
-//
-// It is a control in the strict sense — it fails on the behaviour the other test is
-// about. If the rollback did not restore the pre-fork content this one would see a
-// nonce difference and rebuild, and if the loop rebuilt unconditionally after a
-// rollback, which is what it did before the fix recorded at sync.go:194, it would
-// report a rebuild too.
+// Control for the test above: a fork whose only change vanished with its block costs nothing.
 func TestAReorgThatDropsItsOnlyChangeCostsNoKeyReads(t *testing.T) {
 	h := NewHarness(t, HarnessOpts{})
 	h.requireSandboxPreconditions()
@@ -136,7 +93,6 @@ func TestAReorgThatDropsItsOnlyChangeCostsNoKeyReads(t *testing.T) {
 		t.Fatal("the key to be reorged away is not in the published version")
 	}
 
-	// The winning branch reaches the same height with nothing in it.
 	h.Anvil.Revert(fork)
 	h.Anvil.Mine(int(losingHead - h.Anvil.BlockNumber()))
 
@@ -160,20 +116,8 @@ func TestAReorgThatDropsItsOnlyChangeCostsNoKeyReads(t *testing.T) {
 	}
 }
 
-// TestAReorgAboveThePublishedVersionIsNotEvenNoticed pins the shape of the detector,
-// and it is the mainnet-common case: the published version is some blocks old and a
-// one-or-two-block reorg happens at the tip.
-//
-// detectReorg probes the hash at the published version's *own* height and nowhere
-// else, so a reorg entirely above it is invisible to the loop. That is safe rather
-// than lucky, and the test says why by checking the other half: the registry is
-// untouched and the cycle extends. Had the reorged range changed anything of ours the
-// module's nonce would have moved, and the ordinary freshness check — not the reorg
-// detector — is what would rebuild.
-//
-// Two things this depends on, both measured rather than assumed: anvil_reorg re-mines
-// the rewound blocks with their original transactions, so the state on the new branch
-// is identical; and it refuses to reach the fork block, which Anvil.Reorg checks.
+// detectReorg probes only the version's own height, so a reorg above it is invisible. Safe: a
+// change in that range would have moved the nonce.
 func TestAReorgAboveThePublishedVersionIsNotEvenNoticed(t *testing.T) {
 	h := NewHarness(t, HarnessOpts{})
 	h.requireSandboxPreconditions()
@@ -182,8 +126,6 @@ func TestAReorgAboveThePublishedVersionIsNotEvenNoticed(t *testing.T) {
 	first := h.Cycle()
 	versionBlock := first.VersionBlock
 
-	// Three blocks of headroom, then rewrite two of them. The version's own block stays
-	// below the reorged range.
 	h.Anvil.Mine(3)
 	hashBefore := h.Anvil.BlockHash(versionBlock)
 	tipBefore := h.Anvil.BlockHash(h.Anvil.BlockNumber())

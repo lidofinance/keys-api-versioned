@@ -16,7 +16,6 @@ import (
 	"github.com/lidofinance/keys-api-versioned/internal/store"
 )
 
-// Event is one served request, as the service itself reports it.
 type Event struct {
 	Route  string
 	Status int
@@ -24,13 +23,8 @@ type Event struct {
 	Took   time.Duration
 }
 
-// Server is the HTTP surface under test.
-//
-// It captures what the service reports about a request — the observation and the log
-// record — because for a response that failed after its headers went out, those are the
-// only authoritative signals. The status is already 200 by then and the body is
-// whatever reached the client, so asserting on the client alone cannot distinguish a
-// truncated dump from a complete one without parsing it.
+// Server records the service's own observation and log per request: after headers went out, a
+// truncated dump still answers 200, so the client alone cannot tell.
 type Server struct {
 	*httptest.Server
 	Logs *LogCapture
@@ -40,19 +34,12 @@ type Server struct {
 	started int
 }
 
-// NewServer starts the API over a store, on HTTP/1.1 so that the framing a test
-// asserts on — chunked, and an abort in the middle of it — is deterministic.
-//
-// Both surfaces serve the store's own pin, so a test says what it means about pins in the
-// request rather than inheriting a deployment's choice. NewServerWithExtPin is for the
-// tests that are about that choice.
+// NewServer uses HTTP/1.1 so chunked framing and a mid-stream abort are deterministic.
 func NewServer(tb testing.TB, s store.Store) *Server {
 	tb.Helper()
 	return NewServerWithExtPin(tb, s, "")
 }
 
-// NewServerWithExtPin starts the API with a default pin for the extended surface, the way
-// a deployment configures /ext/v1 to serve finalized while /v1 stays on the head.
 func NewServerWithExtPin(tb testing.TB, s store.Store, extPin string) *Server {
 	tb.Helper()
 
@@ -79,27 +66,8 @@ func NewServerWithExtPin(tb testing.TB, s store.Store, extPin string) *Server {
 	return srv
 }
 
-// Client is a client that does not time out — some of these responses are held open on
-// purpose — and whose socket read buffer is small.
-//
-// The small receive buffer is load-bearing for any test that blocks a reader
-// mid-response: the server buffers 256 KiB, net/http adds its own, and loopback socket
-// autotuning can add megabytes, so without it the server could finish a whole module
-// while the test believes it is still inside one.
-//
-// 64 KiB rather than 4 KiB, and the difference is the whole reason this comment is long.
-// Linux honours SO_RCVBUF exactly and turns receive-window autotuning off for the socket,
-// so at 4 KiB a 20 MB dump crawls: measured at roughly 30 KB/s — ten minutes for the
-// streaming fixture, against 0.4 s at 64 KiB. macOS effectively ignores a buffer that
-// small, which is why every one of these tests passed locally for as long as they
-// existed and the first CI run on Linux hung until it was killed. The Postgres read was
-// never involved: instrumented, the same stream spent 7 ms in the database and 70 s in
-// the socket write.
-//
-// 64 KiB is still small enough for the property the held tests need. The server fills
-// its own 256 KiB buffer before the first flush, so it blocks after roughly 320 KB —
-// three orders of magnitude short of the fixture, which is all "still mid-response" has
-// to mean here.
+// 64 KiB receive buffer keeps a held reader mid-response (server buffers 256 KiB). At 4 KiB Linux
+// disables autotuning: a 20 MB dump took ~10 min instead of 0.4 s; macOS ignores the setting.
 func (s *Server) Client() *http.Client {
 	dialer := &net.Dialer{}
 	return &http.Client{
@@ -119,7 +87,6 @@ func (s *Server) Client() *http.Client {
 	}
 }
 
-// Get performs a request and returns the response with its body unread.
 func (s *Server) Get(tb testing.TB, path string) *http.Response {
 	tb.Helper()
 	resp, err := s.Client().Get(s.URL + path)
@@ -129,8 +96,6 @@ func (s *Server) Get(tb testing.TB, path string) *http.Response {
 	return resp
 }
 
-// Do performs a request with any method and an optional JSON body, for the error-surface
-// cases that are about a method or a malformed payload rather than about data.
 func (s *Server) Do(tb testing.TB, method, path, body string) *http.Response {
 	tb.Helper()
 
@@ -153,9 +118,7 @@ func (s *Server) Do(tb testing.TB, method, path, body string) *http.Response {
 	return resp
 }
 
-// GetHeld starts a request, reads the first gate bytes and leaves the rest in flight,
-// which is what a slow consumer looks like from the service's side. The returned reader
-// replays the prefix, so a verifier still sees the whole body.
+// GetHeld reads the first gate bytes and leaves the rest in flight, like a slow consumer.
 func (s *Server) GetHeld(tb testing.TB, path string, gate int64) (*http.Response, func() io.Reader) {
 	tb.Helper()
 
@@ -171,14 +134,12 @@ func (s *Server) GetHeld(tb testing.TB, path string, gate int64) (*http.Response
 	return resp, func() io.Reader { return io.MultiReader(bytesReader(prefix), resp.Body) }
 }
 
-// Events is every request the service has finished.
 func (s *Server) Events() []Event {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return append([]Event(nil), s.events...)
 }
 
-// LastEvent is the most recent finished request, or false when none has finished.
 func (s *Server) LastEvent() (Event, bool) {
 	events := s.Events()
 	if len(events) == 0 {
@@ -187,17 +148,13 @@ func (s *Server) LastEvent() (Event, bool) {
 	return events[len(events)-1], true
 }
 
-// Pending is how many requests are in flight: started and not yet reported. A pending
-// request that has already sent bytes is a server that is inside a response, which is
-// how a test proves it created the interleaving it meant to create rather than assuming
-// a sleep was long enough.
+// Pending counts started-but-unreported requests: proof a test created its interleaving, not a sleep.
 func (s *Server) Pending() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.started - len(s.events)
 }
 
-// WaitForEvents blocks until the service has reported n requests.
 func (s *Server) WaitForEvents(tb testing.TB, n int, within time.Duration) {
 	tb.Helper()
 	deadline := time.Now().Add(within)
@@ -210,8 +167,6 @@ func (s *Server) WaitForEvents(tb testing.TB, n int, within time.Duration) {
 	tb.Fatalf("waited %s for %d served requests, got %d", within, n, len(s.Events()))
 }
 
-// LogCapture keeps the service's log records so a test can assert on the one line that
-// reports a failure the response itself cannot carry.
 type LogCapture struct {
 	mu      sync.Mutex
 	records []slog.Record
@@ -231,7 +186,6 @@ func (c *LogCapture) Handle(_ context.Context, r slog.Record) error {
 func (c *LogCapture) WithAttrs([]slog.Attr) slog.Handler { return c }
 func (c *LogCapture) WithGroup(string) slog.Handler      { return c }
 
-// Has reports whether a record with this level and message was logged.
 func (c *LogCapture) Has(level slog.Level, message string) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -243,8 +197,6 @@ func (c *LogCapture) Has(level slog.Level, message string) bool {
 	return false
 }
 
-// Messages is every message logged at or above a level, for a failure message that
-// says what the service actually reported.
 func (c *LogCapture) Messages(level slog.Level) []string {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -257,7 +209,6 @@ func (c *LogCapture) Messages(level slog.Level) []string {
 	return out
 }
 
-// bytesReader avoids importing bytes for one call site.
 func bytesReader(b []byte) io.Reader { return &sliceReader{b: b} }
 
 type sliceReader struct {

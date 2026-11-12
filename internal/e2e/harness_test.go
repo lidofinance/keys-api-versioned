@@ -1,14 +1,5 @@
-// Package e2e drives the whole service — writer, store and HTTP surface — against a
-// real Postgres.
-//
-// It is one package on purpose. These tests contend on things that are per-database
-// rather than per-schema (advisory locks, and therefore retention's back-off), and one
-// package keeps them under a single parallelism budget the harness controls instead of
-// letting `go test ./...` interleave them with each other.
-//
-// Skipped unless TEST_DATABASE_URL is set:
-//
-//	TEST_DATABASE_URL=postgres://postgres:postgres@localhost:55433/keys_api_test go test ./internal/e2e/
+// Package e2e drives writer, store and HTTP against real Postgres; skipped without TEST_DATABASE_URL.
+// One package, so per-database contention (advisory locks) stays under one parallelism budget.
 package e2e
 
 import (
@@ -20,11 +11,7 @@ import (
 	"github.com/lidofinance/keys-api-versioned/internal/testreg"
 )
 
-// TestTheHarnessServesAVerifiedDump is the harness proving itself: a version written by
-// the writer, read back through the HTTP surface, and checked key by key against the
-// registry that generated it. Everything else in this package builds on these four
-// pieces working, so when they do not, this is the test that should fail rather than
-// something subtler.
+// The harness proving itself: when this fails, debug it before anything subtler in the package.
 func TestTheHarnessServesAVerifiedDump(t *testing.T) {
 	db := testpg.New(t)
 	ctx := context.Background()
@@ -53,9 +40,7 @@ func TestTheHarnessServesAVerifiedDump(t *testing.T) {
 		t.Errorf("dump held %d keys, want %d", verifier.Keys(), spec.TotalKeys())
 	}
 
-	// The meta names the version's own block, not the head it was last confirmed at:
-	// a consumer reconciling against the chain has to know which block the keys are
-	// from, and this is where it reads it.
+	// Meta names the version's own block, not the head it was last confirmed at.
 	if body.Meta == nil {
 		t.Fatal("the response carried no meta")
 	}
@@ -73,10 +58,7 @@ func TestTheHarnessServesAVerifiedDump(t *testing.T) {
 	}
 }
 
-// TestTheGeneratedRegistryCatchesAKeyFromAnotherVersion is the verifier proving itself.
-// A stitched response — one module's keys from an older version — is the defect the
-// consistency tests are about, so the check that would catch it must be shown to
-// actually catch it, on a key built by hand rather than on a hoped-for interleaving.
+// The verifier proving itself on hand-built keys rather than a hoped-for interleaving.
 func TestTheGeneratedRegistryCatchesAKeyFromAnotherVersion(t *testing.T) {
 	spec := testreg.Small()
 
@@ -85,21 +67,18 @@ func TestTheGeneratedRegistryCatchesAKeyFromAnotherVersion(t *testing.T) {
 		t.Fatalf("a key of the expected version was rejected: %v", err)
 	}
 
-	// The same key from the next generation of the same module.
 	stale := spec.WithSalt(spec.Salt+1).Key(1, 0, 1)
 	if err := verifier.Key(&stale); err == nil {
 		t.Fatal("a key from another version of the module passed verification")
 	}
 
-	// And a key served under the wrong module, which is what a mismapped module id
-	// would produce.
 	misattributed := spec.Key(2, 0, 0)
 	misattributed.ModuleAddress = testreg.ModuleAddress(3)
 	if err := testreg.NewVerifier(spec).Key(&misattributed); err == nil {
 		t.Fatal("a key served under the wrong module passed verification")
 	}
 
-	// A key served twice has to be a failure too: paging depends on it.
+	// A key served twice must fail: paging depends on it.
 	twice := testreg.NewVerifier(spec)
 	first := spec.Key(1, 0, 0)
 	if err := twice.Key(&first); err != nil {

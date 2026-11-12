@@ -10,14 +10,8 @@ import (
 	"github.com/lidofinance/keys-api-versioned/internal/testreg"
 )
 
-// Paging is the feature the canonical service refuses to offer, and for a good reason
-// there: page two would query a table its registry job may have rewritten, so keys
-// could be skipped or repeated. Here every page reads the version its cursor names, so
-// the walk is a walk over one immutable version.
-//
-// This test publishes between every page, which is the situation that breaks the
-// canonical service, and requires the union of the pages to be exactly the version the
-// walk started on: no gaps, no duplicates, one snapshot id throughout.
+// Canonical refuses paging because page two may read a rewritten table. Here each page reads the
+// version its cursor names, so publishing between pages must not change the walk.
 func TestAPagedWalkStaysOnOneVersionAcrossPublishes(t *testing.T) {
 	db := testpg.New(t)
 	ctx := context.Background()
@@ -48,8 +42,7 @@ func TestAPagedWalkStaysOnOneVersionAcrossPublishes(t *testing.T) {
 		if body.Pagination == nil {
 			t.Fatalf("page %d carried no pagination block", pages)
 		}
-		// Every page must name the same version. This is the assertion that would fail
-		// if a page resolved `latest` again instead of following its cursor.
+		// Fails if a page re-resolved `latest` instead of following its cursor.
 		if snapshot == 0 {
 			snapshot = body.Pagination.Snapshot
 			if snapshot != start.BlockNumber {
@@ -60,7 +53,6 @@ func TestAPagedWalkStaysOnOneVersionAcrossPublishes(t *testing.T) {
 				pages, body.Pagination.Snapshot, snapshot)
 		}
 
-		// A new version between every page: exactly what the cursor has to ignore.
 		next := spec.WithSalt(uint64(pages))
 		next.Publish(ctx, t, db.Writer, testreg.At(db.Block(int64(pages))))
 
@@ -79,9 +71,7 @@ func TestAPagedWalkStaysOnOneVersionAcrossPublishes(t *testing.T) {
 	}
 }
 
-// A walk whose version falls out of retention has to say so. Nothing holds a lease
-// between two pages — the lease lives for one request — so this is the honest answer
-// rather than a gap in the middle of a set the consumer would then treat as complete.
+// No lease spans two pages, so a pruned walk answers 410 rather than a silent gap.
 func TestAPagedWalkWhoseVersionIsPrunedAnswers410(t *testing.T) {
 	testpg.Exclusive(t)
 
@@ -104,8 +94,6 @@ func TestAPagedWalkWhoseVersionIsPrunedAnswers410(t *testing.T) {
 		t.Fatal("the first page did not offer a cursor")
 	}
 
-	// The version the cursor names leaves the window while the consumer is between
-	// pages.
 	next := spec.WithSalt(1)
 	next.Publish(ctx, t, db.Writer, testreg.At(db.Block(1)))
 	pruned, err := db.Writer.Prune(ctx, 1)
@@ -123,9 +111,7 @@ func TestAPagedWalkWhoseVersionIsPrunedAnswers410(t *testing.T) {
 	}
 }
 
-// A cursor pointing at a version that never existed is a different answer from one that
-// has been dropped, and a consumer retrying forever on the wrong one is the reason to
-// keep them apart. This records what the service does today.
+// Records today's answer: an unknown version must stay distinguishable from a dropped one.
 func TestACursorNamingAnUnknownVersion(t *testing.T) {
 	db := testpg.New(t)
 	ctx := context.Background()
@@ -135,8 +121,6 @@ func TestACursorNamingAnUnknownVersion(t *testing.T) {
 
 	srv := testpg.NewServer(t, db.Reader(t, "latest", 2))
 
-	// A cursor is `block.module.operator.index`; this one names a block far above
-	// anything published.
 	cursor := fmt.Sprintf("%d.1.0.0", db.Block(999))
 	resp := srv.Get(t, "/ext/v1/keys?limit=10&cursor="+cursor)
 	defer resp.Body.Close()

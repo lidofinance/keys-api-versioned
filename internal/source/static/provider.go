@@ -1,18 +1,5 @@
-// Package static is a source.Provider backed by a JSON file.
-//
-// It exists for three reasons, in order of usefulness:
-//
-//   - It runs the whole service — ingest, versions, staleness, HTTP — with no
-//     chain, which makes the app testable and demoable in a few seconds.
-//   - It is the proof that the layers above source do not depend on a chain.
-//     If something above starts needing an execution node, this provider stops
-//     compiling.
-//   - It is the shape a second real provider takes. A stVaults registry differs
-//     from this one only in where the keys come from.
-//
-// The file is re-read on every Head, so editing it during a run produces the
-// change signals the sync loop reacts to: bump a module's nonce and the loop
-// rebuilds that module only.
+// Package static is a source.Provider backed by a JSON file, re-read on every Head: bump a
+// module's nonce in the file and the loop rebuilds that module only.
 package static
 
 import (
@@ -29,16 +16,13 @@ import (
 	"github.com/lidofinance/keys-api-versioned/internal/source"
 )
 
-// File is the on-disk shape. Block number and hash are optional: without them
-// the provider advances a block per read and derives a hash from the content, so
-// any content change looks like a new block, which is what the sync loop needs.
+// File is the on-disk shape. Block is optional.
 type File struct {
 	ChainID int64    `json:"chainId"`
 	Block   int64    `json:"block"`
 	Modules []Module `json:"modules"`
 }
 
-// Module carries a module's fields plus its operators and keys.
 type Module struct {
 	ID                        int32  `json:"id"`
 	Address                   string `json:"address"`
@@ -55,7 +39,6 @@ type Module struct {
 	Operators []Operator `json:"operators"`
 }
 
-// Operator carries an operator and its keys.
 type Operator struct {
 	Index         int32  `json:"index"`
 	Name          string `json:"name"`
@@ -63,17 +46,17 @@ type Operator struct {
 	Active        bool   `json:"active"`
 	StakingLimit  int32  `json:"stakingLimit"`
 	UsedKeys      int32  `json:"usedKeys"`
-	Keys          []Key  `json:"keys"`
+	// Leave TotalWithdrawnKeys out for curated-onchain-v1, where the canonical service serves null.
+	TotalWithdrawnKeys *int32 `json:"totalWithdrawnKeys,omitempty"`
+	Keys               []Key  `json:"keys"`
 }
 
-// Key is one signing key. Signature may be empty, in which case it is derived
-// from the pubkey so the wire shape stays valid.
+// An empty Signature is derived from the pubkey so the wire shape stays valid.
 type Key struct {
 	Key       string `json:"key"`
 	Signature string `json:"signature"`
 }
 
-// Provider serves a registry from a file.
 type Provider struct {
 	path string
 
@@ -83,12 +66,10 @@ type Provider struct {
 	hash  string
 }
 
-// New builds a provider over a file path.
 func New(path string) *Provider { return &Provider{path: path} }
 
 func (p *Provider) Name() string { return "static-file" }
 
-// ChainID reports the chain id the file declares.
 func (p *Provider) ChainID(context.Context) (int64, error) {
 	f, _, err := p.load()
 	if err != nil {
@@ -97,13 +78,8 @@ func (p *Provider) ChainID(context.Context) (int64, error) {
 	return f.ChainID, nil
 }
 
-// load re-reads the file and derives the block identity from it: the modification
-// time as the height, the content hash as the identity.
-//
-// Both properties the layers above need come out of that. The height is monotone
-// and survives a restart, so a version is never undone by a process coming back;
-// the hash changes exactly when the content does, so editing the file looks like a
-// new block and the loop reacts as it would to a chain.
+// load derives the block from the file: mtime as height (monotone across restarts), content
+// hash as identity (changes exactly when the content does).
 func (p *Provider) load() (*File, string, error) {
 	raw, err := os.ReadFile(p.path)
 	if err != nil {
@@ -130,7 +106,6 @@ func (p *Provider) load() (*File, string, error) {
 	return &f, contentHash, nil
 }
 
-// Head returns the current derived block.
 func (p *Provider) Head(context.Context) (model.ELBlockSnapshot, error) {
 	f, hash, err := p.load()
 	if err != nil {
@@ -152,9 +127,7 @@ func (p *Provider) Head(context.Context) (model.ELBlockSnapshot, error) {
 	}, nil
 }
 
-// BlockHashAt returns the hash for a height. A file has one branch, so the
-// current hash is the answer for the current height and an empty string
-// otherwise — which the sync loop reads as "that block is not on this chain".
+// BlockHashAt: a file has one branch, so any other height is "" ("not on this chain").
 func (p *Provider) BlockHashAt(_ context.Context, block int64) (string, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -164,7 +137,6 @@ func (p *Provider) BlockHashAt(_ context.Context, block int64) (string, error) {
 	return "", nil
 }
 
-// Modules returns the file's modules.
 func (p *Provider) Modules(context.Context, source.Ref) ([]model.StakingModule, error) {
 	f, _, err := p.load()
 	if err != nil {
@@ -196,7 +168,6 @@ func (p *Provider) Modules(context.Context, source.Ref) ([]model.StakingModule, 
 	return out, nil
 }
 
-// Operators returns the operators of one module.
 func (p *Provider) Operators(_ context.Context, _ source.Ref, m model.StakingModule) ([]model.Operator, error) {
 	src, err := p.moduleByAddress(m.RawAddress())
 	if err != nil {
@@ -215,12 +186,12 @@ func (p *Provider) Operators(_ context.Context, _ source.Ref, m model.StakingMod
 			Active:                     op.Active,
 			ModuleAddress:              src.Address,
 			DepositableValidatorsCount: max(op.StakingLimit-op.UsedKeys, 0),
+			TotalWithdrawnKeys:         op.TotalWithdrawnKeys,
 		})
 	}
 	return out, nil
 }
 
-// Keys streams the module's keys.
 func (p *Provider) Keys(_ context.Context, _ source.Ref, m model.StakingModule, fn func(model.Key) error) error {
 	src, err := p.moduleByAddress(m.RawAddress())
 	if err != nil {
@@ -240,8 +211,6 @@ func (p *Provider) Keys(_ context.Context, _ source.Ref, m model.StakingModule, 
 				return fmt.Errorf("operator %d signature %d: %w", op.Index, index, err)
 			}
 			if len(signature) == 0 {
-				// A deterministic filler keeps the wire shape valid without asking
-				// the fixture to carry 96 bytes per key.
 				sum := sha256.Sum256(pubkey)
 				signature = append(append(append(signature, sum[:]...), sum[:]...), sum[:]...)
 			}

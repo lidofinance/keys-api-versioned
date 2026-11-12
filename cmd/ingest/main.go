@@ -1,16 +1,5 @@
-// Command ingest reads the registry from an execution node and reports what it
-// found, without writing anything.
-//
-// The service itself (cmd/keys-api) does the writing. This stays as the probe for
-// the read half: it answers "can we reach the chain, do the module types resolve,
-// how fast do keys come back" in one command, which is what you want when a node is
-// misbehaving and you do not want to involve a database.
-//
-// It is also where ingest throughput is measured, because it reports round trips
-// per module alongside the keys. A cold sync is bound by requests rather than
-// bytes, so the comparison worth running against a given endpoint is
-// -multicall=false against the default, and the number to read is calls per
-// request: 1.0 means every read cost its own round trip.
+// Command ingest reads the registry from an execution node and reports what it found, writing
+// nothing. Throughput figure to read: calls per request (1.0 = every read cost a round trip).
 package main
 
 import (
@@ -26,10 +15,6 @@ import (
 	"github.com/lidofinance/keys-api-versioned/internal/source"
 	"github.com/lidofinance/keys-api-versioned/internal/source/lidocore"
 )
-
-// Mainnet Lido Locator: the address the canonical service carries for chain 1.
-// No compiled-in address: see the note in cmd/keys-api. The flag or the environment
-// supplies it, or the probe says which one it wanted.
 
 func main() {
 	var (
@@ -168,8 +153,6 @@ func main() {
 			"vetted", vetted,
 			"took", took.Round(time.Millisecond).String(),
 			"keys/s", int(float64(count)/took.Seconds()),
-			// Round trips are the figure to watch: this module's cost is latency ×
-			// requests far more than it is bytes.
 			"requests", spent.Requests,
 			"calls", spent.Calls,
 			"aggregates", spent.Aggregates,
@@ -190,8 +173,6 @@ func main() {
 		"aggregate_fallbacks", total.Fallbacks)
 }
 
-// ratio renders calls per request to one decimal, which is the packing figure: 1.0
-// means every read cost its own round trip.
 func ratio(calls, requests int64) string {
 	if requests == 0 {
 		return "0"
@@ -199,8 +180,6 @@ func ratio(calls, requests int64) string {
 	return fmt.Sprintf("%.1f", float64(calls)/float64(requests))
 }
 
-// since is the difference between two counter snapshots, so a per-module line
-// reports that module's cost rather than the process total.
 func since(before, after eth.Stats) eth.Stats {
 	return eth.Stats{
 		Requests:   after.Requests - before.Requests,

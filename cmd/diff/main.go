@@ -1,8 +1,5 @@
-// Command diff compares two keys-api implementations response by response.
-//
-// This is the parity gate: it is meant to run continuously against both
-// services over the same database, not once by hand. Keys arrays are sorted
-// before comparison because neither implementation promises an order.
+// Command diff compares two keys-api implementations response by response, sorting arrays first:
+// neither promises an order.
 package main
 
 import (
@@ -65,18 +62,14 @@ func main() {
 		}
 	}
 	if *live {
-		// Against a syncing pair these differ by construction: the two fetches
-		// happen seconds apart and the writer advances the block meta in between.
-		// The key sets are still compared in full.
+		// The two fetches are seconds apart and the writer advances the block meta in between.
 		for _, p := range []string{
 			".meta.elBlockSnapshot.blockNumber", ".meta.elBlockSnapshot.blockHash",
 			".meta.elBlockSnapshot.timestamp", ".meta.elBlockSnapshot.lastChangedBlockHash",
 			".elBlockSnapshot.blockNumber", ".elBlockSnapshot.blockHash",
 			".elBlockSnapshot.timestamp", ".elBlockSnapshot.lastChangedBlockHash",
-			// A module's own lastChangedBlockHash cannot match, by design rather than by
-			// timing: the canonical service moves it whenever a module is re-read, and
-			// this one moves it only when the module's content changed. That difference
-			// is the point — comparing it would report the fix as a failure.
+			// A module's lastChangedBlockHash differs by design: canonical moves it on every re-read, this
+			// service only on a content change.
 			".data[].lastChangedBlockHash", ".data.module.lastChangedBlockHash",
 			".data[].module.lastChangedBlockHash", ".data.lastChangedBlockHash",
 		} {
@@ -180,17 +173,13 @@ func fetch(client *http.Client, url string) (response, error) {
 func compare(a, b []byte, maxReport int, ignored map[string]bool) ([]string, error) {
 	var ka, kb keysResponse
 	if isKeysResponse(a, &ka) && isKeysResponse(b, &kb) {
-		// The ignore list has to reach this path too: against a live pair the meta
-		// block advances between the two fetches, and a point-in-time store (the
-		// LSM copy) reports the block it was loaded at by design.
+		// The meta block advances between two fetches against a live pair.
 		return compareKeys(ka, kb, maxReport, ignored[".meta.elBlockSnapshot.blockNumber"])
 	}
 	return compareGeneric(a, b, maxReport, ignored)
 }
 
-// isKeysResponse reports whether the body is a flat keys list. Other endpoints
-// also have a "data" array (modules, grouped keys), so the element shape
-// decides, not the envelope.
+// isKeysResponse decides by element shape: other endpoints also have a "data" array.
 func isKeysResponse(body []byte, out *keysResponse) bool {
 	if err := json.Unmarshal(body, out); err != nil {
 		return false
@@ -249,10 +238,7 @@ func compareGeneric(a, b []byte, maxReport int, ignored map[string]bool) ([]stri
 		return nil, fmt.Errorf("parse B: %w", err)
 	}
 
-	// Neither service promises an order, and key arrays are nested differently
-	// per endpoint (`data.keys`, `data[].keys`, plain `data`). Sort every array
-	// of keys wherever it sits, otherwise an order difference reads as a content
-	// difference — which is exactly what it did before this pass existed.
+	// Key arrays nest differently per endpoint (data.keys, data[].keys, data); sort them wherever they sit.
 	normalizeKeyArrays(va)
 	normalizeKeyArrays(vb)
 
@@ -261,12 +247,8 @@ func compareGeneric(a, b []byte, maxReport int, ignored map[string]bool) ([]stri
 	return diffs, nil
 }
 
-// arrayIndex matches a concrete array index in a path, so an ignore entry can be
-// written once as `.data[].field` rather than once per position.
 var arrayIndex = regexp.MustCompile(`\[\d+\]`)
 
-// isIgnored reports whether a path is excluded, comparing both the concrete path and
-// its index-agnostic form.
 func isIgnored(path string, ignored map[string]bool) bool {
 	if ignored[path] {
 		return true
@@ -318,8 +300,6 @@ func walk(path string, a, b any, diffs *[]string, maxReport int, ignored map[str
 	}
 }
 
-// normalizeKeyArrays walks a decoded response and sorts any array whose
-// elements look like registry keys.
 func normalizeKeyArrays(v any) {
 	switch tv := v.(type) {
 	case map[string]any:
@@ -335,11 +315,8 @@ func normalizeKeyArrays(v any) {
 				return keySortKey(tv[i]) < keySortKey(tv[j])
 			})
 		}
-		// Modules and operators need the same treatment for the same reason. The
-		// canonical service returns modules in physical row order — on mainnet that is
-		// 1, 2, 4, 3 — and this service returns them sorted by id. Neither promises an
-		// order, so comparing positionally reports a content mismatch where there is
-		// none: it was reading module 4 against module 3 and calling every field wrong.
+		// Canonical returns modules in physical row order (1, 2, 4, 3 on mainnet); positional comparison
+		// would read module 4 against module 3.
 		if looksLikeModules(tv) {
 			sort.SliceStable(tv, func(i, j int) bool {
 				return numberField(tv[i], "id") < numberField(tv[j], "id")
@@ -350,10 +327,7 @@ func normalizeKeyArrays(v any) {
 				return operatorSortKey(tv[i]) < operatorSortKey(tv[j])
 			})
 		}
-		// The grouped endpoints wrap each module: `[{keys, module}]` and
-		// `[{operators, module}]`. Same ordering difference, one level deeper, and it
-		// reads even worse — comparing group 3 against group 4 reports "length 0 vs
-		// 25940" as though a module lost its keys.
+		// Grouped endpoints wrap each module; same ordering difference one level deeper.
 		if looksLikeGroups(tv) {
 			sort.SliceStable(tv, func(i, j int) bool {
 				return groupModuleID(tv[i]) < groupModuleID(tv[j])
@@ -362,8 +336,6 @@ func normalizeKeyArrays(v any) {
 	}
 }
 
-// looksLikeModules recognises a staking module array by two fields that only
-// modules carry together.
 func looksLikeModules(arr []any) bool {
 	m, ok := firstObject(arr)
 	if !ok {
@@ -374,8 +346,7 @@ func looksLikeModules(arr []any) bool {
 	return hasAddress && hasNonce
 }
 
-// looksLikeOperators recognises an operator array. `rewardAddress` with
-// `stakingLimit` is unique to operators across this surface.
+// rewardAddress with stakingLimit is unique to operators on this surface.
 func looksLikeOperators(arr []any) bool {
 	m, ok := firstObject(arr)
 	if !ok {
@@ -386,7 +357,6 @@ func looksLikeOperators(arr []any) bool {
 	return hasReward && hasLimit
 }
 
-// looksLikeGroups recognises an array whose entries wrap a module.
 func looksLikeGroups(arr []any) bool {
 	m, ok := firstObject(arr)
 	if !ok {
@@ -396,7 +366,6 @@ func looksLikeGroups(arr []any) bool {
 	return hasModule
 }
 
-// groupModuleID reads the wrapped module's id.
 func groupModuleID(v any) float64 {
 	m, ok := v.(map[string]any)
 	if !ok {
@@ -427,8 +396,6 @@ func numberField(v any, field string) float64 {
 	return f
 }
 
-// operatorSortKey orders operators by module and then index, since a grouped
-// response can carry several modules' operators.
 func operatorSortKey(v any) string {
 	m, ok := v.(map[string]any)
 	if !ok {
@@ -451,8 +418,6 @@ func looksLikeKeys(arr []any) bool {
 	return hasKey && hasSig
 }
 
-// keySortKey builds a total order: module, then operator, then index, with the
-// pubkey as the final tiebreaker.
 func keySortKey(v any) string {
 	m, ok := v.(map[string]any)
 	if !ok {

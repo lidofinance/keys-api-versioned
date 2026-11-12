@@ -8,35 +8,17 @@ import (
 	"strings"
 )
 
-// The error surface, compared against the canonical service.
-//
-// It exists because of a gap this repo recorded and then left open: `cmd/diff` compares
-// successful responses, so parity has never covered what either service does with a
-// request it cannot serve. Two defects hid there — a malformed `?snapshot=` fell through
-// to 500, and a module id that is neither a number nor an address answered 404 where the
-// canonical service answers 400 — and both were found by reading code rather than by a
-// run. Parity verified only on the happy path is parity of half the contract.
-//
-// What is compared is the status code, and the shape of the error body where both send
-// one. Not the message text: the canonical service's wording is its own and matching it
-// word for word is neither achievable nor useful. A consumer branches on the status.
-//
-// Cases live here rather than in a test because they need two running services. The
-// hermetic half — that our own answers are what we intend — is internal/e2e's job.
+// The error surface vs the canonical service: status code and error-body field names, not message
+// text. Needs two running services, so it lives here rather than in a test.
 type errorCase struct {
-	name string
-	// method and path are sent to both services.
-	method string
-	path   string
-	body   string
-	// note explains a case whose point is not obvious from the path.
-	note string
-	// canonicalOnly marks a case the extended surface has no opinion about.
+	name          string
+	method        string
+	path          string
+	body          string
+	note          string
 	canonicalOnly bool
 }
 
-// errorCases is the matrix. Everything here is on the canonical surface: the extended
-// one is ours alone and has nothing to be compared against.
 func errorCases(moduleID string) []errorCase {
 	return []errorCase{
 		{name: "unknown module id", method: "GET", path: "/v1/modules/9999/keys"},
@@ -55,10 +37,7 @@ func errorCases(moduleID string) []errorCase {
 		{name: "operatorIndex that is not a number", method: "GET", path: "/v1/keys?operatorIndex=abc"},
 		{name: "negative operatorIndex", method: "GET", path: "/v1/keys?operatorIndex=-1"},
 
-		// The claim this whole surface split rests on: the canonical service ignores a
-		// query parameter it does not declare, so ignoring ours on /v1 is the compatible
-		// behaviour and answering 400 would not be. Read off its ValidationPipe
-		// configuration; this is the run that checks it.
+		// The canonical ValidationPipe ignores undeclared query parameters, so /v1 must too, not 400.
 		{name: "an undeclared query parameter", method: "GET", path: "/v1/keys?limit=3",
 			note: "the compatibility claim: canonical ignores it, so /v1 must too"},
 		{name: "another undeclared parameter", method: "GET", path: "/v1/modules?snapshot=12345",
@@ -77,7 +56,6 @@ func errorCases(moduleID string) []errorCase {
 	}
 }
 
-// runErrorMatrix sends every case to both services and reports where the answers differ.
 func runErrorMatrix(client *http.Client, a, b, moduleID string) bool {
 	fmt.Printf("error surface: %d cases, A=%s B=%s\n\n", len(errorCases(moduleID)), a, b)
 
@@ -125,7 +103,6 @@ func runErrorMatrix(client *http.Client, a, b, moduleID string) bool {
 	return failed
 }
 
-// send performs one request, with a body for POST.
 func send(client *http.Client, method, url, body string) (response, error) {
 	var reader *strings.Reader
 	if body != "" {
@@ -151,16 +128,13 @@ func send(client *http.Client, method, url, body string) (response, error) {
 	defer resp.Body.Close()
 
 	out := response{status: resp.StatusCode}
-	// An error body is small; a 200 on a dump is not, and none of these cases needs it.
+	// A 200 on a dump is large and no case needs it.
 	limited := make([]byte, 4<<10)
 	n, _ := resp.Body.Read(limited)
 	out.body = limited[:n]
 	return out, nil
 }
 
-// shapeDiff reports whether the two error bodies carry the same field names, which is
-// what a consumer that logs or matches on them sees. Message text is deliberately not
-// compared.
 func shapeDiff(a, b []byte) string {
 	fa, oka := fieldNames(a)
 	fb, okb := fieldNames(b)
@@ -186,8 +160,6 @@ func fieldNames(body []byte) ([]string, bool) {
 	return names, true
 }
 
-// summarise keeps a DIFF line readable when a service answers with a page of HTML or a
-// stack trace.
 func summarise(body []byte) string {
 	s := strings.TrimSpace(string(body))
 	s = strings.ReplaceAll(s, "\n", " ")

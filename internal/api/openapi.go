@@ -5,34 +5,18 @@ import (
 	"net/http"
 )
 
-// The API document is hand-written and embedded rather than generated from
-// annotations. Two reasons, and the second is the real one.
-//
-// Generators describe what the handlers happen to return. Half of what a consumer of
-// this service needs to know is not in a struct: that a request without `snapshot`
-// gets `latest`, that a cursor pins the version it came from, that a diff's two sides
-// reconstruct a dump when applied in order, that `409` carries the head to jump to.
-// Those are contract, and they are written down here.
-//
-// The risk of hand-writing is drift, so a test holds the document to the router:
-// every route must be in the spec and every spec path must be a route. Descriptions
-// can still go stale, but the surface cannot.
+// Hand-written, not generated: much of the contract (default pin, cursor pinning, 409 payload) is
+// not in a struct. A test holds the document's paths to the router.
 
 //go:embed openapi.yaml
 var openAPISpec []byte
 
-// handleOpenAPISpec serves the document.
 func handleOpenAPISpec(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", "application/yaml; charset=utf-8")
 	w.Write(openAPISpec)
 }
 
-// docsPage renders the document with Swagger UI.
-//
-// Loaded from a CDN, which is a deliberate trade: the alternative is vendoring about
-// a megabyte of JavaScript into this repo. The page degrades honestly — if the CDN is
-// unreachable it says so and points at the raw document, which is the thing that
-// actually matters and is served locally.
+// Swagger UI from a CDN rather than ~1 MB vendored JS; if it fails, the page links the raw document.
 const docsPage = `<!doctype html>
 <html lang="en">
 <head>
@@ -75,7 +59,6 @@ const docsPage = `<!doctype html>
 </html>
 `
 
-// handleDocs serves the rendering page.
 func handleDocs(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Write([]byte(docsPage))

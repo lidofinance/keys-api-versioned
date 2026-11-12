@@ -12,30 +12,18 @@ import (
 	"github.com/lidofinance/keys-api-versioned/internal/testreg"
 )
 
-// The states a pinned read can land in are more numerous here than in the canonical
-// service, because a version has a life: it is built, published, confirmed, marked
-// stale, superseded by a reorg, and finally pruned. Each of those has to be a distinct
-// answer, since a consumer's correct reaction differs — retry, follow the head, give up,
-// or fix its request.
-//
-// Two of the cases below record what the service does today rather than what it should
-// do; they are marked, and each names the backlog item that would change it. A test that
-// quietly encodes the intended behaviour instead would pass only in a future that has
-// not arrived.
-
 func TestPinAndErrorMatrix(t *testing.T) {
 	db := testpg.New(t)
 	ctx := context.Background()
 
 	spec := testreg.Spec{Modules: 2, OperatorsPerModule: 1, KeysPerOperator: 5}
 
-	// Nothing published yet: the canonical 425, on every read endpoint.
 	empty := testpg.NewServer(t, db.Reader(t, "latest", 2))
 	for _, path := range []string{"/v1/keys", "/v1/modules", "/v1/operators", "/v1/status"} {
 		resp := empty.Get(t, path)
 		resp.Body.Close()
 		if path == "/v1/status" {
-			// Status answers even before there is data — it is how a consumer discovers that.
+			// Status answers before there is data: that is how a consumer discovers it.
 			if resp.StatusCode != http.StatusOK {
 				t.Errorf("GET %s on an empty store: status %d, want 200", path, resp.StatusCode)
 			}
@@ -51,7 +39,6 @@ func TestPinAndErrorMatrix(t *testing.T) {
 		t.Errorf("GET /health/ready on an empty store: status %d, want 503", ready.StatusCode)
 	}
 
-	// One published version, one superseded, one pruned.
 	kept := testreg.At(db.Block(10))
 	spec.Publish(ctx, t, db.Writer, kept)
 
@@ -87,7 +74,7 @@ func TestPinAndErrorMatrix(t *testing.T) {
 		}
 	}
 
-	// A pruned version: retained history is what separates 410 from 409.
+	// Retained history is what separates 410 from 409.
 	testpg.Exclusive(t)
 	spec.WithSalt(2).Publish(ctx, t, db.Writer, testreg.At(db.Block(12)))
 	if _, err := db.Writer.Prune(ctx, 1); err != nil {
@@ -100,11 +87,8 @@ func TestPinAndErrorMatrix(t *testing.T) {
 	}
 }
 
-// TestAnUnknownHashRecordsTodaysBehaviour pins down one answer that is not the one the
-// design asks for, so that fixing it is a test change rather than a discovery: a hash
-// that was never published answers 410 "no longer retained". classifyMissingAppPin works
-// out whether the hash was ever known and then ignores the answer, which makes the code
-// read as though item 5 of the backlog were done. It is not.
+// Records today's behaviour, not the design: an unknown hash answers 410, it should be 404.
+// classifyMissingAppPin works out whether the hash was ever known, then ignores the answer.
 func TestAnUnknownHashRecordsTodaysBehaviour(t *testing.T) {
 	db := testpg.New(t)
 	ctx := context.Background()
@@ -128,19 +112,8 @@ func TestAnUnknownHashRecordsTodaysBehaviour(t *testing.T) {
 	}
 }
 
-// TestADiffFromAPrunedVersionAnswers410 covers the answer a consumer that fell behind
-// actually gets, which until now was only covered through `?snapshot=` on the dump.
-//
-// It matters more on this endpoint than on that one. A pinned dump of a version that is
-// gone can only fail; a diff from it could plausibly be computed, and the result would
-// apply cleanly and be wrong. Retention deletes closed rows, so the `removed` side —
-// and only that side — comes back short: the consumer would keep keys the chain no
-// longer has, with nothing in the response saying so. TestADiffWhoseOlderEndWasDeleted-
-// ComesBackShort demonstrates that at the store level; this one holds the HTTP contract
-// that refuses instead.
-//
-// The 200 before the prune is what stops this from being vacuous: without it, a diff
-// endpoint that answered 410 to everything would pass.
+// A diff from a pruned version must refuse: retention deletes closed rows, so `removed` would come
+// back short and still apply cleanly. The 200 before the prune keeps the 410 from being vacuous.
 func TestADiffFromAPrunedVersionAnswers410(t *testing.T) {
 	testpg.Exclusive(t)
 
@@ -151,8 +124,6 @@ func TestADiffFromAPrunedVersionAnswers410(t *testing.T) {
 	from := testreg.At(db.Block(0))
 	spec.Publish(ctx, t, db.Writer, from)
 
-	// One module rewritten, so the diff has a substantial removed side — the side
-	// retention is able to delete.
 	next := spec.WithSalt(spec.Salt + 1)
 	next.PublishModules(ctx, t, db.Writer, testreg.At(db.Block(1)), 1)
 
@@ -178,7 +149,6 @@ func TestADiffFromAPrunedVersionAnswers410(t *testing.T) {
 			"and the 410 below proves nothing — body %s", body)
 	}
 
-	// The version the consumer holds leaves the retention window while it is away.
 	pruned, err := db.Writer.Prune(ctx, 1)
 	if err != nil {
 		t.Fatalf("prune: %v", err)
@@ -195,17 +165,7 @@ func TestADiffFromAPrunedVersionAnswers410(t *testing.T) {
 	}
 }
 
-// TestANumericPinTellsAPrunedVersionApartFromOneThatNeverExisted pins the distinction
-// that decides what a consumer does next: 410 means "you are too far behind, resync",
-// 404 means "that is not a version, fix your request".
-//
-// It is worth holding in place because the two answers come from one branch of
-// classifyMissingAppPin whose condition is a comparison against min(block_number) — a
-// value that moves every time retention runs. And because the equivalent distinction for
-// *hash* pins does not work at all: see TestAnUnknownHashRecordsTodaysBehaviour and
-// backlog item 5.
-//
-// Both endpoints that resolve a pin are checked, since a consumer meets this on either.
+// The 410/404 boundary compares against min(block_number), which moves every time retention runs.
 func TestANumericPinTellsAPrunedVersionApartFromOneThatNeverExisted(t *testing.T) {
 	testpg.Exclusive(t)
 
@@ -225,9 +185,7 @@ func TestANumericPinTellsAPrunedVersionApartFromOneThatNeverExisted(t *testing.T
 
 	srv := testpg.NewServer(t, db.Reader(t, "latest", 3))
 
-	// Above the oldest version still held, and never published: a block number the
-	// consumer could only have invented — or, more likely, read out of
-	// meta.elBlockSnapshot, which carries the head rather than the version's identity.
+	// Never published; a consumer most likely read it from meta.elBlockSnapshot, which is the head.
 	invented := db.Block(13)
 
 	for _, c := range []struct {
@@ -239,8 +197,7 @@ func TestANumericPinTellsAPrunedVersionApartFromOneThatNeverExisted(t *testing.T
 		{"a block that was never a version", fmt.Sprintf("/ext/v1/keys?snapshot=%d", invented), http.StatusNotFound},
 		{"a diff from a pruned version", fmt.Sprintf("/ext/v1/keys/diff?since=%d", dropped.BlockNumber), http.StatusGone},
 		{"a diff from a block that was never a version", fmt.Sprintf("/ext/v1/keys/diff?since=%d", invented), http.StatusNotFound},
-		// The version that survived retention still serves, which is what makes the two
-		// answers above statements about those pins rather than about the store.
+		// The survivor still serves, so the answers above are about those pins, not the store.
 		{"the version that was kept", fmt.Sprintf("/ext/v1/keys?snapshot=%d", kept.BlockNumber), http.StatusOK},
 	} {
 		resp := srv.Get(t, c.path)
@@ -250,20 +207,14 @@ func TestANumericPinTellsAPrunedVersionApartFromOneThatNeverExisted(t *testing.T
 				c.name, c.path, resp.StatusCode, c.want, body)
 			continue
 		}
-		// A 404 about a pin must not talk about modules. It used to: ErrNotFound is
-		// shared with the module lookup and hardcoded that wording, so a consumer
-		// asking for a version that never existed was told its module was unsupported.
+		// ErrNotFound is shared with the module lookup, whose wording used to leak into pin 404s.
 		if c.want == http.StatusNotFound && strings.Contains(body, "module") {
 			t.Errorf("%s: the 404 body blames a module for a pin problem — %s", c.name, body)
 		}
 	}
 }
 
-// A stale version keeps being served, with the staleness in a header rather than in the
-// body — so a consumer that ignores headers sees the canonical contract unchanged, and
-// one that reads them knows what it has. The header must also arrive before the body,
-// which for HTTP is automatic and worth asserting anyway: it is the reason the signal
-// cannot describe anything that happens later in the stream.
+// Staleness travels in a header so the JSON stays byte-identical to canonical.
 func TestStalenessTravelsInTheHeaderAndTheBodyIsUnchanged(t *testing.T) {
 	db := testpg.New(t)
 	ctx := context.Background()
@@ -280,7 +231,6 @@ func TestStalenessTravelsInTheHeaderAndTheBodyIsUnchanged(t *testing.T) {
 		t.Errorf("a fresh version carries X-Snapshot-Stale: %q", got)
 	}
 
-	// The writer decides a version no longer reflects the chain. It stays served.
 	stored, err := db.Writer.Latest(ctx)
 	if err != nil || stored == nil {
 		t.Fatalf("read the stored version: %v", err)
@@ -323,14 +273,7 @@ func readBody(t *testing.T, resp *http.Response) string {
 	return string(buf)
 }
 
-// TestTheFinalizedPinResolvesToTheNewestFinalizedVersion is the pin that was documented and did not
-// work: it was called `safe`, the query was `label = 'safe'`, and nothing ever wrote the
-// label — so a consumer
-// asking for it got 425 "not ready" forever.
-//
-// What it has to be instead is the newest published version at or below the finalized
-// block — a version a reorg cannot take away. The assertions are about that boundary, not
-// about a label.
+// The finalized pin is the newest published version at or below the finalized block.
 func TestTheFinalizedPinResolvesToTheNewestFinalizedVersion(t *testing.T) {
 	db := testpg.New(t)
 	ctx := context.Background()
@@ -340,8 +283,7 @@ func TestTheFinalizedPinResolvesToTheNewestFinalizedVersion(t *testing.T) {
 	final := testreg.At(db.Block(10))
 	spec.PublishFinal(ctx, t, db.Writer, final, final.BlockNumber)
 
-	// Two more versions above finality, with different content so "which version
-	// answered" is visible in the body rather than only in the meta.
+	// Different content, so which version answered shows in the body, not only the meta.
 	spec.WithSalt(1).PublishFinal(ctx, t, db.Writer, testreg.At(db.Block(11)), final.BlockNumber)
 	spec.WithSalt(2).PublishFinal(ctx, t, db.Writer, testreg.At(db.Block(12)), final.BlockNumber)
 
@@ -360,8 +302,7 @@ func TestTheFinalizedPinResolvesToTheNewestFinalizedVersion(t *testing.T) {
 		t.Fatalf("the finalized pin answered from a version above the finalized block: %v", err)
 	}
 
-	// The control: latest is a different version. Without it this would pass on a
-	// service where the pin simply aliased latest and finality meant nothing.
+	// Control: without it, a pin that merely aliased latest would pass.
 	head := srv.Get(t, "/v1/keys")
 	defer head.Body.Close()
 	if _, err := testreg.NewVerifier(spec.WithSalt(2)).V1Keys(head.Body); err != nil {
@@ -369,14 +310,12 @@ func TestTheFinalizedPinResolvesToTheNewestFinalizedVersion(t *testing.T) {
 	}
 }
 
-// A source with no finality must say so rather than look unready. A store fed from a file
-// will never produce a finalized version, and 425 would have a consumer retry forever.
+// A file-fed store never has finality; 425 would have a consumer retry forever.
 func TestTheFinalizedPinWithoutFinalityIsUnsupportedRatherThanTooEarly(t *testing.T) {
 	db := testpg.New(t)
 	ctx := context.Background()
 
 	spec := testreg.Spec{Modules: 1, OperatorsPerModule: 1, KeysPerOperator: 3}
-	// Publish, not PublishFinal: a version exists, no finalized block was ever recorded.
 	spec.Publish(ctx, t, db.Writer, testreg.At(db.Block(0)))
 
 	srv := testpg.NewServer(t, db.Reader(t, "latest", 2))
@@ -392,10 +331,8 @@ func TestTheFinalizedPinWithoutFinalityIsUnsupportedRatherThanTooEarly(t *testin
 	}
 }
 
-// Retention counts versions and finality is measured in time, so the finalized version drifts
-// towards the edge of the window on its own. Pruning it would break the one pin whose
-// promise is that it stays put, so retention holds for it exactly as it holds for a
-// reader's lease.
+// Retention counts versions while finality is time, so the finalized version drifts to the window
+// edge; retention holds for it as for a reader's lease.
 func TestRetentionDoesNotPruneTheFinalizedVersion(t *testing.T) {
 	testpg.Exclusive(t)
 
@@ -406,13 +343,10 @@ func TestRetentionDoesNotPruneTheFinalizedVersion(t *testing.T) {
 	final := testreg.At(db.Block(0))
 	spec.PublishFinal(ctx, t, db.Writer, final, final.BlockNumber)
 
-	// Newer versions, all above finality.
 	for i := 1; i <= 3; i++ {
 		spec.WithSalt(uint64(i)).PublishFinal(ctx, t, db.Writer, testreg.At(db.Block(int64(i))), final.BlockNumber)
 	}
 
-	// A window of one would drop everything below the newest version — including the
-	// finalized one.
 	pruned, err := db.Writer.Prune(ctx, 1)
 	if err != nil {
 		t.Fatalf("prune: %v", err)

@@ -773,6 +773,13 @@ components:
         active: { type: boolean }
         moduleAddress: { type: string }
         depositableValidatorsCount: { type: integer }
+        totalWithdrawnKeys:
+          type: integer
+          nullable: true
+          description: |
+            Withdrawn keys of the operator. A number for `community-onchain-v1` and
+            `curated-onchain-v2`, `null` for `curated-onchain-v1`, which has no such
+            counter. Always present, on both surfaces, as in the canonical service.
         groupId:
           type: integer
           nullable: true

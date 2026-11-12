@@ -5,14 +5,14 @@ import (
 	"fmt"
 	"math/big"
 	"reflect"
+	"strconv"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/lidofinance/keys-api-versioned/internal/model"
 )
 
-// The ABI decoder builds anonymous struct types at runtime, so tuple returns are
-// read by reflection rather than by type assertion. Field names come from the ABI
-// files, which are the canonical service's own — see internal/eth/abi.
+// The ABI decoder builds anonymous struct types at runtime, so tuples are read by reflection.
 
 const (
 	pubkeyBytes    = 48
@@ -33,7 +33,6 @@ type rawModule struct {
 	withdrawalCredentialsType int32
 }
 
-// defaultWithdrawalCredentialsType is what a module has before the router reports one.
 const defaultWithdrawalCredentialsType = 1
 
 func decodeStakingModules(v any, version int64) ([]rawModule, error) {
@@ -57,12 +56,8 @@ func decodeStakingModules(v any, version int64) ([]rawModule, error) {
 			lastDepositBlock:      fieldInt(item, "LastDepositBlock"),
 			exitedValidatorsCount: int32(fieldInt(item, "ExitedValidatorsCount")),
 		}
-		// The type comes from the contract only from staking router v4; below it the
-		// field is either absent from the tuple or present and unset, and type 1 is
-		// implied. Decided by the version the router reported this cycle rather than by
-		// whether our ABI file happens to declare the field: the ABI is a property of
-		// this build, the tuple is a property of the chain, and reading one for the
-		// other is how a service claims to support a version it has never seen.
+		// Decided by the router version reported this cycle, not by whether our ABI declares the field:
+		// the tuple is a property of the chain, the ABI of this build.
 		f := item.FieldByName("WithdrawalCredentialsType")
 		switch {
 		case version >= srVersionWithWCType && f.IsValid():
@@ -71,8 +66,7 @@ func decodeStakingModules(v any, version int64) ([]rawModule, error) {
 			m.withdrawalCredentialsType = defaultWithdrawalCredentialsType
 		}
 		if m.withdrawalCredentialsType == 0 {
-			// v4 with the field still unset, which is what a chain looks like between the
-			// upgrade and the vote that sets it.
+			// v4 with the field unset: between the upgrade and the vote that sets it.
 			m.withdrawalCredentialsType = defaultWithdrawalCredentialsType
 		}
 		out = append(out, m)
@@ -85,16 +79,14 @@ func decodeModuleType(v any) (string, error) {
 	case string:
 		return t, nil
 	case [32]byte:
-		// getType returns bytes32 on some modules; trim the padding.
 		return strings.TrimRight(string(t[:]), "\x00"), nil
 	default:
 		return "", fmt.Errorf("getType: unexpected type %T", v)
 	}
 }
 
-// decodeCuratedOperator reads getNodeOperator(i, true), whose outputs are, in
-// ABI order: active, name, rewardAddress, totalVettedValidators,
-// totalExitedValidators, totalAddedValidators, totalDepositedValidators.
+// decodeCuratedOperator outputs, in ABI order: active, name, rewardAddress, totalVetted,
+// totalExited, totalAdded, totalDeposited.
 func decodeCuratedOperator(index int32, moduleAddress string, values []any) (model.Operator, error) {
 	if len(values) < 7 {
 		return model.Operator{}, fmt.Errorf("getNodeOperator: expected 7 values, got %d", len(values))
@@ -109,24 +101,30 @@ func decodeCuratedOperator(index int32, moduleAddress string, values []any) (mod
 		return model.Operator{}, fmt.Errorf("getNodeOperator: name is %T", values[1])
 	}
 
+	var counts [4]int32
+	for i, field := range []string{"totalVetted", "totalExited", "totalAdded", "totalDeposited"} {
+		n, err := keyCount(values[3+i])
+		if err != nil {
+			return model.Operator{}, fmt.Errorf("getNodeOperator(%d) %s: %w", index, field, err)
+		}
+		counts[i] = n
+	}
+
 	return model.Operator{
-		Name:              name,
+		Name:              operatorName(name, index),
 		RewardAddress:     strings.ToLower(addressOf(values[2])),
-		StakingLimit:      int32(intOf(values[3])),
-		StoppedValidators: int32(intOf(values[4])),
-		TotalSigningKeys:  int32(intOf(values[5])),
-		UsedSigningKeys:   int32(intOf(values[6])),
+		StakingLimit:      counts[0],
+		StoppedValidators: counts[1],
+		TotalSigningKeys:  counts[2],
+		UsedSigningKeys:   counts[3],
 		Index:             index,
 		Active:            active,
 		ModuleAddress:     moduleAddress,
 	}, nil
 }
 
-// decodeCommunityOperator reads the CSM getNodeOperator struct.
-//
-// CSM has no notion of an inactive operator — getNodeOperatorIsActive only checks
-// that the id exists — and we only ask for ids below the count, so active is true
-// by construction. The canonical service reasons the same way.
+// CSM has no inactive operator (getNodeOperatorIsActive only checks the id exists), so active
+// is true for every id below the count.
 func decodeCommunityOperator(index int32, moduleAddress string, values []any) (model.Operator, error) {
 	if len(values) == 0 {
 		return model.Operator{}, fmt.Errorf("getNodeOperator: empty result")
@@ -136,29 +134,55 @@ func decodeCommunityOperator(index int32, moduleAddress string, values []any) (m
 		return model.Operator{}, fmt.Errorf("getNodeOperator: expected a struct, got %T", values[0])
 	}
 
+	fields := []string{"TotalVettedKeys", "TotalExitedKeys", "TotalAddedKeys", "TotalDepositedKeys", "TotalWithdrawnKeys"}
+	var counts [5]int32
+	for i, field := range fields {
+		f := s.FieldByName(field)
+		if !f.IsValid() {
+			return model.Operator{}, fmt.Errorf("getNodeOperator(%d): no field %s", index, field)
+		}
+		n, err := keyCount(f.Interface())
+		if err != nil {
+			return model.Operator{}, fmt.Errorf("getNodeOperator(%d) %s: %w", index, field, err)
+		}
+		counts[i] = n
+	}
+
+	withdrawn := counts[4]
 	return model.Operator{
-		RewardAddress:     strings.ToLower(fieldAddress(s, "RewardAddress")),
-		StakingLimit:      int32(fieldInt(s, "TotalVettedKeys")),
-		StoppedValidators: int32(fieldInt(s, "TotalExitedKeys")),
-		TotalSigningKeys:  int32(fieldInt(s, "TotalAddedKeys")),
-		UsedSigningKeys:   int32(fieldInt(s, "TotalDepositedKeys")),
-		Index:             index,
-		Active:            true,
-		ModuleAddress:     moduleAddress,
+		RewardAddress:      strings.ToLower(fieldAddress(s, "RewardAddress")),
+		StakingLimit:       counts[0],
+		StoppedValidators:  counts[1],
+		TotalSigningKeys:   counts[2],
+		UsedSigningKeys:    counts[3],
+		Index:              index,
+		Active:             true,
+		ModuleAddress:      moduleAddress,
+		TotalWithdrawnKeys: &withdrawn,
 	}, nil
 }
 
-// depositableFromSummary picks depositableValidatorsCount out of
-// getNodeOperatorSummary, whose last output it is in both ABIs.
-func depositableFromSummary(values []any) int64 {
-	if len(values) == 0 {
-		return 0
+// operatorName: Postgres text rejects invalid UTF-8 and NUL, so one such name would stop the
+// ingest; the canonical placeholder replaces it.
+func operatorName(name string, index int32) string {
+	if !utf8.ValidString(name) || strings.ContainsRune(name, 0) {
+		return "invalidName" + strconv.Itoa(int(index))
 	}
-	return intOf(values[len(values)-1])
+	return name
 }
 
-// metadataName picks the name out of the MetaRegistry metadata struct.
-// firstValue is the single return of a one-output call, or nil for an empty result.
+// depositableValidatorsCount is the last output of getNodeOperatorSummary in both ABIs.
+func depositableFromSummary(index int32, values []any) (int32, error) {
+	if len(values) == 0 {
+		return 0, fmt.Errorf("getNodeOperatorSummary(%d): empty result", index)
+	}
+	n, err := keyCount(values[len(values)-1])
+	if err != nil {
+		return 0, fmt.Errorf("getNodeOperatorSummary(%d) depositableValidatorsCount: %w", index, err)
+	}
+	return n, nil
+}
+
 func firstValue(values []any) any {
 	if len(values) == 0 {
 		return nil
@@ -166,7 +190,7 @@ func firstValue(values []any) any {
 	return values[0]
 }
 
-func metadataName(values []any) string {
+func metadataName(values []any, index int32) string {
 	if len(values) == 0 {
 		return ""
 	}
@@ -174,15 +198,9 @@ func metadataName(values []any) string {
 	if s.Kind() != reflect.Struct {
 		return ""
 	}
-	return fieldString(s, "Name")
+	return operatorName(fieldString(s, "Name"), index)
 }
 
-// decodeCuratedKeys splits the packed return of getSigningKeys into keys.
-//
-// The contract returns all pubkeys concatenated (48 bytes each), all signatures
-// concatenated (96 bytes each) and a used flag per key. A key is vetted when its
-// index is below the operator's vetted count — the same rule the canonical
-// service applies.
 func decodeCuratedKeys(values []any, moduleAddress string, op model.Operator, offset int32) ([]model.Key, error) {
 	if len(values) < 3 {
 		return nil, fmt.Errorf("getSigningKeys: expected 3 values, got %d", len(values))
@@ -210,9 +228,7 @@ func decodeCuratedKeys(values []any, moduleAddress string, op model.Operator, of
 	for i := range used {
 		index := offset + int32(i)
 		out = append(out, model.Key{
-			// Kept as bytes all the way through: the contract returns bytes, the
-			// store holds bytes, and the response encoder writes the hex straight
-			// into the output buffer. Nothing in between allocates a string.
+			// Kept as bytes end to end; the response encoder writes hex straight into its buffer.
 			PubkeyBin:     pubkeys[i*pubkeyBytes : (i+1)*pubkeyBytes],
 			SignatureBin:  signatures[i*signatureBytes : (i+1)*signatureBytes],
 			OperatorIndex: op.Index,
@@ -225,10 +241,6 @@ func decodeCuratedKeys(values []any, moduleAddress string, op model.Operator, of
 	return out, nil
 }
 
-// decodeCommunityKeys splits the packed return of getSigningKeysWithSignatures.
-//
-// There is no used array here: a key is deposited when its index is below the
-// operator's deposited count, and vetted when it is below the vetted count.
 func decodeCommunityKeys(values []any, moduleAddress string, op model.Operator, offset int32) ([]model.Key, error) {
 	if len(values) < 2 {
 		return nil, fmt.Errorf("getSigningKeysWithSignatures: expected 2 values, got %d", len(values))
@@ -269,8 +281,6 @@ func decodeCommunityKeys(values []any, moduleAddress string, op model.Operator, 
 	return out, nil
 }
 
-// reflection helpers
-
 func fieldInt(v reflect.Value, name string) int64 {
 	f := v.FieldByName(name)
 	if !f.IsValid() {
@@ -296,6 +306,55 @@ func fieldAddress(v reflect.Value, name string) string {
 	return addressOf(f.Interface())
 }
 
+// Ceilings on counts read from the chain; mainnet modules hold under a thousand operators. Past
+// them a provider answer is treated as wrong data, not allocated for.
+const (
+	maxOperatorsPerModule = 100_000
+	maxKeysPerOperator    = 10_000_000
+	maxKeysPerModule      = 50_000_000
+)
+
+func operatorCount(out []any) (int, error) {
+	if len(out) == 0 {
+		return 0, fmt.Errorf("getNodeOperatorsCount: empty result")
+	}
+	n, err := countOf(out[0], maxOperatorsPerModule)
+	if err != nil {
+		return 0, fmt.Errorf("getNodeOperatorsCount: %w", err)
+	}
+	return int(n), nil
+}
+
+func keyCount(v any) (int32, error) {
+	n, err := countOf(v, maxKeysPerOperator)
+	return int32(n), err
+}
+
+// countOf is intOf without the wrap-around: a negative, an oversized or an unknown value is an error.
+func countOf(v any, limit int64) (int64, error) {
+	var n int64
+	switch t := v.(type) {
+	case *big.Int:
+		if t == nil || !t.IsInt64() {
+			return 0, fmt.Errorf("count %v is out of range [0, %d]", t, limit)
+		}
+		n = t.Int64()
+	case uint64:
+		if t > uint64(limit) {
+			return 0, fmt.Errorf("count %d is out of range [0, %d]", t, limit)
+		}
+		n = int64(t)
+	case uint8, uint16, uint32, int64, int:
+		n = intOf(t)
+	default:
+		return 0, fmt.Errorf("count has unexpected type %T", v)
+	}
+	if n < 0 || n > limit {
+		return 0, fmt.Errorf("count %d is out of range [0, %d]", n, limit)
+	}
+	return n, nil
+}
+
 func intOf(v any) int64 {
 	switch t := v.(type) {
 	case *big.Int:
@@ -317,7 +376,6 @@ func intOf(v any) int64 {
 	}
 }
 
-// addressOf renders any 20-byte address representation as lowercase hex.
 func addressOf(v any) string {
 	switch t := v.(type) {
 	case string:

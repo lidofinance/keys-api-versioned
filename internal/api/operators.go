@@ -10,12 +10,6 @@ import (
 	"github.com/lidofinance/keys-api-versioned/internal/store"
 )
 
-// The operator endpoints exist because consumers need them, not for completeness.
-// ethereum-validators-monitoring reads /v1/operators for the names it labels every
-// validator with, and it pairs them with /v1/keys?used=true; without operators it
-// cannot attribute a validator to anyone.
-
-// parseOperatorsFilter reads the operator query filters.
 func parseOperatorsFilter(r *http.Request) (model.OperatorsFilter, error) {
 	var f model.OperatorsFilter
 	if v := r.URL.Query().Get("operatorIndex"); v != "" {
@@ -29,34 +23,13 @@ func parseOperatorsFilter(r *http.Request) (model.OperatorsFilter, error) {
 	return f, nil
 }
 
-// extOperator is an operator as the extended surface renders it: every canonical
-// field in its canonical order, then the node operator group.
-//
-// A field rather than a whole endpoint, and on /ext/v1 rather than on /v1, because
-// those two surfaces promise different things. /v1 is the canonical service's
-// contract byte for byte — a field it does not send is a difference a parity run
-// would flag and a strict consumer could choke on — while /ext/v1 is where this
-// service's own additions live. A consumer that wants groups changes one prefix.
-//
-// Three states, because two of them are different facts:
-//
-//	field absent      the module has no group registry. Groups do not exist for
-//	                  modules 1–3, and `"groupId": null` there would read as "this
-//	                  operator was left out of one".
-//	"groupId": null   the module has groups and this operator is in none. On chain
-//	                  that is NO_GROUP_ID, which is 0 — a number that names no
-//	                  group, so serving it would be worse than serving nothing.
-//	"groupId": 17     the group the operator belongs to.
+// extOperator: canonical fields in order, then groupId. Absent = module has no group registry;
+// null = in no group (on-chain NO_GROUP_ID is 0, which names no group); else the group.
 type extOperator struct {
 	model.Operator
 	GroupID *model.GroupID `json:"groupId,omitempty"`
 }
 
-// renderOperators picks the representation for the surface a request came in on.
-//
-// The return is `any` because the two shapes are different types; the alternative,
-// one struct with a flag the marshaller reads, needs a custom MarshalJSON for the
-// whole operator and would put the surface rule somewhere no one looks.
 func renderOperators(r *http.Request, operators []model.Operator) any {
 	if !onExtSurface(r) {
 		return operators
@@ -68,7 +41,6 @@ func renderOperators(r *http.Request, operators []model.Operator) any {
 	return out
 }
 
-// renderOperator is renderOperators for the single-operator endpoint.
 func renderOperator(r *http.Request, operator model.Operator) any {
 	if !onExtSurface(r) {
 		return operator
@@ -76,8 +48,7 @@ func renderOperator(r *http.Request, operator model.Operator) any {
 	return extOperator{Operator: operator, GroupID: operator.Group}
 }
 
-// operatorsOf reads one module's operators, mapping the "this backend has none"
-// case to a 501 rather than an empty list.
+// operatorsOf maps "this backend has none" to 501, not an empty list.
 func operatorsOf(ctx context.Context, snap store.Snapshot, moduleAddress string, f model.OperatorsFilter) ([]model.Operator, error) {
 	operators, err := snap.Operators(ctx, moduleAddress, f)
 	if err != nil {
@@ -89,7 +60,6 @@ func operatorsOf(ctx context.Context, snap store.Snapshot, moduleAddress string,
 	return operators, nil
 }
 
-// handleOperators returns every module's operators, grouped by module.
 func (s *Server) handleOperators(w http.ResponseWriter, r *http.Request) {
 	type group struct {
 		Operators any                 `json:"operators"`
@@ -130,11 +100,10 @@ func (s *Server) handleOperators(w http.ResponseWriter, r *http.Request) {
 		return writeJSON(w, out)
 	})
 	if err != nil && !writeStoreError(w, err) {
-		writeError(w, http.StatusInternalServerError, err.Error())
+		s.internalError(w, r, err)
 	}
 }
 
-// handleModuleOperators returns one module's operators.
 func (s *Server) handleModuleOperators(w http.ResponseWriter, r *http.Request) {
 	type data struct {
 		Operators any                 `json:"operators"`
@@ -181,11 +150,10 @@ func (s *Server) handleModuleOperators(w http.ResponseWriter, r *http.Request) {
 		})
 	})
 	if err != nil && !writeStoreError(w, err) {
-		writeError(w, http.StatusInternalServerError, err.Error())
+		s.internalError(w, r, err)
 	}
 }
 
-// handleModuleOperator returns one operator of one module.
 func (s *Server) handleModuleOperator(w http.ResponseWriter, r *http.Request) {
 	type data struct {
 		Operator any                 `json:"operator"`
@@ -245,11 +213,10 @@ func (s *Server) handleModuleOperator(w http.ResponseWriter, r *http.Request) {
 		})
 	})
 	if err != nil && !writeStoreError(w, err) {
-		writeError(w, http.StatusInternalServerError, err.Error())
+		s.internalError(w, r, err)
 	}
 }
 
-// asNotImplemented reports whether err is a backend capability gap.
 func asNotImplemented(err error) bool {
 	var ni store.ErrNotImplemented
 	return errors.As(err, &ni)

@@ -1,7 +1,6 @@
 package api
 
 import (
-	"bufio"
 	"net/http"
 	"strconv"
 
@@ -9,32 +8,18 @@ import (
 	"github.com/lidofinance/keys-api-versioned/internal/store"
 )
 
-// Paging is opt-in and additive: without `limit` the response is the canonical one,
-// byte for byte. With `limit`, the same envelope carries a `pagination` object after
-// the data array, so a consumer that asked for pages knows where it is and one that
-// did not sees no change.
-//
-// The reason this is safe here and refused by the canonical service is the version.
-// There, page two would query a table the registry job may have rewritten between
-// pages, so keys could be skipped or repeated. Here every page reads the version the
-// cursor names.
+// Paging is safe here, unlike in the canonical service, because every page reads the version the
+// cursor names rather than a table the registry job may rewrite between pages.
 
-// maxPageLimit bounds one page. Above this a consumer should use the full dump,
-// which is streamed and costs less per key than many round trips.
+// Above this a consumer should use the streamed full dump.
 const maxPageLimit = 100_000
 
-// pageRequest is the parsed paging part of a request.
 type pageRequest struct {
 	enabled bool
 	limit   int
 	after   *store.KeyCursor
 }
 
-// parsePage reads `limit` and `cursor`.
-//
-// Both are extensions, so on the canonical surface they are not read at all and the
-// answer is the full dump — which is what the canonical service does with a parameter
-// it does not declare. The request carries the header from extsurface.go saying so.
 func parsePage(r *http.Request) (pageRequest, error) {
 	if !onExtSurface(r) {
 		return pageRequest{}, nil
@@ -48,15 +33,8 @@ func parsePage(r *http.Request) (pageRequest, error) {
 		if err != nil {
 			return p, errBadRequest{[]string{err.Error()}}
 		}
-		// A cursor already names the version, so a `snapshot` alongside it is a second
-		// answer to a question that has one. Refused rather than resolved, because the
-		// natural client loop — build `?snapshot=finalized&limit=1000` once, append
-		// `&cursor=` each page — would otherwise re-resolve the label on every page: as
-		// finality advances mid-walk the consumer would be handed keys from two versions,
-		// with no gap, no error and no way to notice. Silently letting the cursor win
-		// would prevent that, but would leave the consumer believing something untrue
-		// about what it asked for. This way the loop fails on page two of its first run,
-		// deterministically, instead of on the day finality moves during a long walk.
+		// Refused, not resolved: re-sending ?snapshot=finalized with each cursor would mix versions as
+		// finality advances mid-walk, silently. This fails on page two, deterministically.
 		if q.Get("snapshot") != "" {
 			return p, errBadRequest{[]string{
 				"cursor and snapshot cannot be combined: the cursor names the version the " +
@@ -64,9 +42,7 @@ func parsePage(r *http.Request) (pageRequest, error) {
 		}
 		p.after = &cursor
 		p.enabled = true
-		// A cursor without a limit still pages: the consumer clearly wants to
-		// continue a walk, and defaulting to the whole rest of the version would
-		// undo the point of having stopped.
+		// A cursor without a limit still pages.
 		p.limit = 10_000
 	}
 
@@ -85,14 +61,7 @@ func parsePage(r *http.Request) (pageRequest, error) {
 	return p, nil
 }
 
-// pinFor returns the pin a paged request has to be served at: the version named by the
-// cursor once a walk is under way, and whatever the first page asked for before that.
-//
-// This is what makes a walk consistent without asking the consumer to track versions.
-// Page one is served from the pin it named or from the surface default, the cursor carries
-// that version as a block number — an exact pin, not a label — and every later page
-// follows it while new versions are published. The two cannot disagree, because parsePage
-// refuses a request that sends both.
+// pinFor: the cursor carries an exact block, so later pages follow page one's version.
 func (p pageRequest) pinFor(r *http.Request) string {
 	if p.after != nil {
 		return strconv.FormatInt(p.after.Block, 10)
@@ -100,7 +69,6 @@ func (p pageRequest) pinFor(r *http.Request) string {
 	return r.URL.Query().Get("snapshot")
 }
 
-// handleKeysPage serves one page of /v1/keys.
 func (s *Server) handleKeysPage(w http.ResponseWriter, r *http.Request, filter model.KeysFilter, page pageRequest) {
 	ctx := r.Context()
 
@@ -122,7 +90,7 @@ func (s *Server) handleKeysPage(w http.ResponseWriter, r *http.Request, filter m
 		}
 
 		w.Header().Set("Content-Type", "application/json")
-		bw := bufio.NewWriterSize(w, streamBufferSize)
+		bw, out := s.newStreamWriter(w)
 		defer bw.Flush()
 
 		bw.WriteString(`{ "meta": {"elBlockSnapshot":`)
@@ -141,7 +109,7 @@ func (s *Server) handleKeysPage(w http.ResponseWriter, r *http.Request, filter m
 				first = false
 				writeKey(bw, k)
 				returned++
-				return nil
+				return out.Err()
 			})
 		if err != nil {
 			return err
@@ -152,13 +120,11 @@ func (s *Server) handleKeysPage(w http.ResponseWriter, r *http.Request, filter m
 		bw.WriteString(`,"returned":`)
 		writeInt(bw, int64(returned))
 		bw.WriteString(`,"snapshot":`)
-		// The version's own block, not the head in the meta: that is what the cursor
-		// pins to, and the head moves on every quiet cycle.
+		// The version's own block, not the head in meta: the cursor pins to it.
 		writeInt(bw, paged.PinBlock())
 		bw.WriteString(`,"cursor":`)
 		if next == nil {
-			// The walk is finished. A null cursor is the end condition, so a consumer
-			// never has to compare counts against the limit to know.
+			// A null cursor is the end condition.
 			bw.WriteString(`null`)
 		} else {
 			bw.WriteByte('"')
@@ -169,6 +135,6 @@ func (s *Server) handleKeysPage(w http.ResponseWriter, r *http.Request, filter m
 		return nil
 	})
 	if err != nil && !writeStoreError(w, err) {
-		writeError(w, http.StatusInternalServerError, err.Error())
+		s.internalError(w, r, err)
 	}
 }

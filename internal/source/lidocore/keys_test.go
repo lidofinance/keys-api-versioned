@@ -32,8 +32,7 @@ func TestGroupKeyReadsRespectsBothCaps(t *testing.T) {
 	}
 
 	groups := groupKeyReads(reads, 4, 2000)
-	// Operator 0's first two spans fill the key cap; the third travels with the
-	// one-key operators, which is the packing the whole change is for.
+	// Operator 0's third span travels with the one-key operators.
 	want := [][]uint64{{1000, 1000}, {500, 1, 1, 1}}
 	if len(groups) != len(want) {
 		t.Fatalf("got %d groups, want %d: %v", len(groups), len(want), sizes(groups))
@@ -51,8 +50,7 @@ func TestGroupKeyReadsRespectsBothCaps(t *testing.T) {
 }
 
 func TestGroupKeyReadsAlwaysCarriesOneCall(t *testing.T) {
-	// A span larger than the key cap still has to go out; it cannot be made smaller
-	// here, because the batch size is what decides a span's width.
+	// A span larger than the key cap still goes out: the batch size decides a span's width.
 	reads := planKeyReads([]model.Operator{{Index: 0, TotalSigningKeys: 5000}}, 5000)
 	groups := groupKeyReads(reads, 200, 100)
 	if len(groups) != 1 || len(groups[0]) != 1 {
@@ -72,11 +70,8 @@ func sizes(groups [][]keyRead) [][]uint64 {
 	return out
 }
 
-// TestStreamKeysOrder is the one that matters for correctness: packing spans across
-// operators and running groups concurrently must still hand keys to the callback in
-// operator order with the right index on each. A window mixed up between groups
-// would produce a version whose keys are attributed to the wrong operators, and no
-// endpoint test would notice — the counts would still add up.
+// Packing and concurrent groups must still emit keys in operator order with the right index;
+// a mix-up would misattribute keys and no endpoint test would notice.
 func TestStreamKeysOrder(t *testing.T) {
 	operators := []model.Operator{
 		{Index: 0, TotalSigningKeys: 2500, StakingLimit: 2000},
@@ -96,9 +91,8 @@ func TestStreamKeysOrder(t *testing.T) {
 			server := httptest.NewServer(node)
 			defer server.Close()
 
-			// A small batch size on purpose: aggregation only engages when the plain
-			// path would need more than one request, so a large one would make the
-			// aggregated subtest silently identical to the plain one.
+			// Aggregation engages only when the plain path needs more than one request, so a large batch
+			// would make the aggregated subtest identical to the plain one.
 			client := eth.NewClient(server.URL, eth.Options{
 				Concurrency: 4, BatchSize: 2, Multicall: multicall,
 			})
@@ -132,8 +126,6 @@ func TestStreamKeysOrder(t *testing.T) {
 						t.Fatalf("key %d: got operator %d index %d, want operator %d index %d",
 							i, key.OperatorIndex, key.Index, op.Index, index)
 					}
-					// The pubkey carries its own identity, so a key decoded against the
-					// wrong span shows up here rather than staying plausible.
 					if wantKey := pubkeyFor(op.Index, index); !equalBytes(key.PubkeyBin, wantKey) {
 						t.Fatalf("key %d: got pubkey %x, want %x", i, key.PubkeyBin, wantKey)
 					}
@@ -151,7 +143,6 @@ func TestStreamKeysOrder(t *testing.T) {
 			if !multicall && stats.Aggregates != 0 {
 				t.Errorf("aggregation was off and %d aggregates went out", stats.Aggregates)
 			}
-			// The packing figure: a read per round trip is what this replaced.
 			if stats.Requests >= stats.Calls {
 				t.Errorf("got %d requests for %d calls, want fewer requests than calls",
 					stats.Requests, stats.Calls)
@@ -191,8 +182,10 @@ func equalBytes(a, b []byte) bool {
 	return true
 }
 
-// keysNode answers getSigningKeys, directly or wrapped in an aggregate3.
-type keysNode struct{}
+// delta changes how many keys an answer carries for an operator, against what was asked.
+type keysNode struct {
+	delta map[int32]int
+}
 
 type aggregateCall struct {
 	Target       common.Address
@@ -271,7 +264,6 @@ func (n *keysNode) answerAggregate(data []byte) (string, error) {
 	return "0x" + common.Bytes2Hex(packed), nil
 }
 
-// answerKeys returns the range asked for, with each key carrying its identity.
 func (n *keysNode) answerKeys(data []byte) (string, error) {
 	method := eth.RegistryABI.Methods["getSigningKeys"]
 	args, err := method.Inputs.Unpack(data[4:])
@@ -280,7 +272,7 @@ func (n *keysNode) answerKeys(data []byte) (string, error) {
 	}
 	operator := int32(args[0].(*big.Int).Int64())
 	offset := int32(args[1].(*big.Int).Int64())
-	limit := int(args[2].(*big.Int).Int64())
+	limit := int(args[2].(*big.Int).Int64()) + n.delta[operator]
 
 	var (
 		pubkeys    []byte

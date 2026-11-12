@@ -19,12 +19,6 @@ import (
 	"github.com/lidofinance/keys-api-versioned/internal/testpg"
 )
 
-// Harness is the whole service over a fork: the real chain reader, the real writer,
-// a real Postgres schema, and the HTTP surface on top of it.
-//
-// The loop's ticker is never started. Tests call Cycle when they want one, which is
-// what makes "the rename landed in the block after the version" a statement a test can
-// make rather than a race it has to hope for.
 type Harness struct {
 	Anvil    *Anvil
 	DB       *testpg.DB
@@ -37,39 +31,25 @@ type Harness struct {
 	app *store.App
 }
 
-// HarnessOpts configure the service under test.
 type HarnessOpts struct {
-	// Modules bounds which staking modules the reader sees. Empty means the Sandbox
-	// module alone; nil-but-explicit through AllModules means every one of them.
+	// Empty means the Sandbox module alone; AllModules means every module.
 	Modules []int32
-	// Anvil configures the node. The zero value forks the pinned block.
-	Anvil AnvilOpts
-	// Extra endpoints are appended to the provider's endpoint list after the
-	// harness's own node, for the tests about a lagging or failing endpoint.
+	Anvil   AnvilOpts
+	// Extra endpoints follow the harness node, for lagging/failing-endpoint tests.
 	Extra []string
-	// Sync overrides the loop's configuration.
-	Sync ingest.SyncConfig
-	// Debug turns on the service's own debug logging, which is the only way to see
-	// what a cycle decided and what it decided it from.
+	Sync  ingest.SyncConfig
 	Debug bool
-	// NoOperatorWatcher hides source.OperatorWatcher from the loop, which is how the
-	// operator-event tests get a control: with the scan gone, a change that moves no
-	// nonce has to go unnoticed. Without that half, a passing event test would also
-	// pass if the rebuild had been triggered by something else entirely.
+	// NoOperatorWatcher is the control: without the scan, a change that moves no nonce must go unnoticed.
 	NoOperatorWatcher bool
 }
 
-// AllModules lifts the module bound, for the scenarios that are about the module set
-// itself. Expect it to be slow: module 1 alone holds 67 242 keys at the pinned block,
-// and a fork reads them out of upstream one storage slot at a time.
+// AllModules is slow: module 1 holds 67 242 keys at the pinned block, read slot by slot from upstream.
 var AllModules = []int32{}
 
-// NewHarness boots everything and tears it down with the test.
 func NewHarness(tb testing.TB, o HarnessOpts) *Harness {
 	tb.Helper()
 
-	// Leases and retention are per-database rather than per-schema, and a fork's block
-	// numbers land in the same space as the synthetic ones internal/e2e hands out.
+	// Leases and retention are per-database, and fork block numbers overlap internal/e2e's.
 	testpg.Exclusive(tb)
 
 	anvil := StartAnvil(tb, o.Anvil)
@@ -88,18 +68,14 @@ func NewHarness(tb testing.TB, o HarnessOpts) *Harness {
 	client := eth.NewClient(urls, eth.Options{
 		Concurrency: 4,
 		BatchSize:   20,
-		// A fork answers a cold read by pulling storage from upstream a slot at a
-		// time, so a call that is milliseconds against a node can be tens of seconds
-		// here. The default 60 s turns that into a test failure that looks like a bug.
+		// A cold fork read pulls storage slot by slot: tens of seconds, past the 60 s default.
 		Timeout: 180 * time.Second,
-		// Multicall3 is deployed on Hoodi and inherited by the fork, so the
-		// aggregation path is the one under test, as in production.
+		// Multicall3 is inherited from Hoodi, so aggregation is under test as in production.
 		Multicall: true,
 		Log:       log,
 	})
 
 	var provider source.Provider = lidocore.NewProvider(client, LocatorAddress, lidocore.Options{
-		// Small enough that a cold span read stays inside the timeout above.
 		KeysBatch:       200,
 		CallsPerRequest: 20,
 		KeysPerRequest:  400,
@@ -134,7 +110,6 @@ func NewHarness(tb testing.TB, o HarnessOpts) *Harness {
 	return h
 }
 
-// Cycle runs one polling cycle and fails the test if it errored.
 func (h *Harness) Cycle() ingest.CycleResult {
 	h.tb.Helper()
 
@@ -145,21 +120,16 @@ func (h *Harness) Cycle() ingest.CycleResult {
 	return result
 }
 
-// TryCycle runs one cycle and hands back whatever happened, for the tests where the
-// failure is the finding.
 func (h *Harness) TryCycle() ingest.CycleResult {
 	h.tb.Helper()
 	return h.Syncer.Cycle(context.Background())
 }
 
-// Server is the HTTP surface over the published versions, on its own reader pool.
 func (h *Harness) Server() *testpg.Server {
 	h.tb.Helper()
 	return testpg.NewServer(h.tb, h.DB.Reader(h.tb, "latest", 4))
 }
 
-// reader is a store.App on its own pool, reused across a test's reads so a scenario
-// does not open a pool per assertion.
 func (h *Harness) reader() *store.App {
 	h.tb.Helper()
 	if h.app == nil {
@@ -168,9 +138,7 @@ func (h *Harness) reader() *store.App {
 	return h.app
 }
 
-// Keys reads the published latest version's keys for one module, straight out of the
-// store — the served bytes are the API's business and internal/e2e already covers
-// them; what a fork test needs is what the writer recorded.
+// Keys reads what the writer recorded; the served bytes are internal/e2e's concern.
 func (h *Harness) Keys(moduleAddress string) []model.Key {
 	h.tb.Helper()
 
@@ -178,8 +146,7 @@ func (h *Harness) Keys(moduleAddress string) []model.Key {
 	err := h.reader().Snapshot(context.Background(), func(s store.Snapshot) error {
 		return s.StreamKeys(context.Background(), moduleAddress, model.KeysFilter{},
 			func(k *model.Key) error {
-				// StreamKeys reuses the Key between calls, so it has to be copied
-				// before it is kept.
+				// StreamKeys reuses the Key between calls.
 				copied := *k
 				copied.EnsureHex()
 				keys = append(keys, copied)
@@ -192,7 +159,6 @@ func (h *Harness) Keys(moduleAddress string) []model.Key {
 	return keys
 }
 
-// Operators reads the published latest version's operators for one module.
 func (h *Harness) Operators(moduleAddress string) []model.Operator {
 	h.tb.Helper()
 
@@ -208,7 +174,6 @@ func (h *Harness) Operators(moduleAddress string) []model.Operator {
 	return operators
 }
 
-// Module reads one module row of the published latest version.
 func (h *Harness) Module(id int32) model.StakingModule {
 	h.tb.Helper()
 
@@ -234,27 +199,15 @@ func (h *Harness) Module(id int32) model.StakingModule {
 	return *found
 }
 
-// scopedProvider bounds which modules the service sees.
-//
-// This is a test-only decorator rather than a service option on purpose. The read it
-// removes is enormous and entirely uninteresting to these scenarios: Hoodi's module 1
-// holds 67 242 keys and CSM has 467 operators, and a fork serves the first read of
-// either by pulling hundreds of thousands of storage slots out of the upstream node —
-// slow, and hard enough on a shared node to draw 502s. Sandbox is 36 keys in the same
-// contract family, so every semantic under test is reachable for a thousandth of the
-// traffic.
-//
-// What it costs: these tests say nothing about a cycle handling several modules at
-// once. A scenario that is about the module set widens the filter and pays for it.
+// scopedProvider is test-only: Hoodi's module 1 (67 242 keys) and CSM (467 operators) cost
+// hundreds of thousands of upstream slot reads; Sandbox reaches the same semantics.
 type scopedProvider struct {
 	source.Provider
 	keep map[int32]bool
 }
 
-// scopeModules wraps a provider, keeping the optional interfaces intact — the sync
-// loop type-asserts for OperatorWatcher, and a decorator that swallowed it would turn
-// the operator-event scan off without saying so, which is the one path these tests
-// exist to exercise.
+// scopeModules keeps the optional interfaces: swallowing OperatorWatcher would silently turn
+// the event scan off.
 func scopeModules(p source.Provider, ids []int32) source.Provider {
 	keep := make(map[int32]bool, len(ids))
 	for _, id := range ids {
@@ -286,10 +239,7 @@ func scopeModules(p source.Provider, ids []int32) source.Provider {
 	}
 }
 
-// hideOperatorWatcher is a provider that deliberately does not implement
-// source.OperatorWatcher, so operatorEvents short-circuits at sync.go:490 and the
-// cycle has only the nonce to go on. Embedding by field rather than by interface is
-// what drops the optional methods.
+// hideOperatorWatcher embeds by field, not interface, which drops the optional methods.
 type hideOperatorWatcher struct{ inner source.Provider }
 
 func (h hideOperatorWatcher) Name() string { return h.inner.Name() }

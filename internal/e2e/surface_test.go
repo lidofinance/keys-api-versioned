@@ -12,19 +12,8 @@ import (
 	"github.com/lidofinance/keys-api-versioned/internal/testreg"
 )
 
-// The compatibility rule, as tests.
-//
-// `/v1` and `/v2` are the canonical lido-keys-api contract; `/ext/v1` is everything this
-// service invented. The rule matters for one reason: an existing consumer must not be
-// able to tell it was repointed here. So the interesting assertions are the negative
-// ones — what /v1 does *not* do — and each has a positive twin on /ext/v1 proving the
-// behaviour exists at all rather than having been dropped.
-//
-// One consequence is deliberate and worth being explicit about: /v1 ignores `limit`,
-// `cursor` and `snapshot`. Silently ignoring an undeclared query parameter is what the
-// canonical service does — its ValidationPipe is `{ transform: true }` with no
-// `whitelist` (lido-keys-api src/main.ts) — so answering 400 here would be exactly the
-// kind of difference these tests exist to prevent.
+// /v1 and /v2 must be indistinguishable from canonical, so /v1 silently ignores limit, cursor and
+// snapshot as canonical does (no ValidationPipe whitelist); each negative has an /ext/v1 twin.
 
 func TestPagingIsIgnoredOnTheCanonicalSurfaceAndHonouredOnTheExtendedOne(t *testing.T) {
 	db := testpg.New(t)
@@ -40,8 +29,6 @@ func TestPagingIsIgnoredOnTheCanonicalSurfaceAndHonouredOnTheExtendedOne(t *test
 		t.Fatalf("GET /v1/keys: status %d, want 200", plain.StatusCode)
 	}
 
-	// The same request with a paging parameter has to come back identical, byte for
-	// byte. A canonical consumer never sends this; one of ours that does gets told.
 	paged := srv.Get(t, "/v1/keys?limit=3")
 	pagedBody := readBody(t, paged)
 	if paged.StatusCode != http.StatusOK {
@@ -57,8 +44,7 @@ func TestPagingIsIgnoredOnTheCanonicalSurfaceAndHonouredOnTheExtendedOne(t *test
 		t.Errorf("a request that sent no extension parameters carries X-Ignored-Parameters: %q", got)
 	}
 
-	// And the positive twin: the same parameter on the extended surface pages. Without
-	// this the test above would pass on a service that had simply lost paging.
+	// Positive twin: without it the test above passes on a service that lost paging.
 	ext := srv.Get(t, "/ext/v1/keys?limit=3")
 	extBody := readBody(t, ext)
 	if ext.StatusCode != http.StatusOK {
@@ -100,16 +86,13 @@ func TestAPinIsIgnoredOnTheCanonicalSurfaceAndHonouredOnTheExtendedOne(t *testin
 	older := testreg.At(db.Block(0))
 	spec.Publish(ctx, t, db.Writer, older)
 
-	// A second version with different content, so "which version answered" is visible
-	// in the body rather than only in the meta.
+	// Different content, so which version answered shows in the body, not only the meta.
 	newer := spec.WithSalt(spec.Salt + 1)
 	newer.Publish(ctx, t, db.Writer, testreg.At(db.Block(1)))
 
 	srv := testpg.NewServer(t, db.Reader(t, "latest", 3))
 	pin := fmt.Sprintf("?snapshot=%d", older.BlockNumber)
 
-	// On the canonical surface the pin is ignored, so this is `latest` — the newer
-	// version — and the verifier for the older one has to reject it.
 	canonical := srv.Get(t, "/v1/keys"+pin)
 	defer canonical.Body.Close()
 	if canonical.StatusCode != http.StatusOK {
@@ -122,7 +105,6 @@ func TestAPinIsIgnoredOnTheCanonicalSurfaceAndHonouredOnTheExtendedOne(t *testin
 		t.Errorf("X-Ignored-Parameters is %q, want it to name snapshot", got)
 	}
 
-	// On the extended surface the same pin resolves to the older version.
 	extended := srv.Get(t, "/ext/v1/keys"+pin)
 	defer extended.Body.Close()
 	if extended.StatusCode != http.StatusOK {
@@ -137,16 +119,8 @@ func TestAPinIsIgnoredOnTheCanonicalSurfaceAndHonouredOnTheExtendedOne(t *testin
 	}
 }
 
-// TestTheErrorSurfaceMatchesCanonical pins the answers a run against the canonical
-// service settled, so they survive without one running.
-//
-// The run is what produced them: `diff -errors` against canonical 4.0.1 on Hoodi
-// (2026-07-28) started at 17 of 21 cases agreeing and ended at 21 of 21. Every
-// expectation below is that service's own answer, and four of them were differences
-// nothing in this repo could have caught — parity had only ever been checked on
-// successful responses, which is parity of half the contract.
-//
-// Each case says what a consumer would have done wrong with the answer we used to give.
+// Pins canonical's error answers, settled by `diff -errors` against canonical 4.0.1 on Hoodi
+// (17 of 21 cases agreed at first, 21 of 21 after).
 func TestTheErrorSurfaceMatchesCanonical(t *testing.T) {
 	db := testpg.New(t)
 	ctx := context.Background()
@@ -210,8 +184,7 @@ func TestTheErrorSurfaceMatchesCanonical(t *testing.T) {
 		}
 	}
 
-	// Every error body carries `error`, which the canonical service always sends and this
-	// one silently omitted on every failure — the field was declared and never set.
+	// `error` was declared and never set; canonical always sends it.
 	resp := srv.Get(t, "/v1/modules/abc/keys")
 	body := readBody(t, resp)
 	var decoded map[string]any
@@ -245,29 +218,17 @@ func TestTheInventedPathsAreOnlyOnTheExtendedSurface(t *testing.T) {
 		path string
 		want int
 	}{
-		// Gone from the canonical surface: a path this service invented is a path the
-		// canonical service could later claim with other semantics.
-		//
-		// What they answer instead is what a canonical consumer would get, because the
-		// segment falls into the wildcard route beside it: `diff` reads as a pubkey that
-		// is not one, or as a module id that is not one — both 400, from the same
-		// validation the canonical service applies on its own `:pubkey` and `:module_id`
-		// routes. The per-module path matches no route on either service, so it is a 404.
-		//
-		// So these do not 404 because they were deleted; they behave as any other bad
-		// reference on that surface, which is the whole point of taking them off it.
+		// Off /v1, since canonical could later claim those paths. The segment falls into the wildcard route
+		// beside it: canonical's 400 for a bad pubkey or module id, 404 where no route matches.
 		{"a key diff on /v1", "/v1/keys/diff" + since, http.StatusBadRequest},
 		{"a module diff on /v1", "/v1/modules/diff" + since, http.StatusBadRequest},
 		{"a per-module key diff on /v1", "/v1/modules/1/keys/diff" + since, http.StatusNotFound},
 
-		// Present on the extended surface, which is what makes the three above a
-		// statement about where they live rather than about them having been removed.
 		{"a key diff on /ext/v1", "/ext/v1/keys/diff" + since, http.StatusOK},
 		{"a module diff on /ext/v1", "/ext/v1/modules/diff" + since, http.StatusOK},
 		{"a per-module key diff on /ext/v1", "/ext/v1/modules/1/keys/diff" + since, http.StatusOK},
 
-		// The mirrored reads answer on both, including the one canonical endpoint that
-		// lives on /v2 and is mirrored without its version segment.
+		// The one canonical /v2 endpoint is mirrored without its version segment.
 		{"keys on /v1", "/v1/keys", http.StatusOK},
 		{"keys on /ext/v1", "/ext/v1/keys", http.StatusOK},
 		{"the combined stream on /v2", "/v2/modules/operators/keys", http.StatusOK},

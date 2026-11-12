@@ -9,21 +9,9 @@ import (
 	"github.com/lidofinance/keys-api-versioned/internal/model"
 )
 
-// A diff between two published versions is the endpoint that lets a consumer stop
-// pulling 211 MiB per poll. It is also nearly free to implement over block ranges:
-// a row's range already says which versions it was alive for, so "what changed
-// between a and b" is two predicates rather than a comparison of two dumps.
-//
-//	added   — rows that became visible in (a, b]: from_block > a, still alive at b
-//	removed — rows that stopped being visible in (a, b]: alive at a, to_block <= b
-//
-// A key whose value changed appears in both, because that is what the storage did:
-// the old row was closed and a new one opened. A consumer applies removals then
-// additions by key identity and lands on the same state as a fresh dump. Rows both
-// created and closed inside the interval appear in neither, which is correct: no
-// consumer ever saw them.
+// Diff over block ranges: added = from_block in (a, b] and alive at b; removed = alive at a and
+// to_block <= b. A changed key is in both; rows born and closed inside (a, b] are in neither.
 
-// DiffKind says which side of the diff a key is on.
 type DiffKind string
 
 const (
@@ -31,15 +19,11 @@ const (
 	DiffAdded   DiffKind = "added"
 )
 
-// DiffStore can answer what changed between two versions.
 type DiffStore interface {
-	// DiffKeys streams removals and then additions between two pins. It calls fn
-	// with DiffRemoved for every key that stopped being visible and DiffAdded for
-	// every key that became visible.
+	// DiffKeys streams removals, then additions.
 	DiffKeys(ctx context.Context, since, to string, moduleRef string, fn func(DiffKind, *model.Key) error) (*DiffMeta, error)
 }
 
-// DiffMeta describes the interval a diff covers.
 type DiffMeta struct {
 	From    *model.ELBlockSnapshot `json:"from"`
 	To      *model.ELBlockSnapshot `json:"to"`
@@ -47,15 +31,12 @@ type DiffMeta struct {
 	Added   int64                  `json:"added"`
 }
 
-// DiffKeys resolves both ends, then runs one query per side.
-//
-// Both ends have to be versions we still hold. If `since` fell out of the retention
-// window the honest answer is 410 rather than a diff computed against a version
-// whose closed rows have been deleted — that diff would silently miss removals.
+// A `since` outside retention answers 410: its closed rows are deleted, so the diff would
+// silently miss removals.
 func (a *App) DiffKeys(ctx context.Context, since, to string, moduleRef string, fn func(DiffKind, *model.Key) error) (*DiffMeta, error) {
-	conn, err := a.pool.Acquire(ctx)
+	conn, err := a.acquire(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("acquire: %w", err)
+		return nil, err
 	}
 	defer conn.Release()
 
@@ -66,12 +47,8 @@ func (a *App) DiffKeys(ctx context.Context, since, to string, moduleRef string, 
 	if fromBlock == 0 {
 		return nil, ErrNotFound{Ref: since, What: "snapshot"}
 	}
-	// Lease the older end for the duration. Resolving it proves it was still held a
-	// moment ago; the lease is what keeps retention from deleting its closed rows
-	// between the two side queries, which is the case that would silently drop
-	// removals rather than fail. Leasing the older end is enough: the rows a diff
-	// needs are closed above it, and those are exactly what a lease at that block
-	// protects.
+	// Leasing the older end keeps its closed rows (all above it) from retention between the two side
+	// queries.
 	releaseFrom, err := leaseVersion(ctx, conn, fromBlock)
 	if err != nil {
 		return nil, err
@@ -90,8 +67,6 @@ func (a *App) DiffKeys(ctx context.Context, since, to string, moduleRef string, 
 		return nil, ErrNotFound{Ref: toPin, What: "snapshot"}
 	}
 
-	// The two ends are named by version identity, not by the head each version was
-	// last confirmed at: a diff is between two versions, and the head moves.
 	fromMeta, err := versionIdentity(ctx, conn, fromBlock)
 	if err != nil {
 		return nil, err
@@ -105,15 +80,12 @@ func (a *App) DiffKeys(ctx context.Context, since, to string, moduleRef string, 
 		return nil, fmt.Errorf("since (%d) is newer than to (%d)", fromBlock, toBlock)
 	}
 
-	// versionID matters as much as the block here: the status re-check names the
-	// version row, and two versions share a height after a reorg.
+	// versionID, not just block: two versions share a height after a reorg.
 	snap := &appSnapshot{conn: conn, meta: toMeta, versionID: toVersionID, block: toBlock}
 	if err := snap.loadModules(ctx); err != nil {
 		return nil, err
 	}
 
-	// A module filter keeps the answer small for the common case: a consumer that
-	// noticed one module's nonce move and wants only that module's changes.
 	var moduleID *int16
 	if moduleRef != "" {
 		module, err := snap.ModuleByRef(ctx, moduleRef)
@@ -129,8 +101,7 @@ func (a *App) DiffKeys(ctx context.Context, since, to string, moduleRef string, 
 		return meta, nil
 	}
 
-	// Removals first, so a consumer applying the stream in order never holds two
-	// rows for one key identity.
+	// Removals first, so an in-order consumer never holds two rows for one key identity.
 	removed, err := snap.streamDiffSide(ctx, DiffRemoved, fromBlock, toBlock, moduleID, fn)
 	if err != nil {
 		return meta, err
@@ -146,8 +117,6 @@ func (a *App) DiffKeys(ctx context.Context, since, to string, moduleRef string, 
 	return meta, nil
 }
 
-// versionIdentity reads the block a version's data was read at, which is what names
-// it in a diff and in a cursor.
 func versionIdentity(ctx context.Context, conn pinReader, block int64) (*model.ELBlockSnapshot, error) {
 	var m model.ELBlockSnapshot
 	err := conn.QueryRow(ctx, `select block_number, block_hash, timestamp, last_changed_block_hash
@@ -164,9 +133,8 @@ const diffCols = `select module_id, operator_index, key_index, pubkey, signature
 	from key_version where `
 
 func (s *appSnapshot) streamDiffSide(ctx context.Context, kind DiffKind, fromBlock, toBlock int64, moduleID *int16, fn func(DiffKind, *model.Key) error) (int64, error) {
-	// A diff is two queries, so a reorg landing between them would drop one side of
-	// it whole — and a diff missing its removals is worse than one that fails, because
-	// applying it leaves the consumer with keys the chain no longer has.
+	// A reorg between the two side queries would drop a side; missing removals leave the consumer
+	// with keys the chain no longer has.
 	if err := s.stillOnChain(ctx); err != nil {
 		return 0, err
 	}
@@ -177,13 +145,9 @@ func (s *appSnapshot) streamDiffSide(ctx context.Context, kind DiffKind, fromBlo
 	)
 	switch kind {
 	case DiffAdded:
-		// Became visible in the interval and is still visible at the far end.
 		q = diffCols + `from_block > $1 and from_block <= $2 and (to_block is null or to_block > $2)`
 		args = []any{fromBlock, toBlock}
 	case DiffRemoved:
-		// Was visible at the near end and is not visible at the far end. The
-		// from_block bound excludes rows created and closed inside the interval,
-		// which no consumer pinned at either end ever saw.
 		q = diffCols + `from_block <= $1 and to_block > $1 and to_block <= $2`
 		args = []any{fromBlock, toBlock}
 	default:
@@ -221,13 +185,12 @@ func (s *appSnapshot) streamDiffSide(ctx context.Context, kind DiffKind, fromBlo
 	return count, rows.Err()
 }
 
-// ModuleDiff reports which modules changed between two versions, by comparing the
-// stamps the writer maintains. It is a kilobyte-sized answer and it is what a
-// consumer should poll before asking for a key diff at all.
+// ModuleDiff compares the writer's content-derived stamps: a kilobyte answer to poll before a
+// key diff.
 func (a *App) ModuleDiff(ctx context.Context, since, to string) (map[int32]bool, error) {
-	conn, err := a.pool.Acquire(ctx)
+	conn, err := a.acquire(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("acquire: %w", err)
+		return nil, err
 	}
 	defer conn.Release()
 
@@ -294,8 +257,6 @@ func (a *App) ModuleDiff(ctx context.Context, since, to string) (map[int32]bool,
 		if err := rows.Scan(&id, &hash); err != nil {
 			return nil, err
 		}
-		// Same stamp on both ends means this module did not move — which is only a
-		// trustworthy statement because the writer derives the stamp from content.
 		if strings.EqualFold(atTo[int32(id)], hash) {
 			delete(changed, int32(id))
 		}

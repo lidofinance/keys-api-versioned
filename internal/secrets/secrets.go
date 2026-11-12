@@ -1,21 +1,5 @@
-// Package secrets reads the credentials this service is given as a file, and notices when
-// they are rotated.
-//
-// The execution endpoints carry provider credentials, and in Kubernetes the OpenBao agent
-// delivers them by writing a JSON file rather than by setting environment variables. The
-// reason is not aesthetics: a process cannot be handed new environment variables from
-// outside, so env-based delivery costs a pod restart per rotation — and until that restart
-// happens the old credential keeps working, which makes a rotation nobody applied look
-// exactly like a healthy deployment right up to the moment the provider revokes the key.
-//
-// The agent updates the file by writing a temp file and renaming it over the path. The
-// rename is atomic, so a reader never sees half a file — but it also creates a new inode,
-// which is why Watcher polls the path with os.Stat instead of watching the file. A watcher
-// attached to the file itself (fsnotify) goes silent after the first rotation.
-//
-// An absent file is a normal state: it means "no agent here, read the environment", which
-// is how the compose deployment runs. The contract is deliberately the same as
-// ethereum-head-watcher's src/secrets.py, so one description covers both services.
+// Package secrets reads credentials delivered as a JSON file. The path is polled, never watched:
+// the writer renames a temp file over it, so the inode changes on every rotation.
 package secrets
 
 import (
@@ -26,18 +10,13 @@ import (
 	"time"
 )
 
-// DefaultPath is where the agent is configured to render, and DefaultPollInterval is how
-// often the path is stat'ed.
 const (
 	DefaultPath         = "/vault/secrets/config"
 	DefaultPollInterval = 10 * time.Second
 )
 
-// Read returns the file's values, or an empty map when there is no usable file.
-//
-// Absent is not an error — it is the environment-only deployment. Present but unparseable
-// is an error the caller reports and then treats the same way: refusing to start would turn
-// a bad render of one key into an outage of the whole service.
+// Read returns an empty map when the file is absent (env-only deployment). A bad render is an
+// error the caller reports but survives: refusing to start would turn one bad key into an outage.
 func Read(path string) (map[string]string, error) {
 	if path == "" {
 		return nil, nil
@@ -65,8 +44,7 @@ func Read(path string) (map[string]string, error) {
 		case string:
 			values[key] = v
 		case nil:
-			// A key rendered as null is a template that resolved to nothing. Dropped rather
-			// than stored as "null", which would reach a URL parser as a hostname.
+			// A null is a template that resolved to nothing; stored as "null" it would reach a URL parser.
 			continue
 		default:
 			values[key] = fmt.Sprint(v)
@@ -75,13 +53,8 @@ func Read(path string) (map[string]string, error) {
 	return values, nil
 }
 
-// LoadIntoEnv makes the file the source of truth for everything read through the
-// environment, before anything reads it.
-//
-// One place rather than a lookup at every call site: the values a rotation can change are
-// the same ones the environment carries, and two sources consulted in different orders by
-// different callers is how a service ends up half-rotated. Returns the values it applied, so
-// the caller can tell later what a rotation actually changed.
+// LoadIntoEnv makes the file the single source for env-read values, so a rotation cannot leave
+// callers half-rotated. Returns what it applied.
 func LoadIntoEnv(path string) (map[string]string, error) {
 	values, err := Read(path)
 	if err != nil {
@@ -95,23 +68,18 @@ func LoadIntoEnv(path string) (map[string]string, error) {
 	return values, nil
 }
 
-// Watcher re-reads the file when its mtime changes and hands the new values to a callback.
 type Watcher struct {
 	path     string
 	interval time.Duration
 	mtime    int64
 	found    bool
 
-	// OnChange applies the new values. An error means nothing was applied, and the
-	// previous values stay in force.
+	// OnChange returning an error means nothing was applied; the previous values stay in force.
 	OnChange func(values map[string]string) error
-	// OnError reports a bad render or a failed apply. Separate from a logger so the caller
-	// decides what a failure costs — here it also moves a counter.
-	OnError func(err error)
+	OnError  func(err error)
 }
 
-// NewWatcher starts from the file's current mtime, so the first poll after a start does not
-// re-apply what the process was configured with.
+// NewWatcher starts from the current mtime, so the first poll does not re-apply startup values.
 func NewWatcher(path string, interval time.Duration, onChange func(map[string]string) error, onError func(error)) *Watcher {
 	if interval <= 0 {
 		interval = DefaultPollInterval
@@ -129,8 +97,6 @@ func mtimeOf(path string) (int64, bool) {
 	return info.ModTime().UnixNano(), true
 }
 
-// CheckOnce reports whether a change was seen and applied. Separate from Run so the
-// behaviour is testable without waiting on a ticker.
 func (w *Watcher) CheckOnce() bool {
 	mtime, found := mtimeOf(w.path)
 	if !found || (w.found && mtime == w.mtime) {
@@ -144,8 +110,7 @@ func (w *Watcher) CheckOnce() bool {
 		return false
 	}
 	if len(values) == 0 {
-		// Nothing usable: keep the values already in force. The mtime is remembered anyway,
-		// so a broken file is reported once rather than every interval.
+		// The mtime is remembered anyway, so a broken file is reported once, not every interval.
 		w.reportError(fmt.Errorf("secrets file %s changed but has no usable values, keeping the previous ones", w.path))
 		return false
 	}
@@ -159,7 +124,6 @@ func (w *Watcher) CheckOnce() bool {
 	return true
 }
 
-// Run polls until the context is cancelled. Meant to be started in a goroutine.
 func (w *Watcher) Run(ctx context.Context) {
 	ticker := time.NewTicker(w.interval)
 	defer ticker.Stop()

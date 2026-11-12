@@ -10,10 +10,7 @@ import (
 	"testing"
 )
 
-// The observation hook is the whole reason the RPC surface is a metric rather than
-// arithmetic on the source, so what it counts has to match what a provider bills: one
-// observation per HTTP round trip, including the ones that failed and were retried
-// somewhere else, because a metered plan charges for those too.
+// One observation per HTTP round trip, failed and retried ones included: metered plans bill them.
 
 type observed struct {
 	mu   sync.Mutex
@@ -48,8 +45,7 @@ func TestObserveCountsOneRoundTripPerRequest(t *testing.T) {
 	client := NewClient(server.URL, Options{Concurrency: 1, BatchSize: 8, Observe: seen.add})
 
 	if _, err := client.BlockHashByNumber(context.Background(), big.NewInt(1)); err == nil {
-		// The fake answers "0x1" rather than a block, so decoding the hash fails —
-		// irrelevant here, the round trip is what is being counted.
+		// Decoding fails on the fake answer; only the round trip is counted here.
 		_ = err
 	}
 
@@ -69,9 +65,6 @@ func TestObserveCountsOneRoundTripPerRequest(t *testing.T) {
 }
 
 func TestObserveCountsTheEndpointThatFailed(t *testing.T) {
-	// A dead first endpoint and a healthy second one: the fallback hides the failure
-	// from the caller, and a request count that hides it too would understate what the
-	// deployment spent — and say nothing about an endpoint quietly out of rotation.
 	dead := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		hj, ok := w.(http.Hijacker)
 		if !ok {
@@ -117,10 +110,6 @@ func TestObserveCountsTheEndpointThatFailed(t *testing.T) {
 }
 
 func TestObserveMarksACallErrorAsAnError(t *testing.T) {
-	// The round trip succeeded and the call in it did not. Counted as an error, for
-	// the same reason the canonical service's middleware does it: an endpoint
-	// answering "out of gas" to everything is broken, and a success rate that ignores
-	// the answer says the RPC surface is fine.
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var reqs []rpcRequest
 		_ = json.NewDecoder(r.Body).Decode(&reqs)

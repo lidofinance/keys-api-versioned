@@ -10,16 +10,7 @@ import (
 	"github.com/lidofinance/keys-api-versioned/internal/model"
 )
 
-// CuratedReader reads the curated registry (NodeOperatorsRegistry): the Lido
-// module and SimpleDVT.
-//
-//	getNodeOperatorsCount                     → how many operators
-//	getNodeOperator(i, true)                  → name, reward address, counters
-//	getNodeOperatorSummary(i)                 → depositableValidatorsCount
-//	getSigningKeys(op, offset, limit)         → packed pubkeys, signatures, used
-//
-// A key is vetted when its index is below the operator's vetted count, which is
-// the rule the canonical service applies.
+// CuratedReader reads NodeOperatorsRegistry modules (the Lido module and SimpleDVT).
 type CuratedReader struct {
 	KeysBatch       uint64
 	CallsPerRequest int
@@ -30,30 +21,24 @@ type CuratedReader struct {
 
 func (r *CuratedReader) Types() []string { return []string{"curated-onchain-v1"} }
 
-// OperatorEventTopics are the curated events that change operator metadata
-// without moving the nonce. Same three the canonical service filters on.
 func (r *CuratedReader) OperatorEventTopics() []string {
 	return []string{"NodeOperatorAdded", "NodeOperatorNameSet", "NodeOperatorRewardAddressSet"}
 }
 
-// Operators reads every operator, two calls each, batched.
-//
-// finalizedUsedSigningKeys is deliberately not read. The canonical service fetches
-// it with a second round of per-operator calls at the finalized block tag, and no
-// endpoint we serve exposes it — the operator DTO omits it. Skipping it halves the
+// finalizedUsedSigningKeys is not read: no endpoint exposes it, and skipping it halves the
 // per-operator round trips.
-func (r *CuratedReader) Operators(ctx context.Context, c *eth.Client, at eth.BlockRef, moduleAddress string) ([]model.Operator, error) {
+func (r *CuratedReader) Operators(ctx context.Context, c *eth.Client, at eth.BlockRef, m model.StakingModule) ([]model.Operator, error) {
+	moduleAddress := m.RawAddress()
 	out, err := c.CallOne(ctx, at, eth.Call{
 		To: moduleAddress, ABI: &eth.RegistryABI, Method: "getNodeOperatorsCount",
 	})
 	if err != nil {
 		return nil, fmt.Errorf("getNodeOperatorsCount: %w", err)
 	}
-	count, ok := out[0].(*big.Int)
-	if !ok {
-		return nil, fmt.Errorf("unexpected operator count type %T", out[0])
+	n, err := operatorCount(out)
+	if err != nil {
+		return nil, err
 	}
-	n := int(count.Int64())
 
 	operators := make([]model.Operator, n)
 	for start := 0; start < n; start += operatorBatchSize {
@@ -84,14 +69,16 @@ func (r *CuratedReader) Operators(ctx context.Context, c *eth.Client, at eth.Blo
 			if err != nil {
 				return nil, err
 			}
-			op.DepositableValidatorsCount = int32(depositableFromSummary(results[width+i]))
+			op.DepositableValidatorsCount, err = depositableFromSummary(int32(start+i), results[width+i])
+			if err != nil {
+				return nil, err
+			}
 			operators[start+i] = op
 		}
 	}
 	return operators, nil
 }
 
-// Keys streams the module's keys — see keys.go for the walk both readers share.
 func (r *CuratedReader) Keys(ctx context.Context, c *eth.Client, at eth.BlockRef, moduleAddress string, operators []model.Operator, fn func(model.Key) error) error {
 	return streamKeys(ctx, c, at, moduleAddress, operators,
 		keysSpec{abi: &eth.RegistryABI, method: "getSigningKeys", decode: decodeCuratedKeys},

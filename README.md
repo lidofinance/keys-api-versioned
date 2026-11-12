@@ -93,6 +93,8 @@ An existing deployment resyncs once when it picks this up: its rows are in `publ
 
 ## Parity
 
+Tracked canonical version: **5.0.0**, plus the unreleased `develop` fixes to operator names and change detection (through `71fc5b3`). Since 4.0.1 that brought `totalWithdrawnKeys` on every operator, the `invalidName<index>` placeholder for undecodable names, CMv2 renames picked up from the `META_REGISTRY` event, and `Cache-Control` on reads.
+
 `cmd/diff` fetches the same endpoint from both services, sorts key arrays (neither implementation promises an order) and compares. `-live` tolerates the two being at different blocks, which they always are when both follow a chain.
 
 Latest run, both services following mainnet in the stand, all eight compared endpoints equal:
@@ -117,9 +119,11 @@ Against canonical 4.0.1, both following Hoodi: **17 of 21 agreed, now 21 of 21.*
 | `POST /v1/keys/find` with the wrong field name | 400 | 200, no keys | a typo in the field name looked like an empty result |
 | `POST /v1/keys` | 404 `Cannot POST /v1/keys` | 405 | Go is right and Fastify is not, but on their surface theirs wins |
 
-And one systematic difference the run surfaced that no single case is about: **every error body was missing `error`.** The canonical service sends `{message, error, statusCode}`; the field was declared in our struct and never set, so a consumer logging or matching on it saw a difference on every failure rather than on an edge case.
+And one systematic difference the run surfaced that no single case is about: **every error body was missing `error`.** The canonical service sends `{message, error, statusCode}`; the field was declared in our struct and never set, so a consumer logging or matching on it saw a difference on every failure rather than on an edge case. Two answers do not have it there either: the 425 before the first sync and a 500 are a bare `HttpException` and an unknown error to NestJS, so their body is just `{"statusCode":…,"message":…}` — and no error body ends in a newline.
 
 Also confirmed, because the whole `/ext/v1` split rests on it: the canonical service really does ignore a query parameter it does not declare — `?limit=3`, `?snapshot=12345` and `?nonsense=1` all answer 200 there, which is why `/v1` ignores ours instead of answering 400.
+
+`POST …/keys/find` bodies are capped at 1 MiB, Fastify's default and so the canonical service's, and an oversized one gets its answer: 413 `{"statusCode":413,"message":"Request body is too large"}`. The per-module route validates the list exactly like the global one (it used to drop malformed keys silently and answer an empty list with 200).
 
 The expectations are pinned hermetically in `internal/e2e/surface_test.go`, so they hold without a canonical service running; the live run is what discovers a new one.
 
@@ -137,7 +141,7 @@ One trailing byte used to separate us from byte-identical on the non-streamed en
 
 **A found defect: retention could delete rows under a reader.** A concurrent *write* cannot disturb a response here, and not by timing luck — a reader selects by validity range at a pinned block, so a row closed at a later block still matches the predicate and a row opened at a later block does not, whether or not the writer's transaction has committed. Rewriting a whole module mid-dump is a non-event. A *delete* is the opposite case: a row that is gone matches no predicate, and retention deletes the rows of versions falling out of the window — which is where a slow consumer streaming 211 MiB ends up.
 
-Demonstrated rather than argued: with retention running inside a reader's snapshot, the reader streamed **0 keys instead of 1**. The fix is a lease — a shared Postgres advisory lock on the version's block, held for the request — and retention lowers its own boundary to the oldest leased version instead of waiting or skipping. Advisory locks rather than a lease table because they are visible across processes (the reader may be a separate replica from the writer that prunes, which is the point of `KEYS_API_MODE=server`) and are released when the holder's connection drops, so there is no expiry to tune and no sweeper to write. A lease that never goes away is reported: `retention held back by a reader still streaming an older version`.
+Demonstrated rather than argued: with retention running inside a reader's snapshot, the reader streamed **0 keys instead of 1**. The fix is a lease — a shared Postgres advisory lock on the version's block, held for the request — and retention lowers its own boundary to the oldest leased version instead of waiting or skipping. Advisory locks rather than a lease table because they are visible across processes (the reader may be a separate replica from the writer that prunes, which is the point of `KEYS_API_MODE=server`) and are released when the holder's connection drops, so there is no expiry to tune and no sweeper to write. A lease that never goes away is reported: `retention held back by a reader still streaming an older version`. A consumer that stops reading is cut off: each write that reaches the socket has 30 s to complete, so a stalled client gives its connection and lease back while a slow one that keeps reading is never cut. A request that finds the pool exhausted fails after 10 s instead of queueing.
 
 Deliberately not covered by a lease: a reorg. When a version leaves the chain its rows must stop being current, or the next version would inherit keys from the losing branch, so the rollback deletes them. **Telling the reader is a separate mechanism, and it was missing.** A response is not one query — a dump runs one per module — so the rollback landed between two of them and the remaining modules came back empty while the handler finished the JSON: a valid, complete-looking answer assembled from a branch that no longer existed. Exactly the failure this design is against, found by writing down what the tests would have to assert.
 
@@ -231,7 +235,7 @@ Hoodi also gives the cleanest measurement of what aggregation is for, because th
 
 **The ceiling that shaped the design.** An aggregate's inner calls share one `eth_call` gas budget while separate calls in a JSON-RPC batch each get their own. Two reads of 1100 curated keys in one aggregate come back `out of gas` from mainnet geth; 200 reads of one key each are fine. So aggregates are bounded by *keys returned* rather than by call count (`Call.Cost`), and a read too expensive to share goes out plainly. The first version bounded them by count, which cost nothing on the CSM tail and quietly wrecked module 1 — it bisected on every group, then dragged a permanently lowered call cap into the modules after it, turning CSM's 22 requests into 908. Worth recording because both halves of the mistake were invisible in a per-module run: the failure showed up only in a full sync, in the module that had not failed.
 
-Nothing about this needs configuring per endpoint. Presence of the contract is probed once (devnets have none), a refused aggregate is bisected and the budget lowered to what worked, and an endpoint that refuses even a single aggregated read turns aggregation off for the process. `PROVIDER_MULTICALL=false` is the manual escape hatch.
+Nothing about this needs configuring per endpoint. Presence of the contract is probed once (devnets have none), a refused aggregate is bisected and the budget lowered to what worked, and an endpoint that refuses a single aggregated read three times within ten minutes pauses aggregation for thirty, after which the budget starts again from the configured value. Only a refusal of the aggregate itself (a call-level error such as `out of gas`, or a response-size limit) bisects; a transport failure or a non-2xx status is returned as it is, so an outage cannot shrink the budget. Rotating `PROVIDERS_URLS` forgets the probe answer and the budget. `PROVIDER_MULTICALL=false` is the manual escape hatch.
 
 ### The endpoint list is a fallback list, and it has to behave like one
 
@@ -246,14 +250,19 @@ What a failed call has to answer is not "did it fail" but "is this about the end
 | expired or invalid key, `unauthorized` | `gas required exceeds allowance` |
 | method or archive state the node does not serve | `intrinsic gas too low` |
 | a non-2xx HTTP status, whatever the body says | anything unrecognised |
+| a redirect, a response missing a requested id, a body over 64 MiB | |
 
 `out of gas` staying in the right-hand column is load bearing rather than tidy: the Multicall3 bisect is driven by seeing it, so failing over would break the aggregation described above. Unrecognised wording also stays on the right — a wrongly-retried call spends a request on every provider and still fails, while a wrongly-returned one fails the cycle and is retried on the next tick anyway.
+
+An attempt fails early on a dead endpoint (5 s to connect, 30 s to the response headers; `PROVIDER_TIMEOUT_MS` bounds the whole attempt), and an endpoint that fails three times in a row is tried last for 30 s — still asked when everything ahead of it fails.
 
 `keys_api_rpc_endpoint_requests_total{endpoint,result}` makes the failover visible, which matters because the hazard of a fallback list is not noticing the first entry died.
 
 ### What a quiet cycle costs, and what the canonical service's costs
 
 A cold sync is a few hundred requests once. The poll runs every `UPDATE_KEYS_INTERVAL_MS` forever, so on a metered endpoint it is the poll that decides the bill — and the number nobody had was how many requests one iteration makes. `keys_api_rpc_requests_total{method,result}` now answers it from the service instead of from arithmetic; the counts below are that arithmetic, read off both implementations at four mainnet modules with nothing changed.
+
+A failing cycle does not keep that pace: consecutive failures back off from the interval, doubling each time with jitter, up to five minutes, and the first success restores the interval.
 
 | | this service | canonical |
 |---|---|---|

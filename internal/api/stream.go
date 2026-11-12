@@ -1,22 +1,14 @@
 package api
 
 import (
-	"bufio"
 	"net/http"
 
 	"github.com/lidofinance/keys-api-versioned/internal/model"
 	"github.com/lidofinance/keys-api-versioned/internal/store"
 )
 
-// The two streams here are what lido-mev-monitoring reads. Its registry sync pulls
-// /v2/modules/operators/keys — one response carrying every module, every operator
-// and every key — and parses it incrementally with stream-json. The v1 per-module
-// variant is the same data scoped to one module.
-//
-// The framing matches the canonical service down to the separators, because the
-// consumer parses a stream and any shape difference shows up as a parse error
-// rather than as a bad value. Canonical builds these with JSONStream, whose
-// defaults are "[\n", "\n,\n" and "\n]".
+// Framing matches canonical's JSONStream defaults ("[\n", "\n,\n", "\n]"): consumers parse these
+// incrementally, so any shape difference is a parse error.
 
 const (
 	streamOpen  = "[\n"
@@ -24,7 +16,6 @@ const (
 	streamClose = "\n]"
 )
 
-// handleModuleOperatorsKeys streams one module with its operators and keys.
 func (s *Server) handleModuleOperatorsKeys(w http.ResponseWriter, r *http.Request) {
 	filter, err := parseFilter(r, false)
 	if err != nil {
@@ -68,7 +59,7 @@ func (s *Server) handleModuleOperatorsKeys(w http.ResponseWriter, r *http.Reques
 		}
 
 		w.Header().Set("Content-Type", "application/json")
-		bw := bufio.NewWriterSize(w, streamBufferSize)
+		bw, out := s.newStreamWriter(w)
 		defer bw.Flush()
 
 		bw.WriteString(`{ "meta": {"elBlockSnapshot":`)
@@ -86,7 +77,7 @@ func (s *Server) handleModuleOperatorsKeys(w http.ResponseWriter, r *http.Reques
 			}
 			first = false
 			writeKey(bw, k)
-			return nil
+			return out.Err()
 		}); err != nil {
 			return err
 		}
@@ -95,16 +86,12 @@ func (s *Server) handleModuleOperatorsKeys(w http.ResponseWriter, r *http.Reques
 		return nil
 	})
 	if err != nil && !writeStoreError(w, err) {
-		writeError(w, http.StatusInternalServerError, err.Error())
+		s.internalError(w, r, err)
 	}
 }
 
-// handleModulesOperatorsKeysStream streams everything as one array of records.
-//
-// The record shape is fixed and mostly null: the first record of a module carries
-// the module and, once, the meta; then one record per key; then one per operator.
-// It is a strange shape, and it is the shape mev-monitoring already parses, so it
-// stays exactly as it is.
+// The record shape is odd and mostly null (module+meta, then one per key, then one per operator),
+// but it is what existing consumers parse, so it stays.
 func (s *Server) handleModulesOperatorsKeysStream(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
@@ -126,7 +113,7 @@ func (s *Server) handleModulesOperatorsKeysStream(w http.ResponseWriter, r *http
 		}
 
 		w.Header().Set("Content-Type", "application/json")
-		bw := bufio.NewWriterSize(w, streamBufferSize)
+		bw, out := s.newStreamWriter(w)
 		defer bw.Flush()
 
 		bw.WriteString(streamOpen)
@@ -160,7 +147,7 @@ func (s *Server) handleModulesOperatorsKeysStream(w http.ResponseWriter, r *http
 				bw.WriteString(`{"stakingModule":null,"meta":null,"key":`)
 				writeKey(bw, k)
 				bw.WriteString(`,"operator":null}`)
-				return nil
+				return out.Err()
 			}); err != nil {
 				return err
 			}
@@ -181,6 +168,6 @@ func (s *Server) handleModulesOperatorsKeysStream(w http.ResponseWriter, r *http
 		return nil
 	})
 	if err != nil && !writeStoreError(w, err) {
-		writeError(w, http.StatusInternalServerError, err.Error())
+		s.internalError(w, r, err)
 	}
 }

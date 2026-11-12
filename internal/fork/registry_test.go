@@ -9,18 +9,8 @@ import (
 	"github.com/lidofinance/keys-api-versioned/internal/model"
 )
 
-// TestARenameIsPickedUpEvenThoughItMovesNoNonce exercises the one path in the loop
-// that no other test in this repo reaches at all.
-//
-// The scripted double in internal/ingest does not implement source.OperatorWatcher, so
-// operatorEvents short-circuits and the whole operator-event branch — the log scan at
-// provider.go:335, the "assume it changed" fallback at sync.go:236, the rule at
-// freshness.go:117 — has never run under a test. It is also the path docs/next-steps.md
-// flags as the one where a mistake is invisible: a wrong event signature yields a wrong
-// topic hash, which returns no logs and looks exactly like "nothing changed".
-//
-// setNodeOperatorName moves no nonce. Verified on the chain here rather than read off
-// the contract, because the whole test is void if it does.
+// The only test reaching the operator-event path. A wrong event signature returns no logs and
+// looks exactly like "nothing changed".
 func TestARenameIsPickedUpEvenThoughItMovesNoNonce(t *testing.T) {
 	h := NewHarness(t, HarnessOpts{})
 	h.requireSandboxPreconditions()
@@ -46,14 +36,8 @@ func TestARenameIsPickedUpEvenThoughItMovesNoNonce(t *testing.T) {
 	}
 }
 
-// TestARenameGoesUnnoticedWithoutTheEventScan is the control for the test above, and
-// it is what makes it worth having.
-//
-// With source.OperatorWatcher hidden the loop has only the nonce, which did not move,
-// so the rename must not be picked up. If this one also saw the new name, the test
-// above would be passing for some other reason — a coincidental rebuild — and would
-// keep passing with a wrong topic hash, which is the exact failure it is written to
-// rule out.
+// Control: without the event scan the rename must go unnoticed, or the test above passes for
+// another reason.
 func TestARenameGoesUnnoticedWithoutTheEventScan(t *testing.T) {
 	h := NewHarness(t, HarnessOpts{NoOperatorWatcher: true})
 	h.requireSandboxPreconditions()
@@ -74,14 +58,8 @@ func TestARenameGoesUnnoticedWithoutTheEventScan(t *testing.T) {
 	}
 }
 
-// TestRemovingAKeyMovesTheLastKeyIntoItsSlot is the contract semantic that breaks an
-// assumption the service is written on.
-//
-// source.go:33 states that key identity is (operator index, key index) and that it is
-// "stable for the life of the key". NodeOperatorsRegistry disagrees: removeSigningKeys
-// moves the *last* key into the vacated slot and shortens the array, so one removal
-// changes which key lives at that index. The keys here are minted, so the test can say
-// exactly which key ended up where rather than counting.
+// removeSigningKeys moves the last key into the vacated slot, so key identity by
+// (operator, index) is not stable.
 func TestRemovingAKeyMovesTheLastKeyIntoItsSlot(t *testing.T) {
 	h := NewHarness(t, HarnessOpts{})
 	h.requireSandboxPreconditions()
@@ -99,7 +77,6 @@ func TestRemovingAKeyMovesTheLastKeyIntoItsSlot(t *testing.T) {
 		}
 	}
 
-	// Remove the first of the three. The contract moves the third into its slot.
 	h.Sandbox.RemoveKeys(SandboxOperator, int64(first), 1)
 
 	onChain := h.Sandbox.SigningKeys(SandboxOperator, int64(first), 2)
@@ -117,8 +94,6 @@ func TestRemovingAKeyMovesTheLastKeyIntoItsSlot(t *testing.T) {
 		t.Fatalf("removing a key did not rebuild: %s", result.Reason)
 	}
 
-	// What the service serves has to be the chain's set: two of the three added keys,
-	// the removed one gone, no duplicate of the key that moved.
 	if h.holdsKey(added[0]) {
 		t.Errorf("the removed key %s is still served", KeyLabel(added[0]))
 	}
@@ -134,8 +109,7 @@ func TestRemovingAKeyMovesTheLastKeyIntoItsSlot(t *testing.T) {
 		t.Errorf("a key that moved slots is served twice: %v", dup)
 	}
 
-	// The index the moved key is served under has to be its new one. Getting this
-	// wrong is invisible to a key count, which is what makes it worth asserting.
+	// The moved key's served index must be its new one; a key count cannot see this.
 	moved := h.keyAt(SandboxOperator, int32(first))
 	if moved == nil {
 		t.Fatalf("nothing is served at operator %d index %d", SandboxOperator, first)
@@ -146,13 +120,6 @@ func TestRemovingAKeyMovesTheLastKeyIntoItsSlot(t *testing.T) {
 	}
 }
 
-// TestADepositFlipsUsedOnExactlyOneKey is the other mutation that moves the nonce, and
-// the one a consumer reads most: `used` is what ethereum-validators-monitoring filters
-// on.
-//
-// Vetting and depositing are two separate roles — the limit is an Aragon role, the
-// deposit is the staking router's — and both are taken by impersonation. No ether
-// moves; obtainDepositData is what flips the flag and bumps the counter.
 func TestADepositFlipsUsedOnExactlyOneKey(t *testing.T) {
 	h := NewHarness(t, HarnessOpts{})
 	h.requireSandboxPreconditions()
@@ -160,7 +127,6 @@ func TestADepositFlipsUsedOnExactlyOneKey(t *testing.T) {
 	h.Cycle()
 	usedBefore := h.usedKeys()
 
-	// One key becomes depositable, then is deposited.
 	h.Sandbox.Vet(SandboxOperator, 1)
 	h.Cycle()
 	h.Sandbox.Deposit(1)
@@ -188,7 +154,6 @@ func TestADepositFlipsUsedOnExactlyOneKey(t *testing.T) {
 	}
 }
 
-// operatorName is the served name of one Sandbox operator.
 func (h *Harness) operatorName(index int32) string {
 	h.tb.Helper()
 
@@ -201,7 +166,6 @@ func (h *Harness) operatorName(index int32) string {
 	return ""
 }
 
-// keyAt is the served key at one operator slot, or nil.
 func (h *Harness) keyAt(operator, index int32) *model.Key {
 	h.tb.Helper()
 
@@ -214,7 +178,6 @@ func (h *Harness) keyAt(operator, index int32) *model.Key {
 	return nil
 }
 
-// usedKeys is every served key marked deposited.
 func (h *Harness) usedKeys() []model.Key {
 	h.tb.Helper()
 
@@ -227,11 +190,8 @@ func (h *Harness) usedKeys() []model.Key {
 	return out
 }
 
-// duplicateKeys reports pubkeys served more than once for this module.
-//
-// Worth checking rather than assuming: Hoodi's CSM genuinely holds duplicate pubkeys
-// across operators, so duplication is not by itself a defect — but a key duplicated
-// inside one module after a slot move would be.
+// Hoodi's CSM holds duplicate pubkeys across operators; within one module after a slot move it
+// would be a defect.
 func (h *Harness) duplicateKeys() []string {
 	h.tb.Helper()
 

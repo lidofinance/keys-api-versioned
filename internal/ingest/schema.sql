@@ -135,6 +135,9 @@ create table if not exists operator_version (
     -- from the registry's NO_GROUP_ID sentinel, which does exist and means "in no
     -- group". Two different facts, so two different values.
     group_id                     int,
+    -- Null where the module has no such counter (curated-onchain-v1), as in the
+    -- canonical service; 0 is a real value for the CSM-shaped modules.
+    total_withdrawn_keys         int,
     from_block                   bigint       not null,
     to_block                     bigint
 );

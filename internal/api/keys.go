@@ -1,8 +1,8 @@
 package api
 
 import (
-	"bufio"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"strconv"
 	"strings"
@@ -11,12 +11,10 @@ import (
 	"github.com/lidofinance/keys-api-versioned/internal/store"
 )
 
-// streamBufferSize is the write buffer for dump endpoints. Large enough to
-// amortize syscalls on multi-hundred-megabyte responses, small enough that
-// concurrent dumps do not dominate the resident set.
+// Large enough to amortize syscalls on multi-hundred-MiB dumps, small enough that concurrent
+// dumps do not dominate RSS.
 const streamBufferSize = 256 << 10
 
-// parseFilter reads the query filters, rejecting the same inputs as canonical.
 func parseFilter(r *http.Request, withAddresses bool) (model.KeysFilter, error) {
 	var f model.KeysFilter
 	q := r.URL.Query()
@@ -59,10 +57,7 @@ type errBadRequest struct{ messages []string }
 
 func (e errBadRequest) Error() string { return strings.Join(e.messages, ", ") }
 
-// handleKeys streams every key of every module.
-//
-// Framing is byte-identical to the canonical service, including whitespace:
-// `{ "meta": {...}, "data": [` … `]}`.
+// handleKeys framing is byte-identical to canonical, whitespace included.
 func (s *Server) handleKeys(w http.ResponseWriter, r *http.Request) {
 	filter, err := parseFilter(r, true)
 	if err != nil {
@@ -70,7 +65,6 @@ func (s *Server) handleKeys(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Paging is opt-in: without limit or cursor this is the canonical full dump.
 	page, err := parsePage(r)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err.(errBadRequest).messages)
@@ -100,7 +94,7 @@ func (s *Server) handleKeys(w http.ResponseWriter, r *http.Request) {
 		}
 
 		w.Header().Set("Content-Type", "application/json")
-		bw := bufio.NewWriterSize(w, streamBufferSize)
+		bw, out := s.newStreamWriter(w)
 		defer bw.Flush()
 
 		bw.WriteString(`{ "meta": {"elBlockSnapshot":`)
@@ -115,7 +109,7 @@ func (s *Server) handleKeys(w http.ResponseWriter, r *http.Request) {
 				}
 				first = false
 				writeKey(bw, k)
-				return nil
+				return out.Err()
 			})
 			if err != nil {
 				return err
@@ -126,11 +120,10 @@ func (s *Server) handleKeys(w http.ResponseWriter, r *http.Request) {
 		return nil
 	})
 	if err != nil && !writeStoreError(w, err) {
-		writeError(w, http.StatusInternalServerError, err.Error())
+		s.internalError(w, r, err)
 	}
 }
 
-// handleModuleKeys streams keys of a single module.
 func (s *Server) handleModuleKeys(w http.ResponseWriter, r *http.Request) {
 	filter, err := parseFilter(r, false)
 	if err != nil {
@@ -164,7 +157,7 @@ func (s *Server) handleModuleKeys(w http.ResponseWriter, r *http.Request) {
 		}
 
 		w.Header().Set("Content-Type", "application/json")
-		bw := bufio.NewWriterSize(w, streamBufferSize)
+		bw, out := s.newStreamWriter(w)
 		defer bw.Flush()
 
 		bw.WriteString(`{ "meta": {"elBlockSnapshot":`)
@@ -180,7 +173,7 @@ func (s *Server) handleModuleKeys(w http.ResponseWriter, r *http.Request) {
 			}
 			first = false
 			writeKey(bw, k)
-			return nil
+			return out.Err()
 		})
 		if err != nil {
 			return err
@@ -190,20 +183,12 @@ func (s *Server) handleModuleKeys(w http.ResponseWriter, r *http.Request) {
 		return nil
 	})
 	if err != nil && !writeStoreError(w, err) {
-		writeError(w, http.StatusInternalServerError, err.Error())
+		s.internalError(w, r, err)
 	}
 }
 
-// handleGroupedKeys returns keys grouped by module.
-//
-// Streamed, unlike the canonical service, which builds the whole response in memory
-// and dies at a 512 MiB limit on mainnet data. Ours did too for one commit: an
-// earlier version collected every key into a slice, which only looked survivable
-// while a bug left the hex strings empty — 511 877 keys with their pubkeys and
-// signatures materialised is around half a gigabyte of strings.
-//
-// The bytes are identical to the collected version, envelope and property order
-// included; only the memory is different.
+// handleGroupedKeys streams; canonical builds it in memory and dies at a 512 MiB limit on mainnet
+// (~512k keys materialised as strings is about half a gigabyte).
 func (s *Server) handleGroupedKeys(w http.ResponseWriter, r *http.Request) {
 	filter, err := parseFilter(r, false)
 	if err != nil {
@@ -230,7 +215,7 @@ func (s *Server) handleGroupedKeys(w http.ResponseWriter, r *http.Request) {
 		}
 
 		w.Header().Set("Content-Type", "application/json")
-		bw := bufio.NewWriterSize(w, streamBufferSize)
+		bw, out := s.newStreamWriter(w)
 		defer bw.Flush()
 
 		bw.WriteString(`{"data":[`)
@@ -247,7 +232,7 @@ func (s *Server) handleGroupedKeys(w http.ResponseWriter, r *http.Request) {
 				}
 				first = false
 				writeKey(bw, k)
-				return nil
+				return out.Err()
 			}); err != nil {
 				return err
 			}
@@ -262,7 +247,7 @@ func (s *Server) handleGroupedKeys(w http.ResponseWriter, r *http.Request) {
 		return nil
 	})
 	if err != nil && !writeStoreError(w, err) {
-		writeError(w, http.StatusInternalServerError, err.Error())
+		s.internalError(w, r, err)
 	}
 }
 
@@ -270,19 +255,10 @@ type meta struct {
 	ELBlockSnapshot *model.ELBlockSnapshot `json:"elBlockSnapshot"`
 }
 
-// Pubkey validation, and why it is here rather than left to the lookup.
-//
-// The canonical service validates the shape before it looks anything up, so a malformed
-// pubkey is a 400 and a well-formed unknown one is a 404. Without this, both were 404
-// here: "there are no keys with not-a-pubkey in db" for a string that could never be a
-// pubkey. A consumer that retries a 404 and gives up on a 400 — the sensible reading —
-// would retry forever. Found by comparing the error surface against a running canonical
-// service.
-//
-// The message is canonical's own, because the whole point is to be indistinguishable.
+// Shape is validated before lookup, as canonical does: malformed is 400, well-formed unknown is
+// 404. The message is canonical's own.
 const badPubkeyMessage = "Each pubkey must be a valid 0x-prefixed 48-byte hex string"
 
-// validPubkey reports whether a string is a 0x-prefixed 48-byte hex value.
 func validPubkey(s string) bool {
 	if !strings.HasPrefix(s, "0x") || len(s) != 2+2*48 {
 		return false
@@ -296,7 +272,6 @@ func validPubkey(s string) bool {
 	return true
 }
 
-// handleKeyByPubkey returns every key matching one pubkey across modules.
 func (s *Server) handleKeyByPubkey(w http.ResponseWriter, r *http.Request) {
 	pubkey := strings.ToLower(r.PathValue("pubkey"))
 	if !validPubkey(pubkey) {
@@ -306,20 +281,39 @@ func (s *Server) handleKeyByPubkey(w http.ResponseWriter, r *http.Request) {
 	s.findKeys(w, r, []string{pubkey}, true)
 }
 
-// handleKeysFind returns keys matching a pubkey list across modules.
-//
-// The body is validated the way the canonical service validates it, down to reporting
-// every failed constraint at once — that is what class-validator does there, and a
-// consumer reading `message[0]` should see the same thing. Before this, an empty list and
-// a body with the wrong field name both answered 200 with no keys, which reads as "none
-// of your pubkeys exist" rather than "your request is wrong".
 func (s *Server) handleKeysFind(w http.ResponseWriter, r *http.Request) {
+	pubkeys, ok := decodeFindBody(w, r)
+	if !ok {
+		return
+	}
+	s.findKeys(w, r, pubkeys, false)
+}
+
+// maxFindBodyBytes is Fastify's default body limit, the canonical service's.
+const maxFindBodyBytes = 1 << 20
+
+// One valid element is at least 101 bytes (a quoted pubkey and a comma), so under the body limit
+// this cap is never reached by valid input; it holds if the limit is raised.
+const maxFindPubkeys = maxFindBodyBytes/101 + 1
+
+// decodeFindBody validates like canonical's class-validator, reporting every failed constraint at
+// once; an empty list or wrong field used to answer 200 with no keys.
+func decodeFindBody(w http.ResponseWriter, r *http.Request) ([]string, bool) {
+	if r.ContentLength > maxFindBodyBytes {
+		bodyTooLarge(w)
+		return nil, false
+	}
 	var body struct {
 		Pubkeys *[]string `json:"pubkeys"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxFindBodyBytes)).Decode(&body); err != nil {
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			bodyTooLarge(w)
+			return nil, false
+		}
 		writeError(w, http.StatusBadRequest, []string{"pubkeys must be an array"})
-		return
+		return nil, false
 	}
 	if body.Pubkeys == nil {
 		// Missing or the wrong field name: every constraint on the field failed, and
@@ -329,19 +323,30 @@ func (s *Server) handleKeysFind(w http.ResponseWriter, r *http.Request) {
 			"pubkeys must contain at least 1 elements",
 			"pubkeys must be an array",
 		})
-		return
+		return nil, false
 	}
-	if len(*body.Pubkeys) == 0 {
+	pubkeys := *body.Pubkeys
+	if len(pubkeys) == 0 {
 		writeError(w, http.StatusBadRequest, []string{"pubkeys must contain at least 1 elements"})
-		return
+		return nil, false
 	}
-	for _, pubkey := range *body.Pubkeys {
-		if !validPubkey(strings.ToLower(pubkey)) {
+	for _, pubkey := range pubkeys {
+		// Case-sensitive prefix, as canonical's startsWith('0x').
+		if !validPubkey(pubkey) {
 			writeError(w, http.StatusBadRequest, []string{badPubkeyMessage})
-			return
+			return nil, false
 		}
 	}
-	s.findKeys(w, r, *body.Pubkeys, false)
+	if len(pubkeys) > maxFindPubkeys {
+		bodyTooLarge(w)
+		return nil, false
+	}
+	return pubkeys, true
+}
+
+// bodyTooLarge is what NestJS makes of Fastify's body-limit error.
+func bodyTooLarge(w http.ResponseWriter) {
+	writeStatusMessage(w, http.StatusRequestEntityTooLarge, "Request body is too large")
 }
 
 func (s *Server) findKeys(w http.ResponseWriter, r *http.Request, pubkeys []string, notFoundWhenEmpty bool) {
@@ -386,17 +391,13 @@ func (s *Server) findKeys(w http.ResponseWriter, r *http.Request, pubkeys []stri
 		return writeJSON(w, response{Data: collected, Meta: meta{ELBlockSnapshot: elMeta}})
 	})
 	if err != nil && !writeStoreError(w, err) {
-		writeError(w, http.StatusInternalServerError, err.Error())
+		s.internalError(w, r, err)
 	}
 }
 
-// handleModuleKeysFind returns keys of one module matching a pubkey list.
 func (s *Server) handleModuleKeysFind(w http.ResponseWriter, r *http.Request) {
-	var body struct {
-		Pubkeys []string `json:"pubkeys"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		writeError(w, http.StatusBadRequest, []string{"pubkeys must be an array"})
+	pubkeys, ok := decodeFindBody(w, r)
+	if !ok {
 		return
 	}
 
@@ -434,7 +435,7 @@ func (s *Server) handleModuleKeysFind(w http.ResponseWriter, r *http.Request) {
 			return nil
 		}
 
-		keys, err := snap.KeysByPubkeys(ctx, module.RawAddress(), body.Pubkeys)
+		keys, err := snap.KeysByPubkeys(ctx, module.RawAddress(), pubkeys)
 		if err != nil {
 			return err
 		}
@@ -448,6 +449,6 @@ func (s *Server) handleModuleKeysFind(w http.ResponseWriter, r *http.Request) {
 		})
 	})
 	if err != nil && !writeStoreError(w, err) {
-		writeError(w, http.StatusInternalServerError, err.Error())
+		s.internalError(w, r, err)
 	}
 }

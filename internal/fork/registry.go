@@ -12,12 +12,7 @@ import (
 	"github.com/ethereum/go-ethereum/crypto"
 )
 
-// The write half of the registry ABI.
-//
-// It lives here rather than in internal/eth/abi because those files are the canonical
-// service's own, trimmed to the reads the service makes — a service that only reads
-// has no business carrying addSigningKeys. What the tests need is a different set, and
-// keeping it separate means a fork test cannot accidentally widen the production ABI.
+// Write ABI kept out of internal/eth/abi (canonical, read-only) so tests can't widen the production ABI.
 const registryWriteABI = `[
   {"name":"addSigningKeys","type":"function","inputs":[
     {"name":"_nodeOperatorId","type":"uint256"},{"name":"_keysCount","type":"uint256"},
@@ -55,8 +50,6 @@ const registryWriteABI = `[
    "outputs":[{"name":"","type":"address"}]}
 ]`
 
-// The slivers of Aragon needed to hand ourselves a role, and of the router needed to
-// change a module's status.
 const (
 	kernelABIJSON = `[{"name":"acl","type":"function","stateMutability":"view","inputs":[],
 	  "outputs":[{"name":"","type":"address"}]}]`
@@ -105,7 +98,6 @@ func mustABI(s string) abi.ABI {
 	return parsed
 }
 
-// Registry drives one curated module contract on the fork.
 type Registry struct {
 	Address string
 
@@ -113,14 +105,11 @@ type Registry struct {
 	a  *Anvil
 }
 
-// NewRegistry binds to a module address.
 func NewRegistry(tb testing.TB, a *Anvil, address string) *Registry {
 	return &Registry{Address: address, tb: tb, a: a}
 }
 
-// Operator is what getNodeOperator returns, which is more than the served DTO holds:
-// the tests assert on the counters directly, because that is the state the mutation
-// was supposed to move.
+// Operator holds the raw counters, more than the served DTO.
 type Operator struct {
 	Active           bool
 	Name             string
@@ -131,7 +120,6 @@ type Operator struct {
 	UsedSigningKeys  uint64
 }
 
-// Operator reads one operator at the head.
 func (r *Registry) Operator(id int64) Operator {
 	r.tb.Helper()
 
@@ -147,21 +135,17 @@ func (r *Registry) Operator(id int64) Operator {
 	}
 }
 
-// OperatorCount is how many operators the module holds.
 func (r *Registry) OperatorCount() int64 {
 	r.tb.Helper()
 	return r.call("getNodeOperatorsCount")[0].(*big.Int).Int64()
 }
 
-// Nonce is the per-module change counter the whole freshness mechanism rests on.
 func (r *Registry) Nonce() int64 {
 	r.tb.Helper()
 	return r.call("getNonce")[0].(*big.Int).Int64()
 }
 
-// SigningKeys reads a span of an operator's keys straight from the contract. This is
-// the oracle the mutation scenarios compare the served dump against: it goes through
-// the harness's own client rather than the service's.
+// SigningKeys reads the contract through the harness client: the oracle for the served dump.
 func (r *Registry) SigningKeys(operator int64, offset, limit int64) [][]byte {
 	r.tb.Helper()
 
@@ -177,8 +161,7 @@ func (r *Registry) SigningKeys(operator int64, offset, limit int64) [][]byte {
 	return keys
 }
 
-// AddKeys appends keys to an operator, sent from its reward address — which the
-// registry accepts without any role, as long as the operator is active.
+// Sent from the reward address, which the registry accepts without a role while active.
 func (r *Registry) AddKeys(operator int64, keys [][]byte) {
 	r.tb.Helper()
 
@@ -196,8 +179,7 @@ func (r *Registry) AddKeys(operator int64, keys [][]byte) {
 	r.a.Send(r.Operator(operator).RewardAddress, r.Address, data)
 }
 
-// AddKeysCalldata is AddKeys without sending it, for anvil_reorg — where the
-// transaction has to be handed to the node rather than submitted.
+// AddKeysCalldata is for anvil_reorg, which takes the transaction rather than a submission.
 func (r *Registry) AddKeysCalldata(operator int64, keys [][]byte) (from string, data []byte) {
 	r.tb.Helper()
 
@@ -211,10 +193,8 @@ func (r *Registry) AddKeysCalldata(operator int64, keys [][]byte) (from string, 
 		r.pack("addSigningKeys", big.NewInt(operator), big.NewInt(int64(len(keys))), pubkeys, signatures)
 }
 
-// RemoveKeys removes a span, which is the mutation with the interesting semantics:
-// the contract moves the *last* key into the vacated slot and drops the vetted count
-// to the removal point. Key identity is (operator, index) everywhere above the source
-// seam, and this is the operation that breaks it.
+// RemoveKeys: the contract moves the last key into the vacated slot, so (operator, index)
+// identity breaks.
 func (r *Registry) RemoveKeys(operator, fromIndex, count int64) {
 	r.tb.Helper()
 
@@ -222,8 +202,7 @@ func (r *Registry) RemoveKeys(operator, fromIndex, count int64) {
 	r.a.Send(r.Operator(operator).RewardAddress, r.Address, data)
 }
 
-// Rename changes an operator's name. It moves no nonce — verified on the fork, not
-// assumed — so the only thing that can notice it is the operator event scan.
+// Rename moves no nonce; only the operator event scan can notice it.
 func (r *Registry) Rename(operator int64, name string) {
 	r.tb.Helper()
 
@@ -231,7 +210,6 @@ func (r *Registry) Rename(operator int64, name string) {
 	r.a.Send(TestSender, r.Address, r.pack("setNodeOperatorName", big.NewInt(operator), name))
 }
 
-// Vet raises an operator's staking limit, which is what makes keys depositable.
 func (r *Registry) Vet(operator int64, count uint64) {
 	r.tb.Helper()
 
@@ -239,9 +217,7 @@ func (r *Registry) Vet(operator int64, count uint64) {
 	r.a.Send(TestSender, r.Address, r.pack("setNodeOperatorStakingLimit", big.NewInt(operator), count))
 }
 
-// Deposit marks vetted keys as deposited, sent as the staking router, which is the
-// only caller the registry accepts. No ether moves: the point is the `used` flag and
-// the nonce that comes with it.
+// Deposit: only the staking router may call it. No ether moves; the point is `used` and the nonce.
 func (r *Registry) Deposit(count int64) {
 	r.tb.Helper()
 
@@ -249,8 +225,7 @@ func (r *Registry) Deposit(count int64) {
 	r.a.Send(StakingRouterAddress, r.Address, data)
 }
 
-// grant hands TestSender an Aragon role by impersonating the role's permission
-// manager, so a test never has to know which committee happens to hold it today.
+// grant impersonates the role's permission manager, whoever holds it today.
 func (r *Registry) grant(role string) {
 	r.tb.Helper()
 
@@ -281,8 +256,7 @@ func (r *Registry) grant(role string) {
 		mustPack(aclABI, "grantPermission", common.HexToAddress(TestSender), common.HexToAddress(r.Address), roleHash))
 }
 
-// acl walks module → kernel → acl, rather than carrying an address that a Locator
-// upgrade would silently invalidate.
+// Walks module -> kernel -> acl rather than carrying an address an upgrade would invalidate.
 func (r *Registry) acl() string {
 	r.tb.Helper()
 
@@ -314,19 +288,15 @@ func (r *Registry) pack(method string, args ...any) []byte {
 	return data
 }
 
-// SetModuleStatus changes a module's status on the staking router. Worth knowing
-// before reading a test that uses it: this moves no module nonce, because the counter
-// lives in the module contract and the status lives in the router.
+// SetModuleStatus moves no module nonce: the status lives in the router, the nonce in the module.
 func SetModuleStatus(tb testing.TB, a *Anvil, moduleID int64, status uint8) {
 	tb.Helper()
 
 	data := mustPack(routerABI, "setStakingModuleStatus", big.NewInt(moduleID), status)
-	// The router's own admin roles are OpenZeppelin rather than Aragon; the agent
-	// holds them on Hoodi. A test that finds otherwise gets a plain revert.
+	// Router roles are OpenZeppelin, held by the agent on Hoodi.
 	a.Send(AgentAddress, StakingRouterAddress, data)
 }
 
-// AgentAddress is the Aragon agent, which holds the router's manage roles on Hoodi.
 const AgentAddress = "0x0534aA41907c9631fae990960bCC72d75fA7cfeD"
 
 func mustPack(a abi.ABI, method string, args ...any) []byte {

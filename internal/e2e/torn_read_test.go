@@ -11,18 +11,8 @@ import (
 	"github.com/lidofinance/keys-api-versioned/internal/testreg"
 )
 
-// A dump is not one query: it runs one per module, each in its own implicit
-// transaction and therefore its own snapshot. So a version published between two of
-// them is visible to the second and not the first, and a reader that decides what is
-// current by looking for open-ended rows would answer from two versions at once —
-// module 1 from the old one, module 2 from the new one. That happened here: two of six
-// dumps came back stitched at a module boundary.
-//
-// The fix was to read by validity range at a pinned block instead. These tests hold it
-// in place, and the control below is what makes them mean something: it runs the same
-// interleaving against the naive predicate and requires the stitching to appear. A
-// test that passes both with and without the property it claims to check is measuring
-// nothing.
+// A dump runs one query per module, each its own snapshot: a reader picking open-ended rows stitched
+// two of six dumps at a module boundary. Reads go by validity range at a pinned block instead.
 
 func TestAPublishBetweenTwoModuleQueriesCannotStitchAPinnedDump(t *testing.T) {
 	db := testpg.New(t)
@@ -32,8 +22,6 @@ func TestAPublishBetweenTwoModuleQueriesCannotStitchAPinnedDump(t *testing.T) {
 	first := testreg.At(db.Block(0))
 	spec.Publish(ctx, t, db.Writer, first)
 
-	// The next version, staged but not published: everything expensive is already done,
-	// so the only thing landing inside the interleaving window is one row update.
 	next := spec.WithSalt(spec.Salt + 1)
 	staged := next.Fill(ctx, t, db.Writer, testreg.At(db.Block(1)), next.ModuleIDs()...)
 
@@ -45,9 +33,7 @@ func TestAPublishBetweenTwoModuleQueriesCannotStitchAPinnedDump(t *testing.T) {
 		for _, id := range spec.ModuleIDs() {
 			err := snap.StreamKeys(ctx, testreg.ModuleAddress(id), model.KeysFilter{},
 				func(k *model.Key) error {
-					// Publish synchronously, on the first key of the first module. This is a
-					// happens-before, not a race: Publish has committed before the query for
-					// the next module is sent.
+					// Happens-before, not a race: Publish commits before the next module's query is sent.
 					if !published {
 						if err := staged.Publish(ctx, "latest", 0); err != nil {
 							return err
@@ -72,8 +58,7 @@ func TestAPublishBetweenTwoModuleQueriesCannotStitchAPinnedDump(t *testing.T) {
 		t.Fatalf("the pinned dump was not one version: %v", err)
 	}
 
-	// And the write really landed — otherwise the test above would pass because there
-	// was nothing to be confused by.
+	// The write really landed, or the test above passes with nothing to be confused by.
 	fresh := testreg.NewVerifier(next)
 	freshReader := db.Reader(t, "latest", 2)
 	if err := freshReader.Snapshot(ctx, func(snap store.Snapshot) error {
@@ -91,19 +76,8 @@ func TestAPublishBetweenTwoModuleQueriesCannotStitchAPinnedDump(t *testing.T) {
 	}
 }
 
-// TestTheNaivePredicateAnswersFromTwoVersionsAtOnce is the control, and writing it
-// turned out to show the rejected predicate is worse than "occasionally stitched".
-//
-// The first attempt at this control interleaved a *publish* between two naive reads and
-// expected them to disagree. They agreed — both saw the new content — because rows do
-// not arrive at publication time. A build inserts its rows as it goes and Publish only
-// flips a status, which is the whole point of the layout. So "the rows with no to_block"
-// exposes a version that is still being written, and the two reads below straddle a
-// module the build has already rewritten and one it has not: one response, two versions,
-// neither of them published.
-//
-// If this ever comes back consistent, the mechanism the pinned-dump test relies on has
-// changed and that test is passing for the wrong reason.
+// Control: open rows expose a build still in progress (Publish only flips a status), so two naive
+// reads straddle a rewritten and an untouched module. If they agree, the pinned test proves nothing.
 func TestTheNaivePredicateAnswersFromTwoVersionsAtOnce(t *testing.T) {
 	db := testpg.New(t)
 	ctx := context.Background()
@@ -111,8 +85,6 @@ func TestTheNaivePredicateAnswersFromTwoVersionsAtOnce(t *testing.T) {
 	spec := testreg.Spec{Modules: 3, OperatorsPerModule: 2, KeysPerOperator: 5}
 	spec.Publish(ctx, t, db.Writer, testreg.At(db.Block(0)))
 
-	// A build in progress: module 1 rewritten, module 2 not touched yet, nothing
-	// published.
 	next := spec.WithSalt(spec.Salt + 1)
 	staged := next.Fill(ctx, t, db.Writer, testreg.At(db.Block(1)), 1)
 
@@ -129,8 +101,6 @@ func TestTheNaivePredicateAnswersFromTwoVersionsAtOnce(t *testing.T) {
 			firstModule, secondModule, next.Salt, spec.Salt)
 	}
 
-	// At that same moment a pinned reader is consistent, and on the published version —
-	// which is the difference the predicate makes.
 	verifier := testreg.NewVerifier(spec)
 	reader := db.Reader(t, "latest", 2)
 	if err := reader.Snapshot(ctx, func(snap store.Snapshot) error {
@@ -152,13 +122,11 @@ func TestTheNaivePredicateAnswersFromTwoVersionsAtOnce(t *testing.T) {
 	}
 }
 
-// naiveSalt reads one key of a module the way the rejected implementation did — "open
-// rows are the current version" — and reports which generation it came from.
+// naiveSalt reads the way the rejected implementation did: open rows are current.
 func naiveSalt(ctx context.Context, t *testing.T, db *testpg.DB, moduleID int) uint64 {
 	t.Helper()
 
-	// Addresses are stored as bytes, not as the 42-character string: the schema keeps the
-	// address once in module_version and puts a two-byte id on every key row.
+	// Addresses are stored as bytes, once in module_version; key rows carry a two-byte id.
 	address, err := model.DecodeHex(testreg.ModuleAddress(moduleID))
 	if err != nil {
 		t.Fatalf("decode module address: %v", err)
@@ -180,10 +148,7 @@ func naiveSalt(ctx context.Context, t *testing.T, db *testpg.DB, moduleID int) u
 	return id.Salt
 }
 
-// TestAPublishDuringAStreamedDumpDoesNotChangeIt is the same property over HTTP, where
-// the interleaving comes from the client rather than from a callback: the body is held
-// after the first bytes, a version is published while the server sits blocked inside
-// the response, and the dump still has to be one version.
+// Same property over HTTP: the body is held after the first bytes while a version is published.
 func TestAPublishDuringAStreamedDumpDoesNotChangeIt(t *testing.T) {
 	db := testpg.New(t)
 	ctx := context.Background()
@@ -198,8 +163,7 @@ func TestAPublishDuringAStreamedDumpDoesNotChangeIt(t *testing.T) {
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("GET /v1/keys: status %d, want 200", resp.StatusCode)
 	}
-	// The server is inside the response: it has sent bytes and has not finished. Without
-	// this the publish below could land after the whole dump was already served.
+	// Inside the response; otherwise the publish could land after the whole dump was served.
 	if srv.Pending() != 1 {
 		t.Fatalf("%d requests in flight, want the dump to be one of them", srv.Pending())
 	}

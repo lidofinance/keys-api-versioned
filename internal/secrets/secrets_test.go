@@ -8,8 +8,7 @@ import (
 	"time"
 )
 
-// render replaces the file the way the real writer does: a temp file renamed over the path,
-// which gives it a new inode every time.
+// render replaces the file like the real writer: temp file renamed over the path (new inode).
 func render(t *testing.T, path, contents string) {
 	t.Helper()
 	tmp := path + ".tmp"
