@@ -195,3 +195,18 @@ var _ store.Store = stubStore{}
 // Renaming a field of the wire type the spec describes breaks here too.
 var _ = model.Key{Key: "", DepositSignature: "", OperatorIndex: 0, Used: false,
 	ModuleAddress: "", Index: 0, Vetted: false}
+
+func TestTheDocsPageLoadsOnlyPinnedVerifiedAssets(t *testing.T) {
+	tags := regexp.MustCompile(`<(?:script|link)\b[^>]*\b(?:src|href)="https?://[^"]+"[^>]*>`).FindAllString(docsPage, -1)
+	if len(tags) == 0 {
+		t.Fatal("found no external assets on the docs page")
+	}
+	for _, tag := range tags {
+		if !regexp.MustCompile(`@\d+\.\d+\.\d+/`).MatchString(tag) {
+			t.Errorf("not pinned to an exact version: %s", tag)
+		}
+		if !strings.Contains(tag, `integrity="sha384-`) || !strings.Contains(tag, `crossorigin="anonymous"`) {
+			t.Errorf("no subresource integrity: %s", tag)
+		}
+	}
+}
