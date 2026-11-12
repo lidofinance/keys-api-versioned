@@ -183,12 +183,7 @@ func run(log *slog.Logger, masker *logmask.Masker) error {
 			Observe:        m.ObserveRequest,
 		}).Handler()
 
-		server = &http.Server{
-			Addr:              ":" + envOr("PORT", "3000"),
-			Handler:           handler,
-			ReadHeaderTimeout: 10 * time.Second,
-			// No write timeout: a full dump is 200 MiB and a slow consumer is not an error.
-		}
+		server = newHTTPServer(":"+envOr("PORT", "3000"), handler)
 
 		go func() {
 			log.Info("http listening", "addr", server.Addr, "mode", mode)
@@ -233,6 +228,19 @@ func run(log *slog.Logger, masker *logmask.Masker) error {
 		}
 	}
 	return nil
+}
+
+// newHTTPServer has no WriteTimeout: a full dump is 200 MiB, so streams move a per-write deadline
+// instead. 16 KiB of headers is Node's default, the canonical service's.
+func newHTTPServer(addr string, handler http.Handler) *http.Server {
+	return &http.Server{
+		Addr:              addr,
+		Handler:           handler,
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		IdleTimeout:       60 * time.Second,
+		MaxHeaderBytes:    16 << 10,
+	}
 }
 
 // addSecrets registers the credentials from the environment and the secrets file with the log masker.

@@ -39,6 +39,9 @@ func (r *recorder) Flush() {
 
 func (r *recorder) fail(err error) { r.failed = err }
 
+// Unwrap lets http.ResponseController reach the connection for write deadlines.
+func (r *recorder) Unwrap() http.ResponseWriter { return r.ResponseWriter }
+
 // withLogging logs one line per request; a dump that died half way shows only as fewer bytes.
 func withLogging(next http.Handler, log *slog.Logger, observe ObserveFunc) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

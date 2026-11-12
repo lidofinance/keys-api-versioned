@@ -1,7 +1,6 @@
 package api
 
 import (
-	"bufio"
 	"net/http"
 	"slices"
 
@@ -64,7 +63,7 @@ func (s *Server) handleKeysDiff(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	bw := bufio.NewWriterSize(w, streamBufferSize)
+	bw, _ := s.newStreamWriter(w)
 	defer bw.Flush()
 
 	bw.WriteString(`{ "meta": `)

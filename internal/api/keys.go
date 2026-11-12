@@ -1,8 +1,8 @@
 package api
 
 import (
-	"bufio"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"strconv"
 	"strings"
@@ -94,7 +94,7 @@ func (s *Server) handleKeys(w http.ResponseWriter, r *http.Request) {
 		}
 
 		w.Header().Set("Content-Type", "application/json")
-		bw := bufio.NewWriterSize(w, streamBufferSize)
+		bw, out := s.newStreamWriter(w)
 		defer bw.Flush()
 
 		bw.WriteString(`{ "meta": {"elBlockSnapshot":`)
@@ -109,7 +109,7 @@ func (s *Server) handleKeys(w http.ResponseWriter, r *http.Request) {
 				}
 				first = false
 				writeKey(bw, k)
-				return nil
+				return out.Err()
 			})
 			if err != nil {
 				return err
@@ -157,7 +157,7 @@ func (s *Server) handleModuleKeys(w http.ResponseWriter, r *http.Request) {
 		}
 
 		w.Header().Set("Content-Type", "application/json")
-		bw := bufio.NewWriterSize(w, streamBufferSize)
+		bw, out := s.newStreamWriter(w)
 		defer bw.Flush()
 
 		bw.WriteString(`{ "meta": {"elBlockSnapshot":`)
@@ -173,7 +173,7 @@ func (s *Server) handleModuleKeys(w http.ResponseWriter, r *http.Request) {
 			}
 			first = false
 			writeKey(bw, k)
-			return nil
+			return out.Err()
 		})
 		if err != nil {
 			return err
@@ -215,7 +215,7 @@ func (s *Server) handleGroupedKeys(w http.ResponseWriter, r *http.Request) {
 		}
 
 		w.Header().Set("Content-Type", "application/json")
-		bw := bufio.NewWriterSize(w, streamBufferSize)
+		bw, out := s.newStreamWriter(w)
 		defer bw.Flush()
 
 		bw.WriteString(`{"data":[`)
@@ -232,7 +232,7 @@ func (s *Server) handleGroupedKeys(w http.ResponseWriter, r *http.Request) {
 				}
 				first = false
 				writeKey(bw, k)
-				return nil
+				return out.Err()
 			}); err != nil {
 				return err
 			}
@@ -281,15 +281,39 @@ func (s *Server) handleKeyByPubkey(w http.ResponseWriter, r *http.Request) {
 	s.findKeys(w, r, []string{pubkey}, true)
 }
 
-// handleKeysFind validates like canonical's class-validator, reporting every failed constraint at
-// once; an empty list or wrong field used to answer 200 with no keys.
 func (s *Server) handleKeysFind(w http.ResponseWriter, r *http.Request) {
+	pubkeys, ok := decodeFindBody(w, r)
+	if !ok {
+		return
+	}
+	s.findKeys(w, r, pubkeys, false)
+}
+
+// maxFindBodyBytes is Fastify's default body limit, the canonical service's.
+const maxFindBodyBytes = 1 << 20
+
+// One valid element is at least 101 bytes (a quoted pubkey and a comma), so under the body limit
+// this cap is never reached by valid input; it holds if the limit is raised.
+const maxFindPubkeys = maxFindBodyBytes/101 + 1
+
+// decodeFindBody validates like canonical's class-validator, reporting every failed constraint at
+// once; an empty list or wrong field used to answer 200 with no keys.
+func decodeFindBody(w http.ResponseWriter, r *http.Request) ([]string, bool) {
+	if r.ContentLength > maxFindBodyBytes {
+		bodyTooLarge(w)
+		return nil, false
+	}
 	var body struct {
 		Pubkeys *[]string `json:"pubkeys"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxFindBodyBytes)).Decode(&body); err != nil {
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			bodyTooLarge(w)
+			return nil, false
+		}
 		writeError(w, http.StatusBadRequest, []string{"pubkeys must be an array"})
-		return
+		return nil, false
 	}
 	if body.Pubkeys == nil {
 		// Missing or the wrong field name: every constraint on the field failed, and
@@ -299,19 +323,36 @@ func (s *Server) handleKeysFind(w http.ResponseWriter, r *http.Request) {
 			"pubkeys must contain at least 1 elements",
 			"pubkeys must be an array",
 		})
-		return
+		return nil, false
 	}
-	if len(*body.Pubkeys) == 0 {
+	pubkeys := *body.Pubkeys
+	if len(pubkeys) == 0 {
 		writeError(w, http.StatusBadRequest, []string{"pubkeys must contain at least 1 elements"})
-		return
+		return nil, false
 	}
-	for _, pubkey := range *body.Pubkeys {
-		if !validPubkey(strings.ToLower(pubkey)) {
+	for _, pubkey := range pubkeys {
+		// Case-sensitive prefix, as canonical's startsWith('0x').
+		if !validPubkey(pubkey) {
 			writeError(w, http.StatusBadRequest, []string{badPubkeyMessage})
-			return
+			return nil, false
 		}
 	}
-	s.findKeys(w, r, *body.Pubkeys, false)
+	if len(pubkeys) > maxFindPubkeys {
+		bodyTooLarge(w)
+		return nil, false
+	}
+	return pubkeys, true
+}
+
+// bodyTooLarge is what NestJS makes of Fastify's body-limit error: no "error" field, no newline.
+func bodyTooLarge(w http.ResponseWriter) {
+	body, _ := json.Marshal(struct {
+		StatusCode int    `json:"statusCode"`
+		Message    string `json:"message"`
+	}{http.StatusRequestEntityTooLarge, "Request body is too large"})
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusRequestEntityTooLarge)
+	w.Write(body)
 }
 
 func (s *Server) findKeys(w http.ResponseWriter, r *http.Request, pubkeys []string, notFoundWhenEmpty bool) {
@@ -361,11 +402,8 @@ func (s *Server) findKeys(w http.ResponseWriter, r *http.Request, pubkeys []stri
 }
 
 func (s *Server) handleModuleKeysFind(w http.ResponseWriter, r *http.Request) {
-	var body struct {
-		Pubkeys []string `json:"pubkeys"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		writeError(w, http.StatusBadRequest, []string{"pubkeys must be an array"})
+	pubkeys, ok := decodeFindBody(w, r)
+	if !ok {
 		return
 	}
 
@@ -403,7 +441,7 @@ func (s *Server) handleModuleKeysFind(w http.ResponseWriter, r *http.Request) {
 			return nil
 		}
 
-		keys, err := snap.KeysByPubkeys(ctx, module.RawAddress(), body.Pubkeys)
+		keys, err := snap.KeysByPubkeys(ctx, module.RawAddress(), pubkeys)
 		if err != nil {
 			return err
 		}

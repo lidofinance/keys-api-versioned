@@ -34,9 +34,9 @@ type DiffMeta struct {
 // A `since` outside retention answers 410: its closed rows are deleted, so the diff would
 // silently miss removals.
 func (a *App) DiffKeys(ctx context.Context, since, to string, moduleRef string, fn func(DiffKind, *model.Key) error) (*DiffMeta, error) {
-	conn, err := a.pool.Acquire(ctx)
+	conn, err := a.acquire(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("acquire: %w", err)
+		return nil, err
 	}
 	defer conn.Release()
 
@@ -188,9 +188,9 @@ func (s *appSnapshot) streamDiffSide(ctx context.Context, kind DiffKind, fromBlo
 // ModuleDiff compares the writer's content-derived stamps: a kilobyte answer to poll before a
 // key diff.
 func (a *App) ModuleDiff(ctx context.Context, since, to string) (map[int32]bool, error) {
-	conn, err := a.pool.Acquire(ctx)
+	conn, err := a.acquire(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("acquire: %w", err)
+		return nil, err
 	}
 	defer conn.Release()
 

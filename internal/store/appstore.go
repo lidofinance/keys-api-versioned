@@ -23,6 +23,8 @@ type App struct {
 	pool *pgxpool.Pool
 	pin  string
 	Log  *slog.Logger
+	// AcquireTimeout: zero means acquireTimeout.
+	AcquireTimeout time.Duration
 }
 
 func (a *App) logger() *slog.Logger {
@@ -65,10 +67,28 @@ func defaultPin(pin string) string {
 
 func (a *App) Close() { a.pool.Close() }
 
-func (a *App) Snapshot(ctx context.Context, fn func(Snapshot) error) error {
-	conn, err := a.pool.Acquire(ctx)
+// acquireTimeout: with the pool exhausted a request fails instead of queueing for as long as its
+// client waits.
+const acquireTimeout = 10 * time.Second
+
+func (a *App) acquire(ctx context.Context) (*pgxpool.Conn, error) {
+	timeout := a.AcquireTimeout
+	if timeout <= 0 {
+		timeout = acquireTimeout
+	}
+	acquireCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	conn, err := a.pool.Acquire(acquireCtx)
 	if err != nil {
-		return fmt.Errorf("acquire: %w", err)
+		return nil, fmt.Errorf("acquire: %w", err)
+	}
+	return conn, nil
+}
+
+func (a *App) Snapshot(ctx context.Context, fn func(Snapshot) error) error {
+	conn, err := a.acquire(ctx)
+	if err != nil {
+		return err
 	}
 	defer conn.Release()
 
@@ -95,7 +115,7 @@ func (a *App) Snapshot(ctx context.Context, fn func(Snapshot) error) error {
 }
 
 func (a *App) PinnedSnapshot(ctx context.Context, pin string, fn func(Snapshot) error) error {
-	return (&App{pool: a.pool, pin: defaultPin(pin), Log: a.Log}).Snapshot(ctx, fn)
+	return (&App{pool: a.pool, pin: defaultPin(pin), Log: a.Log, AcquireTimeout: a.AcquireTimeout}).Snapshot(ctx, fn)
 }
 
 // Pins resolve on block_number (the version's identity); the meta shows the observed head, which

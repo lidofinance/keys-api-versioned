@@ -1,7 +1,6 @@
 package api
 
 import (
-	"bufio"
 	"net/http"
 
 	"github.com/lidofinance/keys-api-versioned/internal/model"
@@ -60,7 +59,7 @@ func (s *Server) handleModuleOperatorsKeys(w http.ResponseWriter, r *http.Reques
 		}
 
 		w.Header().Set("Content-Type", "application/json")
-		bw := bufio.NewWriterSize(w, streamBufferSize)
+		bw, out := s.newStreamWriter(w)
 		defer bw.Flush()
 
 		bw.WriteString(`{ "meta": {"elBlockSnapshot":`)
@@ -78,7 +77,7 @@ func (s *Server) handleModuleOperatorsKeys(w http.ResponseWriter, r *http.Reques
 			}
 			first = false
 			writeKey(bw, k)
-			return nil
+			return out.Err()
 		}); err != nil {
 			return err
 		}
@@ -114,7 +113,7 @@ func (s *Server) handleModulesOperatorsKeysStream(w http.ResponseWriter, r *http
 		}
 
 		w.Header().Set("Content-Type", "application/json")
-		bw := bufio.NewWriterSize(w, streamBufferSize)
+		bw, out := s.newStreamWriter(w)
 		defer bw.Flush()
 
 		bw.WriteString(streamOpen)
@@ -148,7 +147,7 @@ func (s *Server) handleModulesOperatorsKeysStream(w http.ResponseWriter, r *http
 				bw.WriteString(`{"stakingModule":null,"meta":null,"key":`)
 				writeKey(bw, k)
 				bw.WriteString(`,"operator":null}`)
-				return nil
+				return out.Err()
 			}); err != nil {
 				return err
 			}

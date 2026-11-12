@@ -1,7 +1,6 @@
 package api
 
 import (
-	"bufio"
 	"net/http"
 	"strconv"
 
@@ -91,7 +90,7 @@ func (s *Server) handleKeysPage(w http.ResponseWriter, r *http.Request, filter m
 		}
 
 		w.Header().Set("Content-Type", "application/json")
-		bw := bufio.NewWriterSize(w, streamBufferSize)
+		bw, out := s.newStreamWriter(w)
 		defer bw.Flush()
 
 		bw.WriteString(`{ "meta": {"elBlockSnapshot":`)
@@ -110,7 +109,7 @@ func (s *Server) handleKeysPage(w http.ResponseWriter, r *http.Request, filter m
 				first = false
 				writeKey(bw, k)
 				returned++
-				return nil
+				return out.Err()
 			})
 		if err != nil {
 			return err

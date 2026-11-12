@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/lidofinance/keys-api-versioned/internal/store"
 )
@@ -23,6 +24,8 @@ type Config struct {
 	Log            *slog.Logger
 	MetricsHandler http.Handler
 	Observe        ObserveFunc
+	// StreamWriteTimeout: zero means streamWriteTimeout.
+	StreamWriteTimeout time.Duration
 }
 
 type Server struct {
@@ -33,6 +36,9 @@ type Server struct {
 func New(s store.Store, cfg Config) *Server {
 	if cfg.Log == nil {
 		cfg.Log = slog.New(slog.NewTextHandler(io.Discard, nil))
+	}
+	if cfg.StreamWriteTimeout <= 0 {
+		cfg.StreamWriteTimeout = streamWriteTimeout
 	}
 	return &Server{store: s, cfg: cfg}
 }
@@ -189,6 +195,7 @@ func writeJSON(w http.ResponseWriter, v any) error {
 		return err
 	}
 	w.Header().Set("Content-Type", "application/json")
+	extendWriteDeadline(w, streamWriteTimeout)
 	_, err = w.Write(body)
 	return err
 }
