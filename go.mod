@@ -1,6 +1,6 @@
 module github.com/lidofinance/keys-api-versioned
 
-go 1.25.1
+go 1.26.11
 
 require (
 	github.com/ethereum/go-ethereum v1.17.10
