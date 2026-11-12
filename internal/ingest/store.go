@@ -65,6 +65,27 @@ type ModuleKeys interface {
 	Abort(ctx context.Context)
 }
 
+// LeftoverReporter (optional) lists modules with rows above block published (0 = all), which only a
+// build that never published can have written.
+type LeftoverReporter interface {
+	Leftovers(ctx context.Context, published int64) ([]Leftover, error)
+}
+
+type Leftover struct {
+	ModuleID int32
+	// Complete: the attempt wrote the module row, which comes after its keys and operators, and
+	// nothing later touched the module. Block, BlockHash and Nonce are that row's.
+	Complete  bool
+	Block     int64
+	BlockHash string
+	Nonce     int64
+	Canonical bool
+}
+
+func (l Leftover) reusable(m model.StakingModule) bool {
+	return l.Complete && l.Canonical && l.Nonce == int64(m.Nonce)
+}
+
 type StoredVersion struct {
 	ID int64
 	// The point the data was read at: the version's identity, never moves.

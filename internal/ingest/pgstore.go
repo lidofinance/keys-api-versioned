@@ -358,6 +358,52 @@ func (s *PGStore) SupersedeFrom(ctx context.Context, block int64) (Superseded, e
 	return out, nil
 }
 
+func (s *PGStore) Leftovers(ctx context.Context, published int64) ([]Leftover, error) {
+	rows, err := s.pool.Query(ctx, `
+		with touched as (
+			select module_id from key_version where from_block > $1 or to_block > $1
+			union select module_id from operator_version where from_block > $1 or to_block > $1
+			union select module_id from module_version where from_block > $1 or to_block > $1
+		)
+		select t.module_id, m.from_block, m.nonce, v.block_hash,
+		       m.row_id is not null and v.block_hash is not null
+		       and not exists (select 1 from key_version k where k.module_id = t.module_id
+		                         and (k.from_block > m.from_block or k.to_block > m.from_block))
+		       and not exists (select 1 from operator_version o where o.module_id = t.module_id
+		                         and (o.from_block > m.from_block or o.to_block > m.from_block))
+		  from touched t
+		  left join module_version m
+		    on m.module_id = t.module_id and m.to_block is null and m.from_block > $1
+		  left join lateral (
+		        select min(block_hash) as block_hash from versions
+		         where block_number = m.from_block and status in ('building', 'superseded')
+		        having count(*) = 1) v on true`, published)
+	if err != nil {
+		return nil, fmt.Errorf("leftovers: %w", err)
+	}
+	defer rows.Close()
+
+	var out []Leftover
+	for rows.Next() {
+		var (
+			l     Leftover
+			id    int16
+			block *int64
+			nonce *int64
+			hash  *string
+		)
+		if err := rows.Scan(&id, &block, &nonce, &hash, &l.Complete); err != nil {
+			return nil, err
+		}
+		l.ModuleID = int32(id)
+		if l.Complete {
+			l.Block, l.Nonce, l.BlockHash = *block, *nonce, *hash
+		}
+		out = append(out, l)
+	}
+	return out, rows.Err()
+}
+
 // finalizedVersionBlock duplicates the reader's predicate in internal/store; a retention test
 // keeps the two in step.
 func finalizedVersionBlock(ctx context.Context, tx pgx.Tx) (int64, error) {
@@ -466,4 +512,7 @@ func blocksBelow(ctx context.Context, tx pgx.Tx, boundary int64) ([]int64, error
 // versionedTables in the order a rollback and a prune touch them.
 var versionedTables = []string{"key_version", "operator_version", "module_version"}
 
-var _ Store = (*PGStore)(nil)
+var (
+	_ Store            = (*PGStore)(nil)
+	_ LeftoverReporter = (*PGStore)(nil)
+)
