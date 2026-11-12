@@ -108,7 +108,7 @@ func TestLosingTheWriterSessionIsReported(t *testing.T) {
 	var terminated bool
 	err = db.Admin().QueryRow(ctx, `
 		select pg_terminate_backend(pid) from pg_locks
-		 where locktype = 'advisory' and objsubid = 2 and granted
+		 where locktype = 'advisory' and objsubid = 2 and classid = x'6b617069'::int::oid and granted
 		   and database = (select oid from pg_database where datname = current_database())`).Scan(&terminated)
 	if err != nil || !terminated {
 		t.Fatalf("terminate the lock's session: %v (terminated %t)", err, terminated)
@@ -159,7 +159,7 @@ func TestALostWriterLockStopsTheWriterAndTakesTheLockAgain(t *testing.T) {
 
 	if _, err := db.Admin().Exec(ctx, `
 		select pg_terminate_backend(pid) from pg_locks
-		 where locktype = 'advisory' and objsubid = 2 and granted
+		 where locktype = 'advisory' and objsubid = 2 and classid = x'6b617069'::int::oid and granted
 		   and database = (select oid from pg_database where datname = current_database())`); err != nil {
 		t.Fatal(err)
 	}

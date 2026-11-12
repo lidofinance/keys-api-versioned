@@ -360,9 +360,9 @@ func (s *PGStore) SupersedeFrom(ctx context.Context, block int64) (Superseded, e
 
 // finalizedVersionBlock duplicates the reader's predicate in internal/store; a retention test
 // keeps the two in step.
-func (s *PGStore) finalizedVersionBlock(ctx context.Context) (int64, error) {
+func finalizedVersionBlock(ctx context.Context, tx pgx.Tx) (int64, error) {
 	var block int64
-	err := s.pool.QueryRow(ctx, `
+	err := tx.QueryRow(ctx, `
 		select coalesce(max(block_number), 0) from versions
 		 where status in ('published', 'stale')
 		   and block_number <= (select coalesce(max(finalized_block_number), 0) from versions)`).
@@ -373,14 +373,21 @@ func (s *PGStore) finalizedVersionBlock(ctx context.Context) (int64, error) {
 	return block, nil
 }
 
-// Prune never touches rows still open, whatever the window.
+// Prune never touches rows still open, whatever the window. One transaction, versions first: a
+// reader resolving a pin at the same moment sees the version and its rows, or neither.
 func (s *PGStore) Prune(ctx context.Context, keep int) (Pruned, error) {
 	var out Pruned
 	if keep <= 0 {
 		return out, nil
 	}
 
-	err := s.pool.QueryRow(ctx, `
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return out, err
+	}
+	defer tx.Rollback(ctx)
+
+	err = tx.QueryRow(ctx, `
 		select coalesce(min(block_number), 0) from (
 			select block_number from versions order by block_number desc limit $1
 		) k`, keep).Scan(&out.OldestKept)
@@ -390,25 +397,11 @@ func (s *PGStore) Prune(ctx context.Context, keep int) (Pruned, error) {
 	if out.OldestKept == 0 {
 		return out, nil
 	}
-
-	// Hold the boundary at the oldest leased version: deleting rows mid-stream would corrupt a
-	// response. Held versions are pruned on a later cycle.
 	boundary := out.OldestKept
-	leased, err := store.LeasedVersions(ctx, s.pool)
-	if err != nil {
-		// Must not fall back to deleting: an unreadable lease set means usage is unknown.
-		return out, fmt.Errorf("prune held back, lease set unreadable: %w", err)
-	}
-	for _, block := range leased {
-		if block < boundary {
-			boundary = block
-			out.HeldAt = block
-		}
-	}
 
 	// The finalized version is held too: retention counts versions while finality (~13 min) is time,
 	// and at one rebuild per minute or two it sits near the window's edge.
-	finalizedVersion, err := s.finalizedVersionBlock(ctx)
+	finalizedVersion, err := finalizedVersionBlock(ctx, tx)
 	if err != nil {
 		return out, fmt.Errorf("prune held back, finalized version unreadable: %w", err)
 	}
@@ -417,8 +410,32 @@ func (s *PGStore) Prune(ctx context.Context, keep int) (Pruned, error) {
 		out.HeldAt = finalizedVersion
 	}
 
+	// A leased version holds the boundary at itself: deleting rows mid-stream would corrupt a
+	// response. Held versions are pruned on a later cycle.
+	doomed, err := blocksBelow(ctx, tx, boundary)
+	if err != nil {
+		return out, err
+	}
+	for _, block := range doomed {
+		claimed, err := store.TryClaimForPrune(ctx, tx, block)
+		if err != nil {
+			return out, err
+		}
+		if !claimed {
+			boundary = block
+			out.HeldAt = block
+			break
+		}
+	}
+
+	tag, err := tx.Exec(ctx, `delete from versions where block_number < $1`, boundary)
+	if err != nil {
+		return out, fmt.Errorf("prune versions: %w", err)
+	}
+	out.Versions = tag.RowsAffected()
+
 	for _, table := range versionedTables {
-		tag, err := s.pool.Exec(ctx, `delete from `+table+`
+		tag, err := tx.Exec(ctx, `delete from `+table+`
 			where to_block is not null and to_block <= $1`, boundary)
 		if err != nil {
 			return out, fmt.Errorf("prune %s: %w", table, err)
@@ -426,12 +443,24 @@ func (s *PGStore) Prune(ctx context.Context, keep int) (Pruned, error) {
 		out.Rows += tag.RowsAffected()
 	}
 
-	tag, err := s.pool.Exec(ctx, `delete from versions where block_number < $1`, boundary)
-	if err != nil {
-		return out, fmt.Errorf("prune versions: %w", err)
+	if pruneBeforeCommit != nil {
+		pruneBeforeCommit()
 	}
-	out.Versions = tag.RowsAffected()
+	if err := tx.Commit(ctx); err != nil {
+		return out, fmt.Errorf("commit prune: %w", err)
+	}
 	return out, nil
+}
+
+var pruneBeforeCommit func()
+
+func blocksBelow(ctx context.Context, tx pgx.Tx, boundary int64) ([]int64, error) {
+	rows, err := tx.Query(ctx, `select distinct block_number from versions
+		where block_number < $1 order by block_number`, boundary)
+	if err != nil {
+		return nil, fmt.Errorf("versions to prune: %w", err)
+	}
+	return pgx.CollectRows(rows, pgx.RowTo[int64])
 }
 
 // versionedTables in the order a rollback and a prune touch them.

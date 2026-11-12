@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/lidofinance/keys-api-versioned/internal/store"
 	"github.com/lidofinance/keys-api-versioned/internal/testpg"
 	"github.com/lidofinance/keys-api-versioned/internal/testreg"
 )
@@ -93,7 +94,7 @@ func TestALeaseLeftOnAPooledConnectionHoldsRetention(t *testing.T) {
 	if err != nil {
 		t.Fatalf("acquire: %v", err)
 	}
-	if _, err := conn.Exec(ctx, `select pg_advisory_lock_shared($1)`, old.BlockNumber); err != nil {
+	if _, err := store.LeaseVersion(ctx, conn, old.BlockNumber); err != nil {
 		t.Fatalf("take a lease by hand: %v", err)
 	}
 	conn.Release() // back to the pool, lock still held

@@ -99,19 +99,25 @@ func (a *App) Snapshot(ctx context.Context, fn func(Snapshot) error) error {
 	if meta != nil {
 		// Lease the version for the whole response: retention deletes, and a 211 MiB dump to a slow
 		// consumer can outlive the retention window.
-		release, err := leaseVersion(ctx, conn, block)
+		release, err := LeaseVersion(ctx, conn, block)
 		if err != nil {
 			return err
 		}
 		defer release()
 	}
+	snap := &appSnapshot{conn: conn, meta: meta, versionID: versionID, block: block,
+		stale: status == StatusStale, log: a.logger()}
 	if meta != nil {
+		// Retention claims a version's lease before deleting it, so a pin resolved just before a prune
+		// is caught here, after the lease, rather than by a short response.
+		if err := snap.stillOnChain(ctx); err != nil {
+			return err
+		}
 		a.logger().Debug("snapshot resolved", "pin", a.pin, "version_block", block,
 			"confirmed_at", meta.BlockNumber, "status", status,
 			"last_changed", meta.LastChangedBlockHash)
 	}
-	return fn(&appSnapshot{conn: conn, meta: meta, versionID: versionID, block: block,
-		stale: status == StatusStale, log: a.logger()})
+	return fn(snap)
 }
 
 func (a *App) PinnedSnapshot(ctx context.Context, pin string, fn func(Snapshot) error) error {
@@ -581,7 +587,15 @@ func (s *appSnapshot) Operators(ctx context.Context, moduleAddress string, f mod
 		o.ModuleAddress = checksummed
 		out = append(out, o)
 	}
-	return out, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	// Checked after, not before: operators are the last statement of the grouped stream, and a
+	// rollback landing before it would pair pre-reorg keys with reopened operator rows.
+	if err := s.stillOnChain(ctx); err != nil {
+		return nil, err
+	}
+	return out, nil
 }
 
 var (
