@@ -3,7 +3,9 @@ package e2e
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
+	"net/http"
 	"testing"
 
 	"github.com/lidofinance/keys-api-versioned/internal/testpg"
@@ -55,6 +57,28 @@ func TestKeysStreamInCanonicalOrderAfterARewrite(t *testing.T) {
 				t.Errorf("%s: key %d.%d comes after %d.%d", path, b.OperatorIndex, b.Index, a.OperatorIndex, a.Index)
 				break
 			}
+		}
+	}
+}
+
+// int32(4294967296) is 0: the filter served operator 0's keys, the path served operator 0.
+func TestAnOperatorIndexBeyondInt32IsNotOperatorZero(t *testing.T) {
+	db := testpg.New(t)
+	ctx := context.Background()
+	testreg.Spec{Modules: 1, OperatorsPerModule: 2, KeysPerOperator: 2}.Publish(ctx, t, db.Writer, testreg.At(db.Block(0)))
+	srv := testpg.NewServer(t, db.Reader(t, "latest", 2))
+
+	for path, want := range map[string]int{
+		"/v1/modules/1/operators/4294967296":                                       http.StatusNotFound,
+		"/v1/keys?operatorIndex=4294967296":                                        http.StatusBadRequest,
+		"/v1/modules/1/keys?operatorIndex=4294967296":                              http.StatusBadRequest,
+		fmt.Sprintf("/ext/v1/keys?limit=10&cursor=%d.1.4294967296.0", db.Block(0)): http.StatusBadRequest,
+	} {
+		resp := srv.Get(t, path)
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode != want {
+			t.Errorf("GET %s: %d %.120s, want %d", path, resp.StatusCode, body, want)
 		}
 	}
 }

@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"errors"
+	"math"
 	"net/http"
 	"strconv"
 
@@ -13,7 +14,7 @@ import (
 func parseOperatorsFilter(r *http.Request) (model.OperatorsFilter, error) {
 	var f model.OperatorsFilter
 	if v := r.URL.Query().Get("operatorIndex"); v != "" {
-		n, err := strconv.Atoi(v)
+		n, err := strconv.ParseInt(v, 10, 32)
 		if err != nil || n < 0 {
 			return f, errBadRequest{[]string{"operatorIndex must be an integer number", "operatorIndex must not be less than 0"}}
 		}
@@ -167,12 +168,16 @@ func (s *Server) handleModuleOperator(w http.ResponseWriter, r *http.Request) {
 	ref := r.PathValue("module_id")
 	operatorRef := r.PathValue("operator_id")
 
-	index, err := strconv.Atoi(operatorRef)
+	index, err := strconv.ParseInt(operatorRef, 10, 64)
 	if err != nil || index < 0 {
 		writeError(w, http.StatusBadRequest, []string{"operator_id must be an integer number"})
 		return
 	}
-	wanted := int32(index)
+	// Beyond int32 no operator exists: canonical's 404, where int32(index) used to wrap to a real one.
+	wanted := int32(-1)
+	if index <= math.MaxInt32 {
+		wanted = int32(index)
+	}
 
 	ctx := r.Context()
 	err = s.snapshot(ctx, r, func(snap store.Snapshot) error {

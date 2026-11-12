@@ -33,7 +33,8 @@ func parseFilter(r *http.Request, withAddresses bool) (model.KeysFilter, error) 
 	}
 
 	if v := q.Get("operatorIndex"); v != "" {
-		n, err := strconv.Atoi(v)
+		// 32 bits: int32(n) of 4294967296 was operator 0. Canonical answers 500 there.
+		n, err := strconv.ParseInt(v, 10, 32)
 		if err != nil || n < 0 {
 			return f, errBadRequest{[]string{"operatorIndex must be an integer number", "operatorIndex must not be less than 0"}}
 		}
