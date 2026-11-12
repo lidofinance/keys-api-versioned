@@ -344,15 +344,9 @@ func decodeFindBody(w http.ResponseWriter, r *http.Request) ([]string, bool) {
 	return pubkeys, true
 }
 
-// bodyTooLarge is what NestJS makes of Fastify's body-limit error: no "error" field, no newline.
+// bodyTooLarge is what NestJS makes of Fastify's body-limit error.
 func bodyTooLarge(w http.ResponseWriter) {
-	body, _ := json.Marshal(struct {
-		StatusCode int    `json:"statusCode"`
-		Message    string `json:"message"`
-	}{http.StatusRequestEntityTooLarge, "Request body is too large"})
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusRequestEntityTooLarge)
-	w.Write(body)
+	writeStatusMessage(w, http.StatusRequestEntityTooLarge, "Request body is too large")
 }
 
 func (s *Server) findKeys(w http.ResponseWriter, r *http.Request, pubkeys []string, notFoundWhenEmpty bool) {

@@ -119,7 +119,7 @@ Against canonical 4.0.1, both following Hoodi: **17 of 21 agreed, now 21 of 21.*
 | `POST /v1/keys/find` with the wrong field name | 400 | 200, no keys | a typo in the field name looked like an empty result |
 | `POST /v1/keys` | 404 `Cannot POST /v1/keys` | 405 | Go is right and Fastify is not, but on their surface theirs wins |
 
-And one systematic difference the run surfaced that no single case is about: **every error body was missing `error`.** The canonical service sends `{message, error, statusCode}`; the field was declared in our struct and never set, so a consumer logging or matching on it saw a difference on every failure rather than on an edge case.
+And one systematic difference the run surfaced that no single case is about: **every error body was missing `error`.** The canonical service sends `{message, error, statusCode}`; the field was declared in our struct and never set, so a consumer logging or matching on it saw a difference on every failure rather than on an edge case. Two answers do not have it there either: the 425 before the first sync and a 500 are a bare `HttpException` and an unknown error to NestJS, so their body is just `{"statusCode":…,"message":…}` — and no error body ends in a newline.
 
 Also confirmed, because the whole `/ext/v1` split rests on it: the canonical service really does ignore a query parameter it does not declare — `?limit=3`, `?snapshot=12345` and `?nonsense=1` all answer 200 there, which is why `/v1` ignores ours instead of answering 400.
 

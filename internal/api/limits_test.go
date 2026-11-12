@@ -20,6 +20,8 @@ import (
 // memStore serves one module of generated keys and records how each key stream ended.
 type memStore struct {
 	keys int
+	// early: no published version yet.
+	early bool
 
 	mu      sync.Mutex
 	streams []error
@@ -41,7 +43,10 @@ var memModule = func() model.StakingModule {
 	return mod
 }()
 
-func (memSnapshot) ELMeta(context.Context) (*model.ELBlockSnapshot, error) {
+func (s memSnapshot) ELMeta(context.Context) (*model.ELBlockSnapshot, error) {
+	if s.m.early {
+		return nil, nil
+	}
 	return &model.ELBlockSnapshot{BlockNumber: 1, BlockHash: "0x01", Timestamp: 1}, nil
 }
 

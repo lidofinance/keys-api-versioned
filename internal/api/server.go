@@ -207,23 +207,36 @@ type httpError struct {
 	StatusCode int    `json:"statusCode"`
 }
 
+// writeError is NestJS's body for its typed exceptions (BadRequest, NotFound); no trailing newline,
+// as Fastify sends none.
 func writeError(w http.ResponseWriter, status int, message any) {
+	writeErrorBody(w, status, httpError{Message: message, Error: http.StatusText(status), StatusCode: status})
+}
+
+// writeStatusMessage is NestJS's body for a bare HttpException and for an unknown error.
+func writeStatusMessage(w http.ResponseWriter, status int, message string) {
+	writeErrorBody(w, status, struct {
+		StatusCode int    `json:"statusCode"`
+		Message    string `json:"message"`
+	}{status, message})
+}
+
+func writeErrorBody(w http.ResponseWriter, status int, v any) {
+	body, _ := json.Marshal(v)
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-	json.NewEncoder(w).Encode(httpError{
-		Message: message, Error: http.StatusText(status), StatusCode: status,
-	})
+	w.Write(body)
 }
 
 // internalError keeps the cause in the log: its text names the database, its user and tables, and
 // the canonical service answers a bare "Internal server error".
 func (s *Server) internalError(w http.ResponseWriter, r *http.Request, err error) {
 	s.cfg.Log.Error("request failed", "method", r.Method, "path", r.URL.Path, "err", err)
-	writeError(w, http.StatusInternalServerError, "Internal server error")
+	writeStatusMessage(w, http.StatusInternalServerError, "Internal server error")
 }
 
 func tooEarly(w http.ResponseWriter) {
-	writeError(w, http.StatusTooEarly, "Too early response")
+	writeStatusMessage(w, http.StatusTooEarly, "Too early response")
 }
 
 // writeStoreError maps snapshot failures to distinct statuses: "not yet" vs "gone" vs "off-chain".

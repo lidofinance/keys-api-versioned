@@ -43,3 +43,29 @@ func TestA500BodyHidesTheCauseAndTheLogKeepsIt(t *testing.T) {
 		t.Fatalf("the cause should be logged:\n%s", logs.String())
 	}
 }
+
+// Bodies as canonical 5.0.0 sends them, byte for byte: a bare HttpException and an unknown error
+// carry only statusCode and message, typed exceptions add error, and none ends in a newline.
+func TestErrorBodiesMatchTheCanonicalBytes(t *testing.T) {
+	early := newMemStore(1)
+	early.early = true
+	for _, tc := range []struct {
+		name  string
+		store store.Store
+		path  string
+		want  string
+	}{
+		{"unknown error", failingStore{errors.New("db down")}, "/v1/modules",
+			`{"statusCode":500,"message":"Internal server error"}`},
+		{"too early", early, "/v1/keys",
+			`{"statusCode":425,"message":"Too early response"}`},
+		{"not found", newMemStore(1), "/v1/modules/99/keys",
+			`{"message":"Module with moduleId 99 is not supported","error":"Not Found","statusCode":404}`},
+	} {
+		rec := httptest.NewRecorder()
+		New(tc.store, Config{ChainID: 1}).Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, tc.path, nil))
+		if got := rec.Body.String(); got != tc.want {
+			t.Errorf("%s: body %q, want %q", tc.name, got, tc.want)
+		}
+	}
+}
