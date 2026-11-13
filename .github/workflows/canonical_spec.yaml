@@ -1,0 +1,25 @@
+name: Canonical spec
+
+# The /v1 and /v2 contract is the canonical service's OpenAPI document, kept in
+# internal/api/testdata. A new canonical release changes what is deployed, not this repo,
+# so nothing else here would notice. A failure means: run `make canonical-spec`, then
+# `go test ./internal/api/` lists what openapi.yaml and the service are missing.
+on:
+  schedule:
+    - cron: '0 6 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out the repo
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Compare with the mainnet deployment
+        run: make canonical-spec-check

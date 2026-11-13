@@ -1,0 +1,1742 @@
+{
+  "components": {
+    "schemas": {
+      "CLBlockSnapshot": {
+        "properties": {
+          "blockHash": {
+            "description": "Hash of the execution layer block the state of `slot` holds. Like `blockNumber`, it can be the same as in the snapshot before it since the Glamsterdam fork (EIP-7732).",
+            "type": "string"
+          },
+          "blockNumber": {
+            "description": "Number of the execution layer block the state of `slot` holds. Since the Glamsterdam fork (EIP-7732) it can be the same as in the snapshot before it, because a slot does not always add an execution layer block: that happens at the first slot of the fork, and every time a builder does not reveal its payload in time. Tell snapshots apart by `slot`, which always moves forward.",
+            "type": "number"
+          },
+          "epoch": {
+            "description": "Current epoch",
+            "type": "number"
+          },
+          "payloadSlot": {
+            "description": "Slot whose execution payload `blockNumber`, `blockHash` and `timestamp` describe. Not set before the Glamsterdam fork (EIP-7732), where a block carries its own payload and the payload slot is always `slot` itself. Since the fork it is normally the parent slot, and it goes further back when the builder of the parent did not reveal its payload in time, or when slots before `slot` were missed.",
+            "type": "number"
+          },
+          "root": {
+            "description": "Slot root",
+            "type": "string"
+          },
+          "slot": {
+            "description": "Slot value",
+            "type": "number"
+          },
+          "timestamp": {
+            "description": "Timestamp of the execution layer block. Since the Glamsterdam fork (EIP-7732) this is the time of `payloadSlot` and not of `slot`, so it is at least one slot behind. Take the time of `slot` from the slot number itself when that is what is needed.",
+            "type": "number"
+          }
+        },
+        "required": [
+          "epoch",
+          "root",
+          "slot",
+          "blockNumber",
+          "timestamp",
+          "blockHash"
+        ],
+        "type": "object"
+      },
+      "CLMeta": {
+        "properties": {
+          "clBlockSnapshot": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/CLBlockSnapshot"
+              }
+            ],
+            "description": "Consensus layer block information"
+          }
+        },
+        "required": [
+          "clBlockSnapshot"
+        ],
+        "type": "object"
+      },
+      "ELBlockSnapshot": {
+        "properties": {
+          "blockHash": {
+            "description": "Block hash",
+            "type": "string"
+          },
+          "blockNumber": {
+            "description": "Block number",
+            "type": "number"
+          },
+          "lastChangedBlockHash": {
+            "description": "Last changed block hash — used to determine that a change has been made to this block",
+            "type": "string"
+          },
+          "timestamp": {
+            "description": "Block timestamp",
+            "type": "number"
+          }
+        },
+        "required": [
+          "blockNumber",
+          "blockHash",
+          "timestamp",
+          "lastChangedBlockHash"
+        ],
+        "type": "object"
+      },
+      "ELMeta": {
+        "properties": {
+          "elBlockSnapshot": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/ELBlockSnapshot"
+              }
+            ],
+            "description": "Execution layer block information"
+          }
+        },
+        "required": [
+          "elBlockSnapshot"
+        ],
+        "type": "object"
+      },
+      "ExitPresignMessage": {
+        "properties": {
+          "epoch": {
+            "description": "Finalized epoch of the consensus slot the validators were read at.",
+            "type": "string"
+          },
+          "validator_index": {
+            "description": "Index of validator",
+            "type": "string"
+          }
+        },
+        "required": [
+          "validator_index",
+          "epoch"
+        ],
+        "type": "object"
+      },
+      "ExitPresignMessageListResponse": {
+        "properties": {
+          "data": {
+            "description": "Voluntary exit message list",
+            "items": {
+              "$ref": "#/components/schemas/ExitPresignMessage"
+            },
+            "type": "array"
+          },
+          "meta": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/CLMeta"
+              }
+            ],
+            "description": "Meta for voluntary exit endpoints"
+          }
+        },
+        "required": [
+          "data",
+          "meta"
+        ],
+        "type": "object"
+      },
+      "ExitValidator": {
+        "properties": {
+          "key": {
+            "description": "Public key",
+            "type": "string"
+          },
+          "validatorIndex": {
+            "description": "Index of validator",
+            "type": "number"
+          }
+        },
+        "required": [
+          "validatorIndex",
+          "key"
+        ],
+        "type": "object"
+      },
+      "ExitValidatorListResponse": {
+        "properties": {
+          "data": {
+            "description": "N oldest validators for current epoch when voluntary exit can be processed",
+            "items": {
+              "$ref": "#/components/schemas/ExitValidator"
+            },
+            "type": "array"
+          },
+          "meta": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/CLMeta"
+              }
+            ],
+            "description": "Meta for voluntary exit endpoints"
+          }
+        },
+        "required": [
+          "data",
+          "meta"
+        ],
+        "type": "object"
+      },
+      "GroupedByModuleKeyListResponse": {
+        "properties": {
+          "data": {
+            "description": "Keys for all modules grouped by staking router module",
+            "items": {
+              "$ref": "#/components/schemas/KeyListWithModule"
+            },
+            "type": "array"
+          },
+          "meta": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/ELMeta"
+              }
+            ],
+            "description": "Meta"
+          }
+        },
+        "required": [
+          "data",
+          "meta"
+        ],
+        "type": "object"
+      },
+      "GroupedByModuleOperatorListResponse": {
+        "properties": {
+          "data": {
+            "description": "Operators for all modules grouped by staking router module",
+            "items": {
+              "$ref": "#/components/schemas/OperatorListAndSRModule"
+            },
+            "type": "array"
+          },
+          "meta": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/ELMeta"
+              }
+            ],
+            "description": "Meta"
+          }
+        },
+        "required": [
+          "data",
+          "meta"
+        ],
+        "type": "object"
+      },
+      "InternalServerErrorException": {
+        "properties": {},
+        "type": "object"
+      },
+      "Key": {
+        "properties": {
+          "depositSignature": {
+            "description": "Signing key",
+            "type": "string"
+          },
+          "index": {
+            "description": "Key index",
+            "type": "number"
+          },
+          "key": {
+            "description": "Public key",
+            "type": "string"
+          },
+          "moduleAddress": {
+            "description": "Module address",
+            "type": "string"
+          },
+          "operatorIndex": {
+            "description": "Operator index",
+            "type": "number"
+          },
+          "used": {
+            "description": "Used key status",
+            "type": "boolean"
+          },
+          "vetted": {
+            "description": "Vetted key status",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "index",
+          "key",
+          "depositSignature",
+          "operatorIndex",
+          "used",
+          "moduleAddress",
+          "vetted"
+        ],
+        "type": "object"
+      },
+      "KeyListResponse": {
+        "properties": {
+          "data": {
+            "description": "List of keys for all modules",
+            "items": {
+              "$ref": "#/components/schemas/Key"
+            },
+            "type": "array"
+          },
+          "meta": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/ELMeta"
+              }
+            ],
+            "description": "Meta"
+          }
+        },
+        "required": [
+          "data",
+          "meta"
+        ],
+        "type": "object"
+      },
+      "KeyListWithModule": {
+        "properties": {
+          "keys": {
+            "description": "Keys of staking router module",
+            "items": {
+              "$ref": "#/components/schemas/Key"
+            },
+            "type": "array"
+          },
+          "module": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/StakingModuleResponse"
+              }
+            ],
+            "description": "Detailed Staking Router information"
+          }
+        },
+        "required": [
+          "keys",
+          "module"
+        ],
+        "type": "object"
+      },
+      "KeysFindBody": {
+        "properties": {
+          "pubkeys": {
+            "description": "Public keys list",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "pubkeys"
+        ],
+        "type": "object"
+      },
+      "NotFoundException": {
+        "properties": {},
+        "type": "object"
+      },
+      "Operator": {
+        "properties": {
+          "active": {
+            "description": "This value shows if node operator active",
+            "type": "boolean"
+          },
+          "depositableValidatorsCount": {
+            "description": "Number of validators that are ready for deposit",
+            "type": "number"
+          },
+          "index": {
+            "description": "Index of Operator",
+            "type": "number"
+          },
+          "moduleAddress": {
+            "description": "Module address",
+            "type": "string"
+          },
+          "name": {
+            "description": "Operator name",
+            "type": "string"
+          },
+          "rewardAddress": {
+            "description": "Ethereum 1 address which receives stETH rewards for this operator",
+            "type": "string"
+          },
+          "stakingLimit": {
+            "description": "The number of keys vetted by the DAO and that can be used for the deposit",
+            "type": "number"
+          },
+          "stoppedValidators": {
+            "description": "Amount of stopped validators",
+            "type": "number"
+          },
+          "totalSigningKeys": {
+            "description": "Total signing keys amount",
+            "type": "number"
+          },
+          "totalWithdrawnKeys": {
+            "description": "Total number of withdrawn keys for the operator. Set for community-onchain-v1 and curated-onchain-v2 module types, null for other module types",
+            "nullable": true,
+            "type": "number"
+          },
+          "usedSigningKeys": {
+            "description": "Amount of used signing keys",
+            "type": "number"
+          }
+        },
+        "required": [
+          "index",
+          "active",
+          "name",
+          "rewardAddress",
+          "stakingLimit",
+          "stoppedValidators",
+          "totalSigningKeys",
+          "usedSigningKeys",
+          "moduleAddress",
+          "depositableValidatorsCount",
+          "totalWithdrawnKeys"
+        ],
+        "type": "object"
+      },
+      "OperatorAndSRModule": {
+        "properties": {
+          "module": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/StakingModuleResponse"
+              }
+            ],
+            "description": "Detailed Staking Router information"
+          },
+          "operator": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/Operator"
+              }
+            ],
+            "description": "Operator of staking router module"
+          }
+        },
+        "required": [
+          "operator",
+          "module"
+        ],
+        "type": "object"
+      },
+      "OperatorListAndSRModule": {
+        "properties": {
+          "module": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/StakingModuleResponse"
+              }
+            ],
+            "description": "Detailed Staking Router information"
+          },
+          "operators": {
+            "description": "Operators of staking router module",
+            "items": {
+              "$ref": "#/components/schemas/Operator"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "operators",
+          "module"
+        ],
+        "type": "object"
+      },
+      "SRKeyListWithModule": {
+        "properties": {
+          "keys": {
+            "description": "Keys of staking router module",
+            "items": {
+              "$ref": "#/components/schemas/Key"
+            },
+            "type": "array"
+          },
+          "module": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/StakingModuleResponse"
+              }
+            ],
+            "description": "Detailed Staking Router information"
+          }
+        },
+        "required": [
+          "keys",
+          "module"
+        ],
+        "type": "object"
+      },
+      "SRModuleKeyListResponse": {
+        "properties": {
+          "data": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/SRKeyListWithModule"
+              }
+            ],
+            "description": "Staking router module keys"
+          },
+          "meta": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/ELMeta"
+              }
+            ],
+            "description": "Meta"
+          }
+        },
+        "required": [
+          "data",
+          "meta"
+        ],
+        "type": "object"
+      },
+      "SRModuleListResponse": {
+        "properties": {
+          "data": {
+            "description": "List of staking router modules with detailed information",
+            "items": {
+              "$ref": "#/components/schemas/StakingModuleResponse"
+            },
+            "type": "array"
+          },
+          "elBlockSnapshot": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/ELBlockSnapshot"
+              }
+            ],
+            "description": "Execution layer block information"
+          }
+        },
+        "required": [
+          "data",
+          "elBlockSnapshot"
+        ],
+        "type": "object"
+      },
+      "SRModuleOperatorListResponse": {
+        "properties": {
+          "data": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/OperatorListAndSRModule"
+              }
+            ],
+            "description": "Staking router module operators"
+          },
+          "meta": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/ELMeta"
+              }
+            ],
+            "description": "Meta"
+          }
+        },
+        "required": [
+          "data",
+          "meta"
+        ],
+        "type": "object"
+      },
+      "SRModuleOperatorResponse": {
+        "properties": {
+          "data": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/OperatorAndSRModule"
+              }
+            ],
+            "description": "Staking router module keys"
+          },
+          "meta": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/ELMeta"
+              }
+            ],
+            "description": "Meta"
+          }
+        },
+        "required": [
+          "data",
+          "meta"
+        ],
+        "type": "object"
+      },
+      "SRModuleOperatorsKeysResponse": {
+        "properties": {
+          "data": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/SROperatorsKeysModule"
+              }
+            ],
+            "description": "Staking router module keys"
+          },
+          "meta": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/ELMeta"
+              }
+            ],
+            "description": "Meta"
+          }
+        },
+        "required": [
+          "data",
+          "meta"
+        ],
+        "type": "object"
+      },
+      "SRModuleResponse": {
+        "properties": {
+          "data": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/StakingModuleResponse"
+              }
+            ],
+            "description": "Detailed staking router module information"
+          },
+          "elBlockSnapshot": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/ELBlockSnapshot"
+              }
+            ],
+            "description": "Execution layer block information"
+          }
+        },
+        "required": [
+          "data",
+          "elBlockSnapshot"
+        ],
+        "type": "object"
+      },
+      "SRModulesOperatorsKeysStreamResponse": {
+        "properties": {
+          "key": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/Key"
+              }
+            ],
+            "description": "Key of staking router module",
+            "nullable": true
+          },
+          "meta": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/ELMeta"
+              }
+            ],
+            "description": "Meta",
+            "nullable": true
+          },
+          "operator": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/Operator"
+              }
+            ],
+            "description": "Operator of staking router module",
+            "nullable": true
+          },
+          "stakingModule": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/StakingModuleResponse"
+              }
+            ],
+            "description": "Staking Router module",
+            "nullable": true
+          }
+        },
+        "required": [
+          "operator",
+          "key",
+          "stakingModule",
+          "meta"
+        ],
+        "type": "object"
+      },
+      "SROperatorsKeysModule": {
+        "properties": {
+          "keys": {
+            "description": "Keys of staking router module",
+            "items": {
+              "$ref": "#/components/schemas/Key"
+            },
+            "type": "array"
+          },
+          "module": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/StakingModuleResponse"
+              }
+            ],
+            "description": "Detailed Staking Router information"
+          },
+          "operators": {
+            "description": "Operators of staking router module",
+            "items": {
+              "$ref": "#/components/schemas/Operator"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "operators",
+          "keys",
+          "module"
+        ],
+        "type": "object"
+      },
+      "StakingModuleResponse": {
+        "properties": {
+          "active": {
+            "description": "Module activation status",
+            "type": "boolean"
+          },
+          "exitedValidatorsCount": {
+            "description": "Exited validators count",
+            "type": "number"
+          },
+          "id": {
+            "description": "Unique id of the module",
+            "type": "number"
+          },
+          "lastChangedBlockHash": {
+            "description": "Last changed block hash — used to determine that a change has been made to this staking module",
+            "type": "string"
+          },
+          "lastDepositAt": {
+            "description": "block.timestamp of the last deposit of the module",
+            "type": "number"
+          },
+          "lastDepositBlock": {
+            "description": "block.number of the last deposit of the module",
+            "type": "number"
+          },
+          "moduleFee": {
+            "description": "Reward fee of the module",
+            "type": "number"
+          },
+          "name": {
+            "description": "Name of module",
+            "type": "string"
+          },
+          "nonce": {
+            "description": "Counter that MUST change value if keys were added, removed, node operator was activated/deactivated, a node operator's ready to deposit keys count is changed",
+            "type": "number"
+          },
+          "stakingModuleAddress": {
+            "description": "Address of module",
+            "type": "string"
+          },
+          "status": {
+            "description": "Module status if module can not accept the deposits or can participate in further reward distribution",
+            "type": "number"
+          },
+          "targetShare": {
+            "description": "Target percent of total keys in protocol, in BP",
+            "type": "number"
+          },
+          "treasuryFee": {
+            "description": "Treasury fee",
+            "type": "number"
+          },
+          "type": {
+            "description": "Type of module",
+            "type": "string"
+          },
+          "withdrawalCredentialsType": {
+            "description": "Withdrawal credentials type: 1 (0x01 legacy withdrawal credentials) or 2 (compounding withdrawal credentials type)",
+            "enum": [
+              1,
+              2
+            ],
+            "type": "number"
+          }
+        },
+        "required": [
+          "nonce",
+          "type",
+          "id",
+          "stakingModuleAddress",
+          "moduleFee",
+          "treasuryFee",
+          "targetShare",
+          "status",
+          "name",
+          "lastDepositAt",
+          "lastDepositBlock",
+          "exitedValidatorsCount",
+          "active",
+          "lastChangedBlockHash",
+          "withdrawalCredentialsType"
+        ],
+        "type": "object"
+      },
+      "Status": {
+        "properties": {
+          "appVersion": {
+            "description": "App version",
+            "type": "string"
+          },
+          "chainId": {
+            "description": "Chain id",
+            "type": "number"
+          },
+          "clBlockSnapshot": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/CLBlockSnapshot"
+              }
+            ],
+            "description": "Consensus layer block information",
+            "nullable": true
+          },
+          "elBlockSnapshot": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/ELBlockSnapshot"
+              }
+            ],
+            "description": "Execution layer block information",
+            "nullable": true
+          }
+        },
+        "required": [
+          "appVersion",
+          "chainId",
+          "elBlockSnapshot",
+          "clBlockSnapshot"
+        ],
+        "type": "object"
+      },
+      "TooEarlyResponse": {
+        "properties": {
+          "message": {
+            "default": "Too early response",
+            "enum": [
+              "Too early response"
+            ],
+            "type": "string"
+          },
+          "statusCode": {
+            "default": 425,
+            "enum": [
+              425
+            ],
+            "type": "number"
+          }
+        },
+        "required": [
+          "statusCode",
+          "message"
+        ],
+        "type": "object"
+      }
+    }
+  },
+  "info": {
+    "contact": {},
+    "description": "",
+    "title": "Lido Node Operators keys service",
+    "version": "5.0.0"
+  },
+  "openapi": "3.0.0",
+  "paths": {
+    "/v1/keys": {
+      "get": {
+        "operationId": "KeysController_get_v1",
+        "parameters": [
+          {
+            "description": "Filter to get used keys. Possible values: true/false. If this value is not specified endpoint will return all keys.",
+            "in": "query",
+            "name": "used",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "description": "Filter for operator with specified index. If this value is not specified endpoint will return keys for all operators.",
+            "in": "query",
+            "name": "operatorIndex",
+            "required": false,
+            "schema": {
+              "type": "number"
+            }
+          },
+          {
+            "description": "Module address list",
+            "in": "query",
+            "name": "moduleAddresses",
+            "required": false,
+            "schema": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/KeyListResponse"
+                }
+              }
+            },
+            "description": "List of all keys"
+          },
+          "425": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TooEarlyResponse"
+                }
+              }
+            },
+            "description": "Meta is null, maybe data hasn't been written in db yet"
+          }
+        },
+        "summary": "Get list of all keys in stream",
+        "tags": [
+          "keys"
+        ]
+      }
+    },
+    "/v1/keys/find": {
+      "post": {
+        "operationId": "KeysController_getByPubkeys_v1",
+        "parameters": [],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/KeysFindBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/KeyListResponse"
+                }
+              }
+            },
+            "description": "Staking Router module keys"
+          },
+          "425": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TooEarlyResponse"
+                }
+              }
+            },
+            "description": "Meta is null, maybe data hasn't been written in db yet"
+          }
+        },
+        "summary": "Get list of found keys in DB from pubkey list",
+        "tags": [
+          "keys"
+        ]
+      }
+    },
+    "/v1/keys/{pubkey}": {
+      "get": {
+        "operationId": "KeysController_getByPubkey_v1",
+        "parameters": [
+          {
+            "description": "Public key",
+            "in": "path",
+            "name": "pubkey",
+            "required": true,
+            "schema": {}
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/KeyListResponse"
+                }
+              }
+            },
+            "description": "List of all keys"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NotFoundException"
+                }
+              }
+            },
+            "description": "Provided pubkey was not found"
+          },
+          "425": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TooEarlyResponse"
+                }
+              }
+            },
+            "description": "Meta is null, maybe data hasn't been written in db yet"
+          }
+        },
+        "summary": "Get detailed information about pubkey",
+        "tags": [
+          "keys"
+        ]
+      }
+    },
+    "/v1/modules": {
+      "get": {
+        "operationId": "SRModulesController_getModules_v1",
+        "parameters": [],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SRModuleListResponse"
+                }
+              }
+            },
+            "description": "List of all modules supported in API"
+          },
+          "425": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TooEarlyResponse"
+                }
+              }
+            },
+            "description": "Meta is null, maybe data hasn't been written in db yet"
+          }
+        },
+        "summary": "Get list of modules supported in API",
+        "tags": [
+          "modules"
+        ]
+      }
+    },
+    "/v1/modules/keys": {
+      "get": {
+        "operationId": "SRModulesKeysController_getGroupedByModuleKeys_v1",
+        "parameters": [
+          {
+            "description": "Filter to get used keys. Possible values: true/false. If this value is not specified endpoint will return all keys.",
+            "in": "query",
+            "name": "used",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "description": "Filter for operator with specified index. If this value is not specified endpoint will return keys for all operators.",
+            "in": "query",
+            "name": "operatorIndex",
+            "required": false,
+            "schema": {
+              "type": "number"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GroupedByModuleKeyListResponse"
+                }
+              }
+            },
+            "description": "Keys for all modules are grouped by the staking router module. Receiving results from this endpoint may take some time, so please use it carefully."
+          },
+          "425": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TooEarlyResponse"
+                }
+              }
+            },
+            "description": "Meta is null, maybe data hasn't been written in db yet"
+          }
+        },
+        "summary": "Get keys for all modules grouped by staking router module",
+        "tags": [
+          "sr-module-keys"
+        ]
+      }
+    },
+    "/v1/modules/{module_id}": {
+      "get": {
+        "operationId": "SRModulesController_getModule_v1",
+        "parameters": [
+          {
+            "description": "Staking router module_id or contract address",
+            "in": "path",
+            "name": "module_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SRModuleResponse"
+                }
+              }
+            },
+            "description": "Staking router module detailed information"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NotFoundException"
+                }
+              }
+            },
+            "description": "Provided module is not supported"
+          },
+          "425": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TooEarlyResponse"
+                }
+              }
+            },
+            "description": "Meta is null, maybe data hasn't been written in db yet"
+          }
+        },
+        "summary": "Get detailed information about staking router module",
+        "tags": [
+          "modules"
+        ]
+      }
+    },
+    "/v1/modules/{module_id}/keys": {
+      "get": {
+        "operationId": "SRModulesKeysController_getModuleKeys_v1",
+        "parameters": [
+          {
+            "description": "Filter to get used keys. Possible values: true/false. If this value is not specified endpoint will return all keys.",
+            "in": "query",
+            "name": "used",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "description": "Filter for operator with specified index. If this value is not specified endpoint will return keys for all operators.",
+            "in": "query",
+            "name": "operatorIndex",
+            "required": false,
+            "schema": {
+              "type": "number"
+            }
+          },
+          {
+            "description": "Staking router module_id or contract address",
+            "in": "path",
+            "name": "module_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SRModuleKeyListResponse"
+                }
+              }
+            },
+            "description": "List of all modules supported in API"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NotFoundException"
+                }
+              }
+            },
+            "description": "Provided module is not supported"
+          },
+          "425": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TooEarlyResponse"
+                }
+              }
+            },
+            "description": "Meta is null, maybe data hasn't been written in db yet"
+          }
+        },
+        "summary": "Staking router module keys",
+        "tags": [
+          "sr-module-keys"
+        ]
+      }
+    },
+    "/v1/modules/{module_id}/keys/find": {
+      "post": {
+        "operationId": "SRModulesKeysController_getModuleKeysByPubkeys_v1",
+        "parameters": [
+          {
+            "description": "Staking router module_id or contract address",
+            "in": "path",
+            "name": "module_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/KeysFindBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SRModuleKeyListResponse"
+                }
+              }
+            },
+            "description": "Staking Router module keys"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NotFoundException"
+                }
+              }
+            },
+            "description": "Provided module is not supported"
+          },
+          "425": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TooEarlyResponse"
+                }
+              }
+            },
+            "description": "Meta is null, maybe data hasn't been written in db yet"
+          }
+        },
+        "summary": "Get list of found staking router module keys in db from pubkey list",
+        "tags": [
+          "sr-module-keys"
+        ]
+      }
+    },
+    "/v1/modules/{module_id}/operators": {
+      "get": {
+        "operationId": "SRModulesOperatorsController_getModuleOperators_v1",
+        "parameters": [
+          {
+            "description": "Staking router module_id or contract address",
+            "in": "path",
+            "name": "module_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SRModuleOperatorListResponse"
+                }
+              }
+            },
+            "description": "List of all SR module operators"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NotFoundException"
+                }
+              }
+            },
+            "description": "Provided module is not supported"
+          },
+          "425": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TooEarlyResponse"
+                }
+              }
+            },
+            "description": "Meta is null, maybe data hasn't been written in db yet"
+          }
+        },
+        "summary": "Staking router module operators",
+        "tags": [
+          "operators"
+        ]
+      }
+    },
+    "/v1/modules/{module_id}/operators/keys": {
+      "get": {
+        "operationId": "SRModulesOperatorsKeysController_getOperatorsKeys_v1",
+        "parameters": [
+          {
+            "description": "Filter to get used keys. Possible values: true/false. If this value is not specified endpoint will return all keys.",
+            "in": "query",
+            "name": "used",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "description": "Filter for operator with specified index. If this value is not specified endpoint will return keys for all operators.",
+            "in": "query",
+            "name": "operatorIndex",
+            "required": false,
+            "schema": {
+              "type": "number"
+            }
+          },
+          {
+            "description": "Staking router module_id or contract address",
+            "in": "path",
+            "name": "module_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SRModuleOperatorsKeysResponse"
+                }
+              }
+            },
+            "description": "List of all SR module operators"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NotFoundException"
+                }
+              }
+            },
+            "description": "Provided module is not supported"
+          },
+          "425": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TooEarlyResponse"
+                }
+              }
+            },
+            "description": "Meta is null, maybe data hasn't been written in db yet"
+          }
+        },
+        "summary": "Staking router module operators",
+        "tags": [
+          "operators-keys"
+        ]
+      }
+    },
+    "/v1/modules/{module_id}/operators/{operator_id}": {
+      "get": {
+        "operationId": "SRModulesOperatorsController_getModuleOperator_v1",
+        "parameters": [
+          {
+            "description": "Operator index",
+            "in": "path",
+            "name": "operator_id",
+            "required": true,
+            "schema": {
+              "type": "number"
+            }
+          },
+          {
+            "description": "Staking router module_id or contract address",
+            "in": "path",
+            "name": "module_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SRModuleOperatorResponse"
+                }
+              }
+            },
+            "description": "SR module operator"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NotFoundException"
+                }
+              }
+            },
+            "description": "Provided module or operator are not supported"
+          },
+          "425": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TooEarlyResponse"
+                }
+              }
+            },
+            "description": "Meta is null, maybe data hasn't been written in db yet"
+          }
+        },
+        "summary": "Staking router module operator",
+        "tags": [
+          "operators"
+        ]
+      }
+    },
+    "/v1/modules/{module_id}/validators/generate-unsigned-exit-messages/{operator_id}": {
+      "get": {
+        "operationId": "SRModulesValidatorsController_getMessagesForOldestValidators_v1",
+        "parameters": [
+          {
+            "description": "Operator index",
+            "in": "path",
+            "name": "operator_id",
+            "required": true,
+            "schema": {
+              "type": "number"
+            }
+          },
+          {
+            "description": "Number of validators to exit. If validators number less than amount, return all validators.",
+            "in": "query",
+            "name": "max_amount",
+            "required": false,
+            "schema": {
+              "type": "number"
+            }
+          },
+          {
+            "description": "Percent of validators to exit. Default value is 10. Percent has a higher priority than max_amount",
+            "in": "query",
+            "name": "percent",
+            "required": false,
+            "schema": {
+              "type": "number"
+            }
+          },
+          {
+            "description": "Staking router module_id or contract address.",
+            "in": "path",
+            "name": "module_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ExitPresignMessageListResponse"
+                }
+              }
+            },
+            "description": "Exit messages for N oldest lido validators of operator"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NotFoundException"
+                }
+              }
+            },
+            "description": "Provided module or operator are not supported"
+          },
+          "425": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TooEarlyResponse"
+                }
+              }
+            },
+            "description": "Meta is null, maybe data hasn't been written in db yet"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/InternalServerErrorException"
+                }
+              }
+            },
+            "description": "Disabled endpoint/ Last Execution Layer block number in our database older than last Consensus Layer"
+          }
+        },
+        "summary": "Get list of exit messages for N oldest lido validators",
+        "tags": [
+          "validators"
+        ]
+      }
+    },
+    "/v1/modules/{module_id}/validators/validator-exits-to-prepare/{operator_id}": {
+      "get": {
+        "operationId": "SRModulesValidatorsController_getOldestValidators_v1",
+        "parameters": [
+          {
+            "description": "Operator index",
+            "in": "path",
+            "name": "operator_id",
+            "required": true,
+            "schema": {
+              "type": "number"
+            }
+          },
+          {
+            "description": "Number of validators to exit. If validators number less than amount, return all validators.",
+            "in": "query",
+            "name": "max_amount",
+            "required": false,
+            "schema": {
+              "type": "number"
+            }
+          },
+          {
+            "description": "Percent of validators to exit. Default value is 10. Percent has a higher priority than max_amount",
+            "in": "query",
+            "name": "percent",
+            "required": false,
+            "schema": {
+              "type": "number"
+            }
+          },
+          {
+            "description": "Staking router module_id or contract address",
+            "in": "path",
+            "name": "module_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ExitValidatorListResponse"
+                }
+              }
+            },
+            "description": "N oldest lido validators for operator"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NotFoundException"
+                }
+              }
+            },
+            "description": "Provided module or operator are not supported"
+          },
+          "425": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TooEarlyResponse"
+                }
+              }
+            },
+            "description": "Meta is null, maybe data hasn't been written in db yet"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/InternalServerErrorException"
+                }
+              }
+            },
+            "description": "Disabled endpoint/ Last Execution Layer block number in our database older than last Consensus Layer"
+          }
+        },
+        "summary": "Get list of N oldest lido validators",
+        "tags": [
+          "validators"
+        ]
+      }
+    },
+    "/v1/operators": {
+      "get": {
+        "operationId": "SRModulesOperatorsController_get_v1",
+        "parameters": [],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GroupedByModuleOperatorListResponse"
+                }
+              }
+            },
+            "description": "Operators for all modules grouped by staking router module"
+          },
+          "425": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TooEarlyResponse"
+                }
+              }
+            },
+            "description": "Meta is null, maybe data hasn't been written in db yet"
+          }
+        },
+        "summary": "Get operators for all modules grouped by staking router module",
+        "tags": [
+          "operators"
+        ]
+      }
+    },
+    "/v1/status": {
+      "get": {
+        "operationId": "StatusController_get_v1",
+        "parameters": [],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Status"
+                }
+              }
+            },
+            "description": "Keys API status"
+          }
+        },
+        "summary": "Get status of Keys API",
+        "tags": [
+          "status"
+        ]
+      }
+    },
+    "/v2/modules/operators/keys": {
+      "get": {
+        "operationId": "SRModulesOperatorsKeysController_getModulesOperatorsKeysStream_v2",
+        "parameters": [],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/SRModulesOperatorsKeysStreamResponse"
+                  },
+                  "type": "array"
+                }
+              }
+            },
+            "description": "Stream of all SR modules, operators and keys"
+          },
+          "425": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TooEarlyResponse"
+                }
+              }
+            },
+            "description": "Meta has not exist yet, maybe data was not written in db yet"
+          }
+        },
+        "summary": "Comprehensive stream for staking router modules, operators and their keys",
+        "tags": [
+          "operators-keys"
+        ]
+      }
+    }
+  },
+  "servers": [],
+  "tags": []
+}
