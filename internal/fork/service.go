@@ -75,7 +75,7 @@ func NewHarness(tb testing.TB, o HarnessOpts) *Harness {
 		Log:       log,
 	})
 
-	var provider source.Provider = lidocore.NewProvider(client, LocatorAddress, lidocore.Options{
+	core := lidocore.NewProvider(client, LocatorAddress, lidocore.Options{
 		KeysBatch:       200,
 		CallsPerRequest: 20,
 		KeysPerRequest:  400,
@@ -83,11 +83,12 @@ func NewHarness(tb testing.TB, o HarnessOpts) *Harness {
 		Log:             log,
 	})
 
+	var provider source.Provider = core
 	if modules := o.Modules; len(modules) > 0 || modules == nil {
 		if modules == nil {
 			modules = []int32{SandboxModuleID}
 		}
-		provider = scopeModules(provider, modules)
+		provider = scopeModules(core, modules)
 	}
 	if o.NoOperatorWatcher {
 		provider = hideOperatorWatcher{provider}
@@ -201,42 +202,31 @@ func (h *Harness) Module(id int32) model.StakingModule {
 
 // scopedProvider is test-only: Hoodi's module 1 (67 242 keys) and CSM (467 operators) cost
 // hundreds of thousands of upstream slot reads; Sandbox reaches the same semantics.
+//
+// It embeds the concrete provider, not the interface, so every optional capability the loop
+// type-asserts (finality, tail reads, the grouped event scan, source changes) stays visible: one
+// lost silently runs the fork suite on a code path production does not take.
 type scopedProvider struct {
-	source.Provider
+	*lidocore.Provider
 	keep map[int32]bool
 }
 
-// scopeModules keeps the optional interfaces: swallowing OperatorWatcher would silently turn
-// the event scan off.
-func scopeModules(p source.Provider, ids []int32) source.Provider {
+var (
+	_ source.TailKeyReader          = scopedProvider{}
+	_ source.FinalityReporter       = scopedProvider{}
+	_ source.OperatorWatcher        = scopedProvider{}
+	_ source.GroupedOperatorWatcher = scopedProvider{}
+	_ source.SourceChangeReporter   = scopedProvider{}
+	_ source.ChainIdentifier        = scopedProvider{}
+	_ source.ChainVerifier          = scopedProvider{}
+)
+
+func scopeModules(p *lidocore.Provider, ids []int32) source.Provider {
 	keep := make(map[int32]bool, len(ids))
 	for _, id := range ids {
 		keep[id] = true
 	}
-	scoped := scopedProvider{Provider: p, keep: keep}
-
-	watcher, isWatcher := p.(source.OperatorWatcher)
-	chain, isChain := p.(source.ChainIdentifier)
-	switch {
-	case isWatcher && isChain:
-		return struct {
-			scopedProvider
-			source.OperatorWatcher
-			source.ChainIdentifier
-		}{scoped, watcher, chain}
-	case isWatcher:
-		return struct {
-			scopedProvider
-			source.OperatorWatcher
-		}{scoped, watcher}
-	case isChain:
-		return struct {
-			scopedProvider
-			source.ChainIdentifier
-		}{scoped, chain}
-	default:
-		return scoped
-	}
+	return scopedProvider{Provider: p, keep: keep}
 }
 
 // hideOperatorWatcher embeds by field, not interface, which drops the optional methods.
@@ -262,23 +252,6 @@ func (h hideOperatorWatcher) Operators(ctx context.Context, at source.Ref, m mod
 
 func (h hideOperatorWatcher) Keys(ctx context.Context, at source.Ref, m model.StakingModule, fn func(model.Key) error) error {
 	return h.inner.Keys(ctx, at, m, fn)
-}
-
-// FinalizedBlock and KeysFrom are forwarded rather than composed like the interfaces above: without
-// them the loop runs with no finality and every rebuild reads every key. Each falls back to what the
-// loop does when the capability is missing.
-func (s scopedProvider) FinalizedBlock(ctx context.Context) (model.ELBlockSnapshot, error) {
-	if f, ok := s.Provider.(source.FinalityReporter); ok {
-		return f.FinalizedBlock(ctx)
-	}
-	return model.ELBlockSnapshot{}, nil
-}
-
-func (s scopedProvider) KeysFrom(ctx context.Context, at source.Ref, m model.StakingModule, from map[int32]int32, fn func(model.Key) error) (map[int32]int32, error) {
-	if t, ok := s.Provider.(source.TailKeyReader); ok {
-		return t.KeysFrom(ctx, at, m, from, fn)
-	}
-	return nil, s.Provider.Keys(ctx, at, m, fn)
 }
 
 func (s scopedProvider) Modules(ctx context.Context, at source.Ref) ([]model.StakingModule, error) {
