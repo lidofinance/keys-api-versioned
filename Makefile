@@ -14,11 +14,15 @@ FORK_UPSTREAM_RPC ?=
 FORK_BLOCK ?= 3290000
 
 CANONICAL ?= http://127.0.0.1:3000
+# The canonical contract: the OpenAPI document of the mainnet deployment, which serves the
+# latest release. internal/api/canonical_spec_test.go holds openapi.yaml to it.
+CANONICAL_SPEC_URL ?= https://keys-api.lido.fi/api-json
+CANONICAL_SPEC_FILE := internal/api/testdata/canonical-openapi.json
 POC ?= http://127.0.0.1:$(PORT)
 TARGET ?= $(POC)/v1/keys
 PID ?=
 
-.PHONY: build run run-static diff diff-errors bench test test-e2e test-fork vet clean
+.PHONY: build run run-static diff diff-errors canonical-spec canonical-spec-check bench test test-e2e test-fork vet clean
 
 build:
 	go build -o bin/keys-api ./cmd/keys-api
@@ -45,6 +49,19 @@ diff: build
 # services up and synced on the same chain; it compares status codes, not message text.
 diff-errors: build
 	./bin/diff -errors -a $(CANONICAL) -b $(POC)
+
+# Take the canonical document as the new contract, then `go test ./internal/api/` says what
+# openapi.yaml and the service are missing.
+canonical-spec:
+	curl -sf --max-time 30 $(CANONICAL_SPEC_URL) | jq -S . > $(CANONICAL_SPEC_FILE).tmp
+	mv $(CANONICAL_SPEC_FILE).tmp $(CANONICAL_SPEC_FILE)
+	@jq -r '"canonical " + .info.version + ", " + (.paths | length | tostring) + " paths"' $(CANONICAL_SPEC_FILE)
+
+# Fails when the deployment no longer serves the document the contract was taken from.
+canonical-spec-check:
+	@curl -sf --max-time 30 $(CANONICAL_SPEC_URL) | jq -S . > $(CANONICAL_SPEC_FILE).live
+	@diff -u $(CANONICAL_SPEC_FILE) $(CANONICAL_SPEC_FILE).live && rm $(CANONICAL_SPEC_FILE).live \
+		|| { rm $(CANONICAL_SPEC_FILE).live; echo "canonical spec moved: run make canonical-spec"; exit 1; }
 
 bench: build
 	./bin/bench -url $(TARGET) -requests 5 -concurrency 1 -warmup 1 $(if $(PID),-rss-pid $(PID),)

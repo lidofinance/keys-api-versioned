@@ -95,6 +95,8 @@ An existing deployment resyncs once when it picks this up: its rows are in `publ
 
 Tracked canonical version: **5.0.0**, plus the unreleased `develop` fixes to operator names and change detection (through `71fc5b3`). Since 4.0.1 that brought `totalWithdrawnKeys` on every operator, the `invalidName<index>` placeholder for undecodable names, CMv2 renames picked up from the `META_REGISTRY` event, and `Cache-Control` on reads.
 
+The contract is the canonical OpenAPI document itself, kept in `internal/api/testdata/canonical-openapi.json` as served by the mainnet deployment (identical, apart from `info`, to one generated from the `5.0.0` tag). `internal/api/canonical_spec_test.go` requires every canonical operation, parameter, status code and response field to be in `openapi.yaml` with a compatible type. `/openapi.yaml` is a superset: it adds `/ext/v1` and may widen a type. What is deliberately not served (the exit endpoints) or served narrower (`clBlockSnapshot`, always `null`) is listed in the test with its reason, and an entry that stops being a difference fails too. A weekly workflow compares the file with the deployment; `make canonical-spec` takes a new release. The document covers shape only: byte equality, error bodies and ignored parameters remain `cmd/diff`'s job.
+
 `cmd/diff` fetches the same endpoint from both services, sorts key arrays (neither implementation promises an order) and compares. `-live` tolerates the two being at different blocks, which they always are when both follow a chain.
 
 Latest run, both services following mainnet in the stand, all eight compared endpoints equal:

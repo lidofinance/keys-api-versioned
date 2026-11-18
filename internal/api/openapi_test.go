@@ -93,16 +93,7 @@ func TestEveryCanonicalRouteHasAMirror(t *testing.T) {
 func TestTheCanonicalSurfaceCarriesNoInventedPaths(t *testing.T) {
 	server := New(stubStore{}, Config{})
 
-	canonicalPaths := map[string]bool{
-		"/v1/keys": true, "/v1/keys/{pubkey}": true, "/v1/keys/find": true,
-		"/v1/modules": true, "/v1/modules/keys": true, "/v1/modules/{module_id}": true,
-		"/v1/modules/{module_id}/keys": true, "/v1/modules/{module_id}/keys/find": true,
-		"/v1/operators": true, "/v1/modules/{module_id}/operators": true,
-		"/v1/modules/{module_id}/operators/{operator_id}": true,
-		"/v1/modules/{module_id}/operators/keys":          true,
-		"/v2/modules/operators/keys":                      true,
-		"/v1/status":                                      true,
-	}
+	canonicalPaths := canonicalPathSet(t)
 
 	for _, r := range server.routes() {
 		if r.undocumented || r.mirror {
