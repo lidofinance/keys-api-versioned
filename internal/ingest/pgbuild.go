@@ -87,22 +87,19 @@ func (k *pgModuleKeys) KeepPrefix(keep map[int32]int32) { k.keep = keep }
 // SettledKeys: a run of current rows from key 0 that are all deposited and were written at or below
 // finalized. A missing index or a row that fails either test ends the operator's run there.
 func (b *pgBuild) SettledKeys(ctx context.Context, module model.StakingModule, finalized int64) (map[int32]int32, error) {
+	// One pass: pos is the row's place in its operator, so key_index <> pos marks the first gap.
+	// A per-operator subquery here cost operators × rows (1.7 s for 500 operators × 200 keys).
 	rows, err := b.store.pool.Query(ctx, `
-		with current_keys as (
-			select operator_index, key_index, (used and vetted and from_block <= $2) as settled
-			  from key_version
-			 where module_id = $1 and to_block is null
-		), runs as (
-			select operator_index,
-			       coalesce(min(key_index) filter (where not settled), max(key_index) + 1) as n
-			  from current_keys
-			 group by operator_index
-		)
-		select r.operator_index, r.n
-		  from runs r
-		 where r.n > 0
-		   and r.n = (select count(*) from current_keys c
-		               where c.operator_index = r.operator_index and c.key_index < r.n)`,
+		select operator_index, n
+		  from (select operator_index,
+		               coalesce(min(pos) filter (where not settled or key_index <> pos), count(*))::int as n
+		          from (select operator_index, key_index,
+		                       used and vetted and from_block <= $2 as settled,
+		                       row_number() over (partition by operator_index order by key_index) - 1 as pos
+		                  from key_version
+		                 where module_id = $1 and to_block is null) c
+		         group by operator_index) r
+		 where n > 0`,
 		module.ID, finalized)
 	if err != nil {
 		return nil, fmt.Errorf("settled keys of module %d: %w", module.ID, err)
@@ -212,9 +209,10 @@ func (k *pgModuleKeys) Commit(ctx context.Context) (KeyDiff, error) {
 		update key_version v set to_block = $2
 		 where v.module_id = $1
 		   and v.to_block is null
-		   and v.key_index >= coalesce(
-		       (select k.n from unnest($3::int[], $4::int[]) as k(operator_index, n)
-		         where k.operator_index = v.operator_index), 0)
+		   -- An anti-join, not a correlated lookup per row: that one cost rows × operators.
+		   and not exists (
+		       select 1 from unnest($3::int[], $4::int[]) as k(operator_index, n)
+		        where k.operator_index = v.operator_index and v.key_index < k.n)
 		   and not exists (
 		       select 1 from staged_keys s
 		        where s.operator_index = v.operator_index
