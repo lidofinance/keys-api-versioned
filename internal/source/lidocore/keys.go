@@ -55,13 +55,14 @@ type keyRead struct {
 
 type keySpan struct{ offset, limit uint64 }
 
-func planKeyReads(operators []model.Operator, batch uint64) []keyRead {
+func planKeyReads(operators []model.Operator, from map[int32]int32, batch uint64) []keyRead {
 	var reads []keyRead
 	for _, op := range operators {
-		if op.TotalSigningKeys == 0 {
+		start := uint64(max(from[op.Index], 0))
+		if uint64(op.TotalSigningKeys) <= start {
 			continue
 		}
-		for _, span := range batchSpans(uint64(op.TotalSigningKeys), batch) {
+		for _, span := range batchSpans(start, uint64(op.TotalSigningKeys), batch) {
 			reads = append(reads, keyRead{op: op, span: span})
 		}
 	}
@@ -97,16 +98,17 @@ func streamKeys(
 	at eth.BlockRef,
 	moduleAddress string,
 	operators []model.Operator,
+	from map[int32]int32,
 	spec keysSpec,
 	pacing keysPacing,
 	log *slog.Logger,
 	fn func(model.Key) error,
 ) error {
 	pacing = pacing.withDefaults()
-	if err := checkKeyTotals(operators); err != nil {
+	if err := checkKeyTotals(operators, from); err != nil {
 		return err
 	}
-	groups := groupKeyReads(planKeyReads(operators, pacing.keysBatch), pacing.callsPerRequest, pacing.keysPerRequest)
+	groups := groupKeyReads(planKeyReads(operators, from, pacing.keysBatch), pacing.callsPerRequest, pacing.keysPerRequest)
 	emitted := make(map[int32]int64, len(operators))
 
 	started := time.Now()
@@ -168,21 +170,25 @@ func streamKeys(
 		logProgress(log, moduleAddress, lastGroup[len(lastGroup)-1], end, len(groups), read, started)
 	}
 	for _, op := range operators {
-		if emitted[op.Index] != int64(op.TotalSigningKeys) {
-			return fmt.Errorf("operator %d of %s: read %d keys, totalSigningKeys is %d",
-				op.Index, moduleAddress, emitted[op.Index], op.TotalSigningKeys)
+		if want := int64(op.TotalSigningKeys - from[op.Index]); emitted[op.Index] != want {
+			return fmt.Errorf("operator %d of %s: read %d keys from offset %d, totalSigningKeys is %d",
+				op.Index, moduleAddress, emitted[op.Index], from[op.Index], op.TotalSigningKeys)
 		}
 	}
 	return nil
 }
 
 // checkKeyTotals runs before planning: the plan holds one entry per batch of keys.
-func checkKeyTotals(operators []model.Operator) error {
+func checkKeyTotals(operators []model.Operator, from map[int32]int32) error {
 	var total int64
 	for _, op := range operators {
 		if op.TotalSigningKeys < 0 || int64(op.TotalSigningKeys) > maxKeysPerOperator {
 			return fmt.Errorf("operator %d: totalSigningKeys %d is out of range [0, %d]",
 				op.Index, op.TotalSigningKeys, maxKeysPerOperator)
+		}
+		if offset := from[op.Index]; offset < 0 || offset > op.TotalSigningKeys {
+			return fmt.Errorf("operator %d: offset %d is out of range [0, %d]",
+				op.Index, offset, op.TotalSigningKeys)
 		}
 		total += int64(op.TotalSigningKeys)
 	}
@@ -238,9 +244,9 @@ func readKeyGroup(
 	return keys, nil
 }
 
-func batchSpans(total, batch uint64) []keySpan {
+func batchSpans(start, total, batch uint64) []keySpan {
 	var spans []keySpan
-	for offset := uint64(0); offset < total; offset += batch {
+	for offset := start; offset < total; offset += batch {
 		spans = append(spans, keySpan{offset: offset, limit: min(batch, total-offset)})
 	}
 	return spans

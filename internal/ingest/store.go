@@ -65,6 +65,21 @@ type ModuleKeys interface {
 	Abort(ctx context.Context)
 }
 
+// SettledKeys (optional on Build) lets a rebuild read only what follows each operator's deposited
+// keys. A key deposited at a finalized block cannot change on chain; the periodic audit still
+// reads everything, so a wrong row cannot outlive it.
+type SettledKeys interface {
+	// SettledKeys returns, per operator, n such that the current rows for keys 0..n-1 are all
+	// deposited and were written at a block at or below finalized.
+	SettledKeys(ctx context.Context, module model.StakingModule, finalized int64) (map[int32]int32, error)
+}
+
+// PrefixKeeper (optional on ModuleKeys): rows for keys below keep[operator] were not read this
+// time, so Commit leaves them open instead of closing them as gone.
+type PrefixKeeper interface {
+	KeepPrefix(keep map[int32]int32)
+}
+
 // LeftoverReporter (optional) lists modules with rows above block published (0 = all), which only a
 // build that never published can have written.
 type LeftoverReporter interface {
@@ -112,6 +127,8 @@ func (v StoredVersion) AsVersion() Version {
 }
 
 type KeyDiff struct {
+	// Kept: deposited keys left as they are without being read.
+	Kept      int64
 	Staged    int64
 	Closed    int64
 	Opened    int64

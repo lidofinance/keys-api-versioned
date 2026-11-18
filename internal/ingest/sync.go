@@ -91,9 +91,11 @@ type CycleResult struct {
 	VersionBlock     int64
 	VersionTimestamp int64
 	// HeadTimestamp is the health signal: it stops moving for any reason the loop stops working.
-	HeadTimestamp  int64
-	Rebuilt        bool
-	KeysStaged     int64
+	HeadTimestamp int64
+	Rebuilt       bool
+	KeysStaged    int64
+	// KeysKept: deposited keys a rebuild left as they were without reading them.
+	KeysKept       int64
 	KeysChanged    int64
 	FinalizedBlock int64
 	// ReorgFrom is the rollback block (0 = none); a reorg does not imply a rebuild.
@@ -496,12 +498,21 @@ func (s *Syncer) rebuild(ctx context.Context, head model.ELBlockSnapshot, scope 
 		)
 		if read.reads(DepthKeys) {
 			moduleStarted := time.Now()
-			diff, err = s.writeModuleKeys(ctx, build, at, m)
+			// Only over rows a published version holds, never an unfinished attempt's, and never in the
+			// audit, which exists to check the rows this would trust.
+			var settled map[int32]int32
+			if _, attempted := leftovers[m.ID]; reuse && !attempted && published > 0 && finalized > 0 {
+				if settled, err = s.settledKeys(ctx, build, m, min(finalized, published)); err != nil {
+					return err
+				}
+			}
+			diff, err = s.writeModuleKeys(ctx, build, at, m, settled)
 			if err != nil {
 				return err
 			}
 			keysTook = time.Since(moduleStarted)
 			result.KeysStaged += diff.Staged
+			result.KeysKept += diff.Kept
 			result.KeysChanged += diff.Opened + diff.Closed
 			contentChanged = diff.Changed()
 		}
@@ -519,7 +530,7 @@ func (s *Syncer) rebuild(ctx context.Context, head model.ELBlockSnapshot, scope 
 
 		s.log.Info("module written",
 			"module", m.ID, "type", m.Type, "nonce", m.Nonce, "reads", read.String(),
-			"keys_read", diff.Staged, "keys_opened", diff.Opened, "keys_closed", diff.Closed,
+			"keys_read", diff.Staged, "keys_kept", diff.Kept, "keys_opened", diff.Opened, "keys_closed", diff.Closed,
 			"keys_unchanged", diff.Unchanged,
 			"operators", len(operators), "operators_changed", changed,
 			"keys_took", keysTook.Round(time.Millisecond).String(),
@@ -582,8 +593,22 @@ func (s *Syncer) leftovers(ctx context.Context, published int64) (map[int32]Left
 	return out, nil
 }
 
+// settledKeys is nil when either side cannot read or keep a prefix.
+func (s *Syncer) settledKeys(ctx context.Context, build Build, m model.StakingModule, finalized int64) (map[int32]int32, error) {
+	settler, ok := build.(SettledKeys)
+	if !ok {
+		return nil, nil
+	}
+	if _, ok := s.source.(source.TailKeyReader); !ok {
+		return nil, nil
+	}
+	return settler.SettledKeys(ctx, m, finalized)
+}
+
 // writeModuleKeys: the diff runs in the database, so memory stays bounded for any module size.
-func (s *Syncer) writeModuleKeys(ctx context.Context, build Build, at source.Ref, m model.StakingModule) (KeyDiff, error) {
+// settled (may be nil) is each operator's deposited prefix the store already holds; only the keys
+// after it are read.
+func (s *Syncer) writeModuleKeys(ctx context.Context, build Build, at source.Ref, m model.StakingModule, settled map[int32]int32) (KeyDiff, error) {
 	writer, err := build.Keys(ctx, m)
 	if err != nil {
 		return KeyDiff{}, err
@@ -594,7 +619,7 @@ func (s *Syncer) writeModuleKeys(ctx context.Context, build Build, at source.Ref
 		started  = time.Now()
 		lastLine = time.Now()
 	)
-	if err := s.source.Keys(ctx, at, m, func(k model.Key) error {
+	add := func(k model.Key) error {
 		staged++
 		if time.Since(lastLine) > 5*time.Second {
 			lastLine = time.Now()
@@ -604,7 +629,18 @@ func (s *Syncer) writeModuleKeys(ctx context.Context, build Build, at source.Ref
 				"keys/s", int(float64(staged)/elapsed.Seconds()))
 		}
 		return writer.Add(ctx, k)
-	}); err != nil {
+	}
+
+	tail, canRead := s.source.(source.TailKeyReader)
+	keeper, canKeep := writer.(PrefixKeeper)
+	if len(settled) > 0 && canRead && canKeep {
+		applied, err := tail.KeysFrom(ctx, at, m, settled, add)
+		if err != nil {
+			writer.Abort(ctx)
+			return KeyDiff{}, fmt.Errorf("read keys of module %d: %w", m.ID, err)
+		}
+		keeper.KeepPrefix(applied)
+	} else if err := s.source.Keys(ctx, at, m, add); err != nil {
 		writer.Abort(ctx)
 		return KeyDiff{}, fmt.Errorf("read keys of module %d: %w", m.ID, err)
 	}

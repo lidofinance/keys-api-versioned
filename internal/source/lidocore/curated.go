@@ -79,8 +79,8 @@ func (r *CuratedReader) Operators(ctx context.Context, c *eth.Client, at eth.Blo
 	return operators, nil
 }
 
-func (r *CuratedReader) Keys(ctx context.Context, c *eth.Client, at eth.BlockRef, moduleAddress string, operators []model.Operator, fn func(model.Key) error) error {
-	return streamKeys(ctx, c, at, moduleAddress, operators,
+func (r *CuratedReader) Keys(ctx context.Context, c *eth.Client, at eth.BlockRef, moduleAddress string, operators []model.Operator, from map[int32]int32, fn func(model.Key) error) error {
+	return streamKeys(ctx, c, at, moduleAddress, operators, from,
 		keysSpec{abi: &eth.RegistryABI, method: "getSigningKeys", decode: decodeCuratedKeys},
 		keysPacing{
 			keysBatch:       r.KeysBatch,

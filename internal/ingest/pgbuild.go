@@ -79,6 +79,48 @@ type pgModuleKeys struct {
 	pending []stagedKey
 	staged  int64
 	done    bool
+	keep    map[int32]int32
+}
+
+func (k *pgModuleKeys) KeepPrefix(keep map[int32]int32) { k.keep = keep }
+
+// SettledKeys: a run of current rows from key 0 that are all deposited and were written at or below
+// finalized. A missing index or a row that fails either test ends the operator's run there.
+func (b *pgBuild) SettledKeys(ctx context.Context, module model.StakingModule, finalized int64) (map[int32]int32, error) {
+	rows, err := b.store.pool.Query(ctx, `
+		with current_keys as (
+			select operator_index, key_index, (used and vetted and from_block <= $2) as settled
+			  from key_version
+			 where module_id = $1 and to_block is null
+		), runs as (
+			select operator_index,
+			       coalesce(min(key_index) filter (where not settled), max(key_index) + 1) as n
+			  from current_keys
+			 group by operator_index
+		)
+		select r.operator_index, r.n
+		  from runs r
+		 where r.n > 0
+		   and r.n = (select count(*) from current_keys c
+		               where c.operator_index = r.operator_index and c.key_index < r.n)`,
+		module.ID, finalized)
+	if err != nil {
+		return nil, fmt.Errorf("settled keys of module %d: %w", module.ID, err)
+	}
+	defer rows.Close()
+
+	out := map[int32]int32{}
+	for rows.Next() {
+		var operator, n int32
+		if err := rows.Scan(&operator, &n); err != nil {
+			return nil, fmt.Errorf("settled keys of module %d: %w", module.ID, err)
+		}
+		out[operator] = n
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("settled keys of module %d: %w", module.ID, err)
+	}
+	return out, nil
 }
 
 func (k *pgModuleKeys) Add(ctx context.Context, key model.Key) error {
@@ -134,6 +176,7 @@ func (k *pgModuleKeys) flush(ctx context.Context) error {
 
 // Commit closes open rows not staged identically, then opens rows for staged keys left without
 // one. Unchanged keys are written by neither, so one changed operator costs a handful of rows.
+// Rows below a kept prefix were not staged and are left alone.
 func (k *pgModuleKeys) Commit(ctx context.Context) (KeyDiff, error) {
 	defer k.release()
 	if k.done {
@@ -157,11 +200,21 @@ func (k *pgModuleKeys) Commit(ctx context.Context) (KeyDiff, error) {
 
 	block := k.build.at.BlockNumber
 	diff := KeyDiff{Staged: k.staged}
+	keepOperators := make([]int32, 0, len(k.keep))
+	keepBelow := make([]int32, 0, len(k.keep))
+	for operator, n := range k.keep {
+		keepOperators = append(keepOperators, operator)
+		keepBelow = append(keepBelow, n)
+		diff.Kept += int64(n)
+	}
 
 	closed, err := tx.Exec(ctx, `
 		update key_version v set to_block = $2
 		 where v.module_id = $1
 		   and v.to_block is null
+		   and v.key_index >= coalesce(
+		       (select k.n from unnest($3::int[], $4::int[]) as k(operator_index, n)
+		         where k.operator_index = v.operator_index), 0)
 		   and not exists (
 		       select 1 from staged_keys s
 		        where s.operator_index = v.operator_index
@@ -169,7 +222,7 @@ func (k *pgModuleKeys) Commit(ctx context.Context) (KeyDiff, error) {
 		          and s.pubkey = v.pubkey
 		          and s.signature = v.signature
 		          and s.used = v.used
-		          and s.vetted = v.vetted)`, k.moduleID, block)
+		          and s.vetted = v.vetted)`, k.moduleID, block, keepOperators, keepBelow)
 	if err != nil {
 		return diff, fmt.Errorf("close superseded keys: %w", err)
 	}

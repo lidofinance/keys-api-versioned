@@ -29,6 +29,15 @@ type Provider interface {
 	Keys(ctx context.Context, at Ref, module model.StakingModule, fn func(model.Key) error) error
 }
 
+// TailKeyReader reads each operator's keys from an offset on. Deposited keys cannot change, so a
+// writer that already holds them only needs the rest.
+type TailKeyReader interface {
+	// KeysFrom reads keys at index >= from[operator] (absent = 0) and returns the offsets it
+	// applied. An offset above the operator's deposited count at `at` is not trusted: that operator
+	// is read in full and its applied offset is 0.
+	KeysFrom(ctx context.Context, at Ref, module model.StakingModule, from map[int32]int32, fn func(model.Key) error) (map[int32]int32, error)
+}
+
 // OperatorWatcher reports operator metadata changes (renames, reward addresses), which move no
 // nonce. Implement only if it can be answered cheaply.
 type OperatorWatcher interface {
