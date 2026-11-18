@@ -125,7 +125,7 @@ func TestKeyReadsWithImpossibleTotalsAreRefusedBeforeAnyRequest(t *testing.T) {
 			client := eth.NewClient(server.URL, eth.Options{Concurrency: 2, BatchSize: 8})
 
 			err := (&CuratedReader{}).Keys(context.Background(), client, eth.BlockRef{Tag: "latest"},
-				moduleUnderTest, operators, func(model.Key) error { return nil })
+				moduleUnderTest, operators, nil, func(model.Key) error { return nil })
 			if err == nil {
 				t.Fatal("got no error, want the totals refused")
 			}
@@ -151,7 +151,7 @@ func TestAKeyReadMustReturnExactlyWhatWasAskedFor(t *testing.T) {
 
 			var emitted int
 			err := (&CuratedReader{KeysBatch: 1000}).Keys(context.Background(), client, eth.BlockRef{Tag: "latest"},
-				moduleUnderTest, operators, func(model.Key) error { emitted++; return nil })
+				moduleUnderTest, operators, nil, func(model.Key) error { emitted++; return nil })
 			if err == nil {
 				t.Fatalf("got %d keys and no error, want the short read refused", emitted)
 			}
@@ -171,7 +171,7 @@ func TestAPanicInAKeyReadGoroutineBecomesAnError(t *testing.T) {
 	spec := keysSpec{abi: &eth.RegistryABI, method: "getSigningKeys",
 		decode: func([]any, string, model.Operator, int32) ([]model.Key, error) { panic("decoder bug") }}
 	err := streamKeys(context.Background(), client, eth.BlockRef{Tag: "latest"}, moduleUnderTest,
-		[]model.Operator{{Index: 0, TotalSigningKeys: 2}}, spec, keysPacing{}, nil,
+		[]model.Operator{{Index: 0, TotalSigningKeys: 2}}, nil, spec, keysPacing{}, nil,
 		func(model.Key) error { return nil })
 	if err == nil || !strings.Contains(err.Error(), "decoder bug") {
 		t.Fatalf("got %v, want the panic as an error", err)
@@ -187,7 +187,7 @@ func TestEveryOperatorMustYieldItsTotalSigningKeys(t *testing.T) {
 
 	operators := []model.Operator{{Index: 1, TotalSigningKeys: 2}, {Index: 1, TotalSigningKeys: 2}}
 	err := (&CuratedReader{}).Keys(context.Background(), client, eth.BlockRef{Tag: "latest"},
-		moduleUnderTest, operators, func(model.Key) error { return nil })
+		moduleUnderTest, operators, nil, func(model.Key) error { return nil })
 	if err == nil || !strings.Contains(err.Error(), "totalSigningKeys is 2") {
 		t.Fatalf("got %v, want the per-operator sum refused", err)
 	}

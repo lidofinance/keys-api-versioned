@@ -64,7 +64,9 @@ func (p *Provider) noteSourceChange(reason string) {
 type ModuleReader interface {
 	Types() []string
 	Operators(ctx context.Context, c *eth.Client, at eth.BlockRef, m model.StakingModule) ([]model.Operator, error)
-	Keys(ctx context.Context, c *eth.Client, at eth.BlockRef, moduleAddress string, operators []model.Operator, fn func(model.Key) error) error
+	// Keys reads each operator's keys from from[operator] on (absent = 0); the offsets are already
+	// checked against the operators passed.
+	Keys(ctx context.Context, c *eth.Client, at eth.BlockRef, moduleAddress string, operators []model.Operator, from map[int32]int32, fn func(model.Key) error) error
 	// OperatorEventTopics: ABI event names, or full signatures for events no loaded ABI declares.
 	OperatorEventTopics() []string
 }
@@ -397,28 +399,57 @@ func (p *Provider) Operators(ctx context.Context, at source.Ref, m model.Staking
 
 // Operators are read first: readers need vetted and deposited counts to set per-key flags.
 func (p *Provider) Keys(ctx context.Context, at source.Ref, m model.StakingModule, fn func(model.Key) error) error {
+	_, err := p.KeysFrom(ctx, at, m, nil, fn)
+	return err
+}
+
+func (p *Provider) KeysFrom(ctx context.Context, at source.Ref, m model.StakingModule, from map[int32]int32, fn func(model.Key) error) (map[int32]int32, error) {
 	r, err := p.reader(m)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	ref := blockRef(at)
 
 	started := time.Now()
 	operators, err := r.Operators(ctx, p.client, ref, m)
 	if err != nil {
-		return fmt.Errorf("operators of module %d: %w", m.ID, err)
+		return nil, fmt.Errorf("operators of module %d: %w", m.ID, err)
 	}
 
-	var keys int
+	applied := settledOffsets(operators, from)
+	var keys, skipped int
 	for _, op := range operators {
 		keys += int(op.TotalSigningKeys)
+		skipped += int(applied[op.Index])
 	}
 	p.log.Debug("reading keys", "module", m.ID, "type", m.Type,
-		"operators", len(operators), "keys_expected", keys,
+		"operators", len(operators), "keys_expected", keys, "keys_skipped", skipped,
 		"operators_took", time.Since(started).Round(time.Millisecond).String())
 
-	return r.Keys(ctx, p.client, ref, m.RawAddress(), operators, fn)
+	if err := r.Keys(ctx, p.client, ref, m.RawAddress(), operators, applied, fn); err != nil {
+		return nil, err
+	}
+	return applied, nil
 }
+
+// settledOffsets keeps an offset only while it covers keys the operator has deposited and vetted at
+// the read block; anything else (keys removed on a testnet, a store from another branch) reads in full.
+func settledOffsets(operators []model.Operator, from map[int32]int32) map[int32]int32 {
+	applied := make(map[int32]int32, len(from))
+	for _, op := range operators {
+		offset, ok := from[op.Index]
+		if !ok || offset <= 0 {
+			continue
+		}
+		if offset > op.UsedSigningKeys || offset > op.StakingLimit || offset > op.TotalSigningKeys {
+			continue
+		}
+		applied[op.Index] = offset
+	}
+	return applied
+}
+
+var _ source.TailKeyReader = (*Provider)(nil)
 
 // OperatorsChanged covers what the nonce does not: renames and reward-address changes.
 func (p *Provider) OperatorsChanged(ctx context.Context, m model.StakingModule, fromBlock, toBlock int64) (bool, error) {

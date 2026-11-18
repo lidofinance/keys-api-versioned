@@ -192,8 +192,8 @@ func (r *CommunityReader) metaRegistry(ctx context.Context, c *eth.Client, at et
 	return address, nil
 }
 
-func (r *CommunityReader) Keys(ctx context.Context, c *eth.Client, at eth.BlockRef, moduleAddress string, operators []model.Operator, fn func(model.Key) error) error {
-	return streamKeys(ctx, c, at, moduleAddress, operators,
+func (r *CommunityReader) Keys(ctx context.Context, c *eth.Client, at eth.BlockRef, moduleAddress string, operators []model.Operator, from map[int32]int32, fn func(model.Key) error) error {
+	return streamKeys(ctx, c, at, moduleAddress, operators, from,
 		keysSpec{abi: &eth.CSMABI, method: "getSigningKeysWithSignatures", decode: decodeCommunityKeys},
 		keysPacing{
 			keysBatch:       r.KeysBatch,

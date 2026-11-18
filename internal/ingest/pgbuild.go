@@ -79,6 +79,45 @@ type pgModuleKeys struct {
 	pending []stagedKey
 	staged  int64
 	done    bool
+	keep    map[int32]int32
+}
+
+func (k *pgModuleKeys) KeepPrefix(keep map[int32]int32) { k.keep = keep }
+
+// SettledKeys: a run of current rows from key 0 that are all deposited and were written at or below
+// finalized. A missing index or a row that fails either test ends the operator's run there.
+func (b *pgBuild) SettledKeys(ctx context.Context, module model.StakingModule, finalized int64) (map[int32]int32, error) {
+	// One pass: pos is the row's place in its operator, so key_index <> pos marks the first gap.
+	// A per-operator subquery here cost operators × rows (1.7 s for 500 operators × 200 keys).
+	rows, err := b.store.pool.Query(ctx, `
+		select operator_index, n
+		  from (select operator_index,
+		               coalesce(min(pos) filter (where not settled or key_index <> pos), count(*))::int as n
+		          from (select operator_index, key_index,
+		                       used and vetted and from_block <= $2 as settled,
+		                       row_number() over (partition by operator_index order by key_index) - 1 as pos
+		                  from key_version
+		                 where module_id = $1 and to_block is null) c
+		         group by operator_index) r
+		 where n > 0`,
+		module.ID, finalized)
+	if err != nil {
+		return nil, fmt.Errorf("settled keys of module %d: %w", module.ID, err)
+	}
+	defer rows.Close()
+
+	out := map[int32]int32{}
+	for rows.Next() {
+		var operator, n int32
+		if err := rows.Scan(&operator, &n); err != nil {
+			return nil, fmt.Errorf("settled keys of module %d: %w", module.ID, err)
+		}
+		out[operator] = n
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("settled keys of module %d: %w", module.ID, err)
+	}
+	return out, nil
 }
 
 func (k *pgModuleKeys) Add(ctx context.Context, key model.Key) error {
@@ -134,6 +173,7 @@ func (k *pgModuleKeys) flush(ctx context.Context) error {
 
 // Commit closes open rows not staged identically, then opens rows for staged keys left without
 // one. Unchanged keys are written by neither, so one changed operator costs a handful of rows.
+// Rows below a kept prefix were not staged and are left alone.
 func (k *pgModuleKeys) Commit(ctx context.Context) (KeyDiff, error) {
 	defer k.release()
 	if k.done {
@@ -157,11 +197,22 @@ func (k *pgModuleKeys) Commit(ctx context.Context) (KeyDiff, error) {
 
 	block := k.build.at.BlockNumber
 	diff := KeyDiff{Staged: k.staged}
+	keepOperators := make([]int32, 0, len(k.keep))
+	keepBelow := make([]int32, 0, len(k.keep))
+	for operator, n := range k.keep {
+		keepOperators = append(keepOperators, operator)
+		keepBelow = append(keepBelow, n)
+		diff.Kept += int64(n)
+	}
 
 	closed, err := tx.Exec(ctx, `
 		update key_version v set to_block = $2
 		 where v.module_id = $1
 		   and v.to_block is null
+		   -- An anti-join, not a correlated lookup per row: that one cost rows × operators.
+		   and not exists (
+		       select 1 from unnest($3::int[], $4::int[]) as k(operator_index, n)
+		        where k.operator_index = v.operator_index and v.key_index < k.n)
 		   and not exists (
 		       select 1 from staged_keys s
 		        where s.operator_index = v.operator_index
@@ -169,7 +220,7 @@ func (k *pgModuleKeys) Commit(ctx context.Context) (KeyDiff, error) {
 		          and s.pubkey = v.pubkey
 		          and s.signature = v.signature
 		          and s.used = v.used
-		          and s.vetted = v.vetted)`, k.moduleID, block)
+		          and s.vetted = v.vetted)`, k.moduleID, block, keepOperators, keepBelow)
 	if err != nil {
 		return diff, fmt.Errorf("close superseded keys: %w", err)
 	}

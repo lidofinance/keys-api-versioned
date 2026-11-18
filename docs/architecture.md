@@ -58,7 +58,7 @@ Pubkeys and signatures are `bytea`, and a key row carries a two-byte module id r
 
 Nothing changed: a block header, the module set with nonces, one log filter per module. One row update. Measured on mainnet: 0.81 s mean per cycle.
 
-A module's nonce moved: the same reads, plus that module's keys and operators, plus the rows that actually differ. Other modules are untouched. On mainnet one module holds about 90 % of the keys, so a change confined to the others is worth roughly a tenth of the work.
+A module's nonce moved: the same reads, plus that module's keys and operators, plus the rows that actually differ. Other modules are untouched. On mainnet one module holds about 90 % of the keys, so a change confined to the others is worth roughly a tenth of the work. Within the module, each operator is read from its deposited count at the finalized block on: a deposited key cannot change, and the store already holds those rows, so a deposit costs the keys that follow it rather than the whole module. The audit is the exception and reads everything, since it exists to check the rows that shortcut trusts.
 
 A reorg: the stored version's hash no longer matches the chain at its height. The loop walks its own version table to find the newest version whose block still matches, rolls everything above it back, and then runs the ordinary cycle — so a reorg with no key changes in the reorged range costs no key reads. A reorg deeper than the retained window is the one case that forces a full rebuild, and it says so in the log.
 

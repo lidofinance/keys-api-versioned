@@ -26,7 +26,7 @@ func TestGroupKeyReadsRespectsBothCaps(t *testing.T) {
 		{Index: 4, TotalSigningKeys: 1},
 	}
 
-	reads := planKeyReads(operators, 1000)
+	reads := planKeyReads(operators, nil, 1000)
 	if len(reads) != 6 {
 		t.Fatalf("got %d reads, want 6 (3 spans for operator 0, one each for 2–4)", len(reads))
 	}
@@ -51,10 +51,103 @@ func TestGroupKeyReadsRespectsBothCaps(t *testing.T) {
 
 func TestGroupKeyReadsAlwaysCarriesOneCall(t *testing.T) {
 	// A span larger than the key cap still goes out: the batch size decides a span's width.
-	reads := planKeyReads([]model.Operator{{Index: 0, TotalSigningKeys: 5000}}, 5000)
+	reads := planKeyReads([]model.Operator{{Index: 0, TotalSigningKeys: 5000}}, nil, 5000)
 	groups := groupKeyReads(reads, 200, 100)
 	if len(groups) != 1 || len(groups[0]) != 1 {
 		t.Fatalf("got %v, want a single group of one call", sizes(groups))
+	}
+}
+
+func TestPlanKeyReadsStartsAtEachOperatorsOffset(t *testing.T) {
+	operators := []model.Operator{
+		{Index: 0, TotalSigningKeys: 2500},
+		{Index: 1, TotalSigningKeys: 10}, // all deposited: nothing to read
+		{Index: 2, TotalSigningKeys: 5},  // no offset: read from 0
+	}
+	reads := planKeyReads(operators, map[int32]int32{0: 1200, 1: 10}, 1000)
+
+	want := []struct {
+		op            int32
+		offset, limit uint64
+	}{{0, 1200, 1000}, {0, 2200, 300}, {2, 0, 5}}
+	if len(reads) != len(want) {
+		t.Fatalf("got %d reads, want %d", len(reads), len(want))
+	}
+	for i, w := range want {
+		r := reads[i]
+		if r.op.Index != w.op || r.span.offset != w.offset || r.span.limit != w.limit {
+			t.Errorf("read %d: operator %d offset %d limit %d, want %d %d %d",
+				i, r.op.Index, r.span.offset, r.span.limit, w.op, w.offset, w.limit)
+		}
+	}
+}
+
+// An offset is a claim about the store; the chain at the read block decides whether it holds.
+func TestSettledOffsetsKeepOnlyDepositedAndVettedPrefixes(t *testing.T) {
+	operators := []model.Operator{
+		{Index: 0, TotalSigningKeys: 10, UsedSigningKeys: 5, StakingLimit: 7},
+		{Index: 1, TotalSigningKeys: 10, UsedSigningKeys: 5, StakingLimit: 7},
+		{Index: 2, TotalSigningKeys: 10, UsedSigningKeys: 5, StakingLimit: 3},
+		{Index: 3, TotalSigningKeys: 10, UsedSigningKeys: 5, StakingLimit: 7},
+	}
+	got := settledOffsets(operators, map[int32]int32{
+		0: 5,  // the whole deposited prefix
+		1: 6,  // more than the chain has deposited: keys removed, or the store is from another branch
+		2: 4,  // deposited but not vetted, which the contracts do not allow
+		3: -1, // nonsense
+		9: 3,  // an operator the chain does not have
+	})
+	if len(got) != 1 || got[0] != 5 {
+		t.Errorf("applied %v, want only operator 0 at 5", got)
+	}
+}
+
+// From an offset, the right keys under the right indices, and the count check still holds.
+func TestStreamKeysFromOffsets(t *testing.T) {
+	operators := []model.Operator{
+		{Index: 0, TotalSigningKeys: 2500, StakingLimit: 2500},
+		{Index: 1, TotalSigningKeys: 3, StakingLimit: 3},
+		{Index: 2, TotalSigningKeys: 4, StakingLimit: 4},
+	}
+	from := map[int32]int32{0: 1500, 1: 3}
+
+	node := &keysNode{}
+	server := httptest.NewServer(node)
+	defer server.Close()
+	client := eth.NewClient(server.URL, eth.Options{Concurrency: 4, BatchSize: 2})
+	reader := &CuratedReader{KeysBatch: 1000, CallsPerRequest: 4, KeysPerRequest: 2000, Concurrency: 3}
+
+	var got []model.Key
+	err := reader.Keys(context.Background(), client, eth.BlockRef{Tag: "latest"},
+		moduleUnderTest, operators, from, func(k model.Key) error {
+			got = append(got, k)
+			return nil
+		})
+	if err != nil {
+		t.Fatalf("Keys: %v", err)
+	}
+
+	i := 0
+	for _, op := range operators {
+		for index := from[op.Index]; index < op.TotalSigningKeys; index++ {
+			if i >= len(got) {
+				t.Fatalf("got %d keys, ran out at operator %d index %d", len(got), op.Index, index)
+			}
+			key := got[i]
+			if key.OperatorIndex != op.Index || key.Index != index || !equalBytes(key.PubkeyBin, pubkeyFor(op.Index, index)) {
+				t.Fatalf("key %d: got operator %d index %d, want operator %d index %d",
+					i, key.OperatorIndex, key.Index, op.Index, index)
+			}
+			i++
+		}
+	}
+	if i != len(got) || len(got) != 1000+4 {
+		t.Errorf("got %d keys, want 1004 (1000 after operator 0's offset, none of operator 1, all 4 of operator 2)", len(got))
+	}
+
+	if err := reader.Keys(context.Background(), client, eth.BlockRef{Tag: "latest"},
+		moduleUnderTest, operators, map[int32]int32{2: 5}, func(model.Key) error { return nil }); err == nil {
+		t.Error("an offset past the operator's keys was accepted")
 	}
 }
 
@@ -102,7 +195,7 @@ func TestStreamKeysOrder(t *testing.T) {
 
 			var got []model.Key
 			err := reader.Keys(context.Background(), client, eth.BlockRef{Tag: "latest"},
-				moduleUnderTest, operators, func(k model.Key) error {
+				moduleUnderTest, operators, nil, func(k model.Key) error {
 					got = append(got, k)
 					return nil
 				})
