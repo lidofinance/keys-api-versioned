@@ -264,6 +264,23 @@ func (h hideOperatorWatcher) Keys(ctx context.Context, at source.Ref, m model.St
 	return h.inner.Keys(ctx, at, m, fn)
 }
 
+// FinalizedBlock and KeysFrom are forwarded rather than composed like the interfaces above: without
+// them the loop runs with no finality and every rebuild reads every key. Each falls back to what the
+// loop does when the capability is missing.
+func (s scopedProvider) FinalizedBlock(ctx context.Context) (model.ELBlockSnapshot, error) {
+	if f, ok := s.Provider.(source.FinalityReporter); ok {
+		return f.FinalizedBlock(ctx)
+	}
+	return model.ELBlockSnapshot{}, nil
+}
+
+func (s scopedProvider) KeysFrom(ctx context.Context, at source.Ref, m model.StakingModule, from map[int32]int32, fn func(model.Key) error) (map[int32]int32, error) {
+	if t, ok := s.Provider.(source.TailKeyReader); ok {
+		return t.KeysFrom(ctx, at, m, from, fn)
+	}
+	return nil, s.Provider.Keys(ctx, at, m, fn)
+}
+
 func (s scopedProvider) Modules(ctx context.Context, at source.Ref) ([]model.StakingModule, error) {
 	all, err := s.Provider.Modules(ctx, at)
 	if err != nil {
