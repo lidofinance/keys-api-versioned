@@ -59,7 +59,7 @@ func (s *Server) handleModuleOperatorsKeys(w http.ResponseWriter, r *http.Reques
 		}
 
 		w.Header().Set("Content-Type", "application/json")
-		bw, out := s.newStreamWriter(w)
+		bw, out := s.newStreamWriter(ctx, w)
 		defer bw.Flush()
 
 		bw.WriteString(`{ "meta": {"elBlockSnapshot":`)
@@ -113,7 +113,7 @@ func (s *Server) handleModulesOperatorsKeysStream(w http.ResponseWriter, r *http
 		}
 
 		w.Header().Set("Content-Type", "application/json")
-		bw, out := s.newStreamWriter(w)
+		bw, out := s.newStreamWriter(ctx, w)
 		defer bw.Flush()
 
 		bw.WriteString(streamOpen)

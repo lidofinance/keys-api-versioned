@@ -11,7 +11,7 @@ The security and weakness review of November 2026 is closed except for the items
 ## Deployment and operations
 
 - **`/metrics` shares the API port.** Anyone who can reach the API reads operator names by index and endpoint hosts. Moving it to its own port needs the chart's scrape config changed in the same release.
-- **Reader and writer share one pool in `KEYS_API_MODE=all`.** A burst of slow dumps can hold every connection the writer needs. The split deployment (`ingest` plus `server`) avoids it; separate pools in one process would too.
+- **Reader and writer share one pool in `KEYS_API_MODE=all`.** Dumps and diffs take at most `STREAM_MAX_CONCURRENT` connections (half the pool by default), but a burst of short reads can still hold the rest the writer needs. The split deployment (`ingest` plus `server`) avoids it; separate pools in one process would too.
 - **Direct connections only.** Leases and the writer lock are session-level advisory locks, which a transaction-mode pooler (PgBouncer) breaks silently. Nothing checks for one.
 - **A schema change is a cold sync for readers.** Migrate now runs in one locked transaction, so two image versions no longer break each other, but readers answer 425 until the new schema has a published version. Building under a fingerprint-suffixed schema and switching readers when it publishes would remove the gap.
 - **The secrets file should be mode 0400 or 0440.** The service warns when it is readable by group or others; volumes and the vault agent default to 0644.

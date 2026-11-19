@@ -42,19 +42,23 @@ func NewServer(tb testing.TB, s store.Store) *Server {
 
 func NewServerWithExtPin(tb testing.TB, s store.Store, extPin string) *Server {
 	tb.Helper()
+	return NewServerWithConfig(tb, s, func(cfg *api.Config) { cfg.ExtPin = extPin })
+}
+
+// NewServerWithConfig: configure may change anything but Log and Observe, which the Server reads.
+func NewServerWithConfig(tb testing.TB, s store.Store, configure func(*api.Config)) *Server {
+	tb.Helper()
 
 	srv := &Server{Logs: NewLogCapture()}
-	handler := api.New(s, api.Config{
-		ChainID:    1,
-		AppVersion: "test",
-		ExtPin:     extPin,
-		Log:        slog.New(srv.Logs),
-		Observe: func(method, route string, status int, bytes int64, took time.Duration) {
-			srv.mu.Lock()
-			srv.events = append(srv.events, Event{route, status, bytes, took})
-			srv.mu.Unlock()
-		},
-	}).Handler()
+	cfg := api.Config{ChainID: 1, AppVersion: "test"}
+	configure(&cfg)
+	cfg.Log = slog.New(srv.Logs)
+	cfg.Observe = func(method, route string, status int, bytes int64, took time.Duration) {
+		srv.mu.Lock()
+		srv.events = append(srv.events, Event{route, status, bytes, took})
+		srv.mu.Unlock()
+	}
+	handler := api.New(s, cfg).Handler()
 
 	srv.Server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		srv.mu.Lock()

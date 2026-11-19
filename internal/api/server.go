@@ -28,11 +28,18 @@ type Config struct {
 	StreamWriteTimeout time.Duration
 	// MaxDiffKeys: zero means maxDiffKeys.
 	MaxDiffKeys int
+	// MaxStreams caps concurrent streaming responses; keep it below the pool size. Zero means no cap.
+	MaxStreams int
+	// StreamWait: zero means streamWait.
+	StreamWait time.Duration
+	// StreamMaxDuration: zero means streamMaxDuration.
+	StreamMaxDuration time.Duration
 }
 
 type Server struct {
-	store store.Store
-	cfg   Config
+	store   store.Store
+	cfg     Config
+	streams chan struct{}
 }
 
 func New(s store.Store, cfg Config) *Server {
@@ -42,7 +49,17 @@ func New(s store.Store, cfg Config) *Server {
 	if cfg.StreamWriteTimeout <= 0 {
 		cfg.StreamWriteTimeout = streamWriteTimeout
 	}
-	return &Server{store: s, cfg: cfg}
+	if cfg.StreamWait <= 0 {
+		cfg.StreamWait = streamWait
+	}
+	if cfg.StreamMaxDuration <= 0 {
+		cfg.StreamMaxDuration = streamMaxDuration
+	}
+	srv := &Server{store: s, cfg: cfg}
+	if cfg.MaxStreams > 0 {
+		srv.streams = make(chan struct{}, cfg.MaxStreams)
+	}
+	return srv
 }
 
 // Routes are data so a test can check them against the OpenAPI document.
@@ -53,27 +70,29 @@ type route struct {
 	// mirror: the document states the mirroring rule once and a test checks it, which also catches a
 	// canonical route added without a mirror.
 	mirror bool
+	// stream: the response can outlive a client's patience, so it takes a stream slot.
+	stream bool
 }
 
 // Diff endpoints exist only under the prefix: this service invented them, and the canonical
 // contract belongs to someone else.
 func (s *Server) routes() []route {
 	canonical := []route{
-		{pattern: "GET /v1/keys", handler: s.handleKeys},
+		{pattern: "GET /v1/keys", handler: s.handleKeys, stream: true},
 		{pattern: "GET /v1/keys/{pubkey}", handler: s.handleKeyByPubkey},
 		{pattern: "POST /v1/keys/find", handler: s.handleKeysFind},
 
 		{pattern: "GET /v1/modules", handler: s.handleModules},
-		{pattern: "GET /v1/modules/keys", handler: s.handleGroupedKeys},
+		{pattern: "GET /v1/modules/keys", handler: s.handleGroupedKeys, stream: true},
 		{pattern: "GET /v1/modules/{module_id}", handler: s.handleModule},
-		{pattern: "GET /v1/modules/{module_id}/keys", handler: s.handleModuleKeys},
+		{pattern: "GET /v1/modules/{module_id}/keys", handler: s.handleModuleKeys, stream: true},
 		{pattern: "POST /v1/modules/{module_id}/keys/find", handler: s.handleModuleKeysFind},
 
 		{pattern: "GET /v1/operators", handler: s.handleOperators},
 		{pattern: "GET /v1/modules/{module_id}/operators", handler: s.handleModuleOperators},
 		{pattern: "GET /v1/modules/{module_id}/operators/{operator_id}", handler: s.handleModuleOperator},
-		{pattern: "GET /v1/modules/{module_id}/operators/keys", handler: s.handleModuleOperatorsKeys},
-		{pattern: "GET /v2/modules/operators/keys", handler: s.handleModulesOperatorsKeysStream},
+		{pattern: "GET /v1/modules/{module_id}/operators/keys", handler: s.handleModuleOperatorsKeys, stream: true},
+		{pattern: "GET /v2/modules/operators/keys", handler: s.handleModulesOperatorsKeysStream, stream: true},
 
 		{pattern: "GET /v1/status", handler: s.handleStatus},
 	}
@@ -82,13 +101,13 @@ func (s *Server) routes() []route {
 	out = append(out, canonical...)
 	for _, r := range canonical {
 		method, path, _ := strings.Cut(r.pattern, " ")
-		out = append(out, route{pattern: method + " " + mirrorPath(path), handler: r.handler, mirror: true})
+		out = append(out, route{pattern: method + " " + mirrorPath(path), handler: r.handler, mirror: true, stream: r.stream})
 	}
 
 	out = append(out,
-		route{pattern: "GET " + extPrefix + "/keys/diff", handler: s.handleKeysDiff},
+		route{pattern: "GET " + extPrefix + "/keys/diff", handler: s.handleKeysDiff, stream: true},
 		route{pattern: "GET " + extPrefix + "/modules/diff", handler: s.handleModulesDiff},
-		route{pattern: "GET " + extPrefix + "/modules/{module_id}/keys/diff", handler: s.handleKeysDiff},
+		route{pattern: "GET " + extPrefix + "/modules/{module_id}/keys/diff", handler: s.handleKeysDiff, stream: true},
 	)
 
 	return append(out,
@@ -109,6 +128,9 @@ func (s *Server) Handler() http.Handler {
 
 	for _, r := range s.routes() {
 		handler := r.handler
+		if r.stream {
+			handler = s.limitStream(handler)
+		}
 		_, path, _ := strings.Cut(r.pattern, " ")
 		switch {
 		case r.undocumented:
