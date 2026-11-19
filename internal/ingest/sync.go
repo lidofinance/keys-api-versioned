@@ -34,6 +34,9 @@ type Syncer struct {
 	finalized model.ELBlockSnapshot
 	// retentionHeldAt is the last prune's HeldAt, reported on every cycle.
 	retentionHeldAt int64
+	// auditedAt is the block of the last rebuild that read every key from the chain. Not persisted: a
+	// restart starts it at the published version, as the block-gap rule always counted from there.
+	auditedAt int64
 
 	now func() time.Time
 	// wait sleeps between cycles; tests replace it to record the schedule.
@@ -252,6 +255,9 @@ func (s *Syncer) Cycle(ctx context.Context) (result CycleResult) {
 	}
 	result.VersionBlock = latest.BlockNumber
 	result.VersionTimestamp = latest.Timestamp
+	if s.auditedAt == 0 {
+		s.auditedAt = latest.BlockNumber
+	}
 
 	// Head behind the published version: a rolled-back node or a lagging replica. Wait, don't undo it.
 	if head.BlockNumber < latest.BlockNumber {
@@ -328,12 +334,17 @@ func (s *Syncer) Cycle(ctx context.Context) (result CycleResult) {
 			return result
 		}
 		latest = survivor
+		// A full read on the lost branch vouches for nothing on this one.
+		if s.auditedAt > latest.BlockNumber {
+			s.auditedAt = latest.BlockNumber
+		}
 	}
 
 	state := HeadState{
 		BlockNumber:  readAt.BlockNumber,
 		BlockHash:    readAt.BlockHash,
 		ModuleNonces: nonceMap(modules),
+		AuditedAt:    s.auditedAt,
 	}
 	// Asked after the module read (where a source notices it moved) and consumed, so one deploy causes
 	// one rebuild.
@@ -397,15 +408,20 @@ func (s *Syncer) Cycle(ctx context.Context) (result CycleResult) {
 			result.Err = err
 			return result
 		}
-		if err := s.rebuild(ctx, readAt, decision.ChangedModules, decision.Depth, latest.BlockNumber, !decision.Audit, finalized, &result); err != nil {
+		scope := decision.ChangedModules
+		if decision.Audit {
+			scope = nil
+		}
+		if err := s.rebuild(ctx, readAt, scope, decision.Depth, latest.BlockNumber, !decision.Audit, finalized, &result); err != nil {
 			result.Err = err
 			break
 		}
 		result.VersionBlock = head.BlockNumber
 		result.VersionTimestamp = head.Timestamp
 
-		// The audit is the only check that nonces move with keys: a healthy one writes nothing.
-		if decision.Audit && result.KeysChanged > 0 {
+		// The audit is the only check that nonces move with keys: a healthy one writes nothing. One that
+		// coincides with a nonce change writes that change, so it proves nothing either way.
+		if decision.Audit && len(decision.ChangedModules) == 0 && result.KeysChanged > 0 {
 			s.log.Error("the periodic audit changed key rows, so a module nonce did not report a change",
 				"rows_changed", result.KeysChanged, "keys_read", result.KeysStaged,
 				"version", latest.BlockNumber, "head", head.BlockNumber)
@@ -460,6 +476,8 @@ func (s *Syncer) rebuild(ctx context.Context, head model.ELBlockSnapshot, scope 
 	}()
 
 	inScope := scopeSet(scope)
+	// Whether this rebuild read every key from the chain, which is what the block-gap audit counts from.
+	everyKey := inScope == nil && depth.reads(DepthKeys)
 	for _, m := range modules {
 		read := depth
 		if inScope != nil && !inScope[m.RawAddress()] {
@@ -479,6 +497,7 @@ func (s *Syncer) rebuild(ctx context.Context, head model.ELBlockSnapshot, scope 
 				read = DepthKeys
 			}
 		}
+		everyKey = everyKey && read.reads(DepthKeys)
 		if read == DepthModule {
 			s.log.Debug("module: metadata only, contents inherited",
 				"module", m.ID, "nonce", m.Nonce)
@@ -513,6 +532,7 @@ func (s *Syncer) rebuild(ctx context.Context, head model.ELBlockSnapshot, scope 
 			keysTook = time.Since(moduleStarted)
 			result.KeysStaged += diff.Staged
 			result.KeysKept += diff.Kept
+			everyKey = everyKey && diff.Kept == 0
 			result.KeysChanged += diff.Opened + diff.Closed
 			contentChanged = diff.Changed()
 		}
@@ -555,6 +575,9 @@ func (s *Syncer) rebuild(ctx context.Context, head model.ELBlockSnapshot, scope 
 	}
 	committed = true
 	result.Rebuilt = true
+	if everyKey {
+		s.auditedAt = head.BlockNumber
+	}
 	s.log.Debug("publish: status flipped",
 		"took", time.Since(publishStarted).Round(time.Millisecond).String())
 

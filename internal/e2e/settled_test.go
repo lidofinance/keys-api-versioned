@@ -106,6 +106,67 @@ func TestTheAuditReadsEveryKey(t *testing.T) {
 	t.Fatal("no audit within 5 cycles of a gap limit of 3")
 }
 
+// One wrong answer for a deposited key is kept unread by every rebuild after it, so only the audit can
+// correct it, and it has to come due while deposits keep moving the nonce.
+func TestAWrongDepositedKeyIsCorrectedByTheAuditWhileNoncesMove(t *testing.T) {
+	db := testpg.New(t)
+	ctx := context.Background()
+	src := &lyingOnce{depositSource: newDepositSource(db.Block(0), map[[2]int]int{{1, 0}: 1}), lie: true}
+	syncer := ingest.NewSyncer(src, db.Writer, ingest.SyncConfig{MaxBlockGap: 3}, nil)
+
+	if r := syncer.Cycle(ctx); r.Err != nil {
+		t.Fatalf("cold sync: %v", r.Err)
+	}
+	src.lie = false
+
+	audited := false
+	for i := 0; i < 6 && !audited; i++ {
+		src.finalized = src.block
+		src.deposit(1, i%2)
+		r := syncer.Cycle(ctx)
+		if r.Err != nil {
+			t.Fatalf("cycle %d: %v", i, r.Err)
+		}
+		if !r.Rebuilt {
+			t.Fatalf("cycle %d: a deposit did not rebuild: %s", i, r.Reason)
+		}
+		audited = r.Audit
+	}
+	if !audited {
+		t.Fatal("no audit in 6 deposit rebuilds with a gap limit of 3")
+	}
+	verifyDeposits(t, db, src.depositSource)
+
+	// The gap now counts from the audit, so the next deposit keeps the prefix again.
+	src.finalized = src.block
+	src.deposit(1, 1)
+	if r := syncer.Cycle(ctx); r.Err != nil || r.Audit || r.KeysKept == 0 {
+		t.Errorf("the deposit after the audit: audit %t, kept %d, err %v; want a prefix-keeping rebuild", r.Audit, r.KeysKept, r.Err)
+	}
+}
+
+// lyingOnce answers one deposited key wrong while lie is set.
+type lyingOnce struct {
+	*depositSource
+	lie bool
+}
+
+func (s *lyingOnce) Keys(ctx context.Context, at source.Ref, m model.StakingModule, fn func(model.Key) error) error {
+	_, err := s.KeysFrom(ctx, at, m, nil, fn)
+	return err
+}
+
+func (s *lyingOnce) KeysFrom(ctx context.Context, at source.Ref, m model.StakingModule, from map[int32]int32, fn func(model.Key) error) (map[int32]int32, error) {
+	return s.depositSource.KeysFrom(ctx, at, m, from, func(k model.Key) error {
+		if s.lie && m.ID == 1 && k.OperatorIndex == 0 && k.Index == 0 {
+			wrong := append([]byte(nil), k.PubkeyBin...)
+			wrong[len(wrong)-1] ^= 0xff
+			k.PubkeyBin = wrong
+		}
+		return fn(k)
+	})
+}
+
 // The store holds 3 deposited keys for operator 0; the chain at the read block has 2 (keys removed
 // on a testnet, or a store from another branch). That operator is read and rewritten in full.
 func TestAPrefixTheChainNoLongerHasIsReadInFull(t *testing.T) {
