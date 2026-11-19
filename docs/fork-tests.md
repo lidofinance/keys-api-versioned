@@ -5,7 +5,7 @@ store and the HTTP surface — against an anvil fork of Hoodi at a pinned block,
 registry mutated on purpose.
 
 ```bash
-FORK_UPSTREAM_RPC=http://…-hoodi-geth… make test-fork
+FORK_UPSTREAM_RPC=http://<hoodi-el-node>:8545 make test-fork
 ```
 
 ## What the other two levels cannot do

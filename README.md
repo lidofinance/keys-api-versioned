@@ -217,7 +217,7 @@ Key reads used to go one per HTTP request, one operator at a time, so mainnet's 
 
 Aggregation earns its place exactly where a batch cannot carry the group. At the stand's throttled batch of 40, a 200-call group needs five requests plainly and one aggregated, and CSM goes 5.78 s / 53 requests to 4.44 s / 35. So the rule is not "aggregate when possible" but **aggregate when the plain path would need more than one request**, which is what the client does. Wrapping calls that already fit one batch measured slightly worse — 0.99 s against 0.87 s per quiet freshness cycle — because the node executes a dispatching contract for reads it would otherwise answer directly.
 
-**Against a hosted provider, aggregation is the only packing available.** On dRPC's free plan a JSON-RPC batch of more than three requests is refused outright (`Batch of more than 3 requests are not allowed on free plan`), which caps the plain path at 3 calls per round trip. Module 2, 14 205 keys, concurrency 2:
+**Against a hosted provider, aggregation is the only packing available.** Some hosted providers' free plans refuse a JSON-RPC batch of more than three requests outright (`Batch of more than 3 requests are not allowed on free plan`), which caps the plain path at 3 calls per round trip. Module 2, 14 205 keys, concurrency 2:
 
 | | |
 |---|---|
@@ -241,7 +241,7 @@ Nothing about this needs configuring per endpoint. Presence of the contract is p
 
 ### The endpoint list is a fallback list, and it has to behave like one
 
-`PROVIDERS_URLS` takes several endpoints, and until recently the second one was decoration. A dRPC key hit its daily compute-unit limit and answered every call with `Your key daily limit exceeded` — **inside a 200 OK**, because that is where JSON-RPC errors live. The fallback loop advanced only on transport failures, so the healthy Alchemy endpoint behind it was never asked, and both contours sat dead for a day with a working provider one line away in the config.
+`PROVIDERS_URLS` takes several endpoints, and until recently the second one was decoration. A hosted provider's key hit its daily compute-unit limit and answered every call with a limit error — **inside a 200 OK**, because that is where JSON-RPC errors live. The fallback loop advanced only on transport failures, so the healthy endpoint behind it was never asked, and ingest sat dead for a day with a working provider one line away in the config.
 
 What a failed call has to answer is not "did it fail" but "is this about the endpoint or about the call":
 
@@ -300,16 +300,16 @@ The first is that every read ran at the fastest read's cadence. The cycle polls 
 
 The second is aggregation. `PROVIDER_MULTICALL` wraps reads into one `Multicall3.aggregate3` only when a JSON-RPC batch cannot carry the group, which is right for a node of our own — measured above, the plain path is faster because the node answers reads directly instead of executing a dispatcher. On a metered provider the comparison inverts: eleven getters in one batch is one round trip and *eleven billed calls*, where one aggregate is one of each. `PROVIDER_METERED` aggregates any multi-call read, taking a quiet cycle from eleven billed calls to two — two rather than one because the module addresses the second step reads come out of the first, so the dependency is real. A flag rather than a list of known provider hosts: the list would go stale, and a deployment knows what it pays for.
 
-**It defaults to true**, because the two mistakes cost differently. Forgetting it on a hosted provider spends five times the compute units on every cycle forever, which is what emptied a 2 000 000/day key five hours into the day. Leaving it on against a node of our own costs the dispatcher the node executes instead of answering directly — 0.99 s against 0.87 s on a quiet cycle. One is an outage and the other is 120 ms, so the default belongs on the side that fails cheaply; a stand running its own node sets `PROVIDER_METERED=false`.
+**It defaults to true**, because the two mistakes cost differently. Forgetting it on a hosted provider spends five times the compute units on every cycle forever, which is enough to empty a daily quota within hours. Leaving it on against a node of our own costs the dispatcher the node executes instead of answering directly — 0.99 s against 0.87 s on a quiet cycle. One is an outage and the other is 120 ms, so the default belongs on the side that fails cheaply; a stand running its own node sets `PROVIDER_METERED=false`.
 
-Together, against dRPC's published weights — `eth_call` at 20 CU, `eth_getLogs` at 75 — the two contours go from roughly 6.5M compute units a day to about 1.15M at the current twelve-second interval, and to ~230k at sixty seconds. The 2 000 000 daily budget that used to last five hours then lasts days.
+Together, against a hosted provider's published weights — `eth_call` at 20 CU, `eth_getLogs` at 75 — two writers sharing one key go from roughly 6.5M compute units a day to about 1.15M at a twelve-second interval, and to ~230k at sixty seconds. A daily quota that used to last hours then lasts days.
 
-Two tests hold this, and they answer different questions. `TestQuietCycleRequestBudget` asserts the counts per method exactly — a cycle makes whole requests, so any new round trip fails it and either goes away or changes one number in a diff a reviewer can argue with. `TestADayOfPollingFitsTheProviderQuota` takes the profile it measures from real cycles, prices it against the provider's published compute-unit weights, projects a day of it at the deployed interval and fails when it no longer fits the 2 000 000 daily limit. Both are worth having: one added call often still fits, and the day it stops fitting is not the day it was added.
+Two tests hold this, and they answer different questions. `TestQuietCycleRequestBudget` asserts the counts per method exactly — a cycle makes whole requests, so any new round trip fails it and either goes away or changes one number in a diff a reviewer can argue with. `TestADayOfPollingFitsTheProviderQuota` takes the profile it measures from real cycles, prices it against the provider's published compute-unit weights, projects a day of it at the deployed interval and fails when it no longer fits the daily limit the test is given. Both are worth having: one added call often still fits, and the day it stops fitting is not the day it was added.
 
 The projection reports what it is made of, so a failure names the method that grew:
 
 ```
-projected 1583740 CU/day for 2 contour(s) at a 5s interval, quota 2000000 (79% used)
+projected 1583740 CU/day for 2 writer(s) at a 5s interval, quota 2000000 (79% used)
   eth_call                   14400 calls      288000 CU
   eth_getBlockByNumber       17505 calls      420120 CU
   eth_getLogs                  450 calls       33750 CU
