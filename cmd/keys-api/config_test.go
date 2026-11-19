@@ -87,3 +87,24 @@ func TestADatabaseURLRotationAsksForARestart(t *testing.T) {
 }
 
 func discard() *slog.Logger { return slog.New(slog.NewTextHandler(io.Discard, nil)) }
+
+func TestStreamsDefaultToHalfThePoolAndMustStayBelowIt(t *testing.T) {
+	t.Setenv("DATABASE_MAX_CONNS", "10")
+	if got := maxStreams(); got != 5 {
+		t.Errorf("maxStreams() = %d with a pool of 10, want 5", got)
+	}
+	t.Setenv("DATABASE_MAX_CONNS", "1")
+	if got := maxStreams(); got != 1 {
+		t.Errorf("maxStreams() = %d with a pool of 1, want 1", got)
+	}
+
+	t.Setenv("DATABASE_MAX_CONNS", "10")
+	t.Setenv("STREAM_MAX_CONCURRENT", "10")
+	if err := validateEnv(); err == nil || !strings.Contains(err.Error(), "STREAM_MAX_CONCURRENT") {
+		t.Errorf("streams at the pool size: got %v, want an error naming STREAM_MAX_CONCURRENT", err)
+	}
+	t.Setenv("STREAM_MAX_CONCURRENT", "9")
+	if err := validateEnv(); err != nil {
+		t.Errorf("streams below the pool size: %v", err)
+	}
+}

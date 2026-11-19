@@ -74,7 +74,7 @@ func (s *Server) handleKeysDiff(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	bw, _ := s.newStreamWriter(w)
+	bw, _ := s.newStreamWriter(ctx, w)
 	defer bw.Flush()
 
 	bw.WriteString(`{ "meta": `)

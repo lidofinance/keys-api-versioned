@@ -114,7 +114,7 @@ func run(log *slog.Logger, masker *logmask.Masker) error {
 	// One schema per chain: otherwise a store from another chain looks like a reorg deeper than the
 	// window and is silently rebuilt from scratch.
 	pgStore, err := ingest.NewPGStore(ctx, dsn, ingest.PGOptions{
-		MaxConns: int32(envInt("DATABASE_MAX_CONNS", 10)),
+		MaxConns: int32(databaseMaxConns()),
 		Source:   envOr("KEYS_API_SOURCE", "lido-core"),
 		ChainID:  chainID,
 		// The API comes up anyway: liveness passes, readiness says 503 until a version is served.
@@ -217,6 +217,9 @@ func run(log *slog.Logger, masker *logmask.Masker) error {
 			Log:            log,
 			MetricsHandler: m.Handler(),
 			Observe:        m.ObserveRequest,
+
+			MaxStreams:        maxStreams(),
+			StreamMaxDuration: time.Duration(envInt("STREAM_MAX_DURATION_MS", int(10*time.Minute/time.Millisecond))) * time.Millisecond,
 		}).Handler()
 
 		server = newHTTPServer(":"+envOr("PORT", "3000"), m.CountInFlight(handler))
@@ -677,6 +680,8 @@ var envLimits = map[string][2]int64{
 	"KEYS_CALLS_PER_REQUEST":           {1, 100_000},
 	"KEYS_PER_REQUEST":                 {1, 10_000_000},
 	"KEYS_READ_CONCURRENCY":            {1, 1024},
+	"STREAM_MAX_CONCURRENT":            {1, 1000},
+	"STREAM_MAX_DURATION_MS":           {1000, 86_400_000},
 }
 
 var envBools = []string{"KEYS_API_BUILD_AT_FINALIZED", "PROVIDER_METERED", "PROVIDER_MULTICALL"}
@@ -700,12 +705,21 @@ func validateEnv() error {
 			}
 		}
 	}
+	// Streams at the pool size leave readiness, /v1/status and the writer nothing to acquire.
+	if os.Getenv("STREAM_MAX_CONCURRENT") != "" && maxStreams() >= databaseMaxConns() {
+		errs = append(errs, "STREAM_MAX_CONCURRENT must be below DATABASE_MAX_CONNS")
+	}
 	if len(errs) == 0 {
 		return nil
 	}
 	sort.Strings(errs)
 	return errors.New(strings.Join(errs, "; "))
 }
+
+func databaseMaxConns() int { return envInt("DATABASE_MAX_CONNS", 10) }
+
+// maxStreams defaults to half the pool: the other half serves short reads, probes and the writer.
+func maxStreams() int { return envInt("STREAM_MAX_CONCURRENT", max(1, databaseMaxConns()/2)) }
 
 func envInt(key string, def int) int {
 	v := os.Getenv(key)

@@ -95,7 +95,7 @@ func (s *Server) handleKeys(w http.ResponseWriter, r *http.Request) {
 		}
 
 		w.Header().Set("Content-Type", "application/json")
-		bw, out := s.newStreamWriter(w)
+		bw, out := s.newStreamWriter(ctx, w)
 		defer bw.Flush()
 
 		bw.WriteString(`{ "meta": {"elBlockSnapshot":`)
@@ -158,7 +158,7 @@ func (s *Server) handleModuleKeys(w http.ResponseWriter, r *http.Request) {
 		}
 
 		w.Header().Set("Content-Type", "application/json")
-		bw, out := s.newStreamWriter(w)
+		bw, out := s.newStreamWriter(ctx, w)
 		defer bw.Flush()
 
 		bw.WriteString(`{ "meta": {"elBlockSnapshot":`)
@@ -216,7 +216,7 @@ func (s *Server) handleGroupedKeys(w http.ResponseWriter, r *http.Request) {
 		}
 
 		w.Header().Set("Content-Type", "application/json")
-		bw, out := s.newStreamWriter(w)
+		bw, out := s.newStreamWriter(ctx, w)
 		defer bw.Flush()
 
 		bw.WriteString(`{"data":[`)
