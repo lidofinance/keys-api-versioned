@@ -20,8 +20,8 @@ import (
 const (
 	// quotaCUPerDay is the key's daily limit, as quoted in the provider's error.
 	quotaCUPerDay = 2_000_000
-	// contours is how many writers share the key.
-	contours = 2
+	// writers is how many writers share the key.
+	writers = 2
 	// pollInterval must match the writer's configured UPDATE_KEYS_INTERVAL_MS.
 	pollInterval = 5 * time.Second
 	slotTime     = 12 * time.Second
@@ -59,31 +59,31 @@ func TestADayOfPollingFitsTheProviderQuota(t *testing.T) {
 	// Epoch-paced reads are charged once per epoch, not per cycle.
 	epochExtra := epoch.minus(moved)
 
-	perContour := moved.scale(movedCycles).
+	perWriter := moved.scale(movedCycles).
 		plus(idle.scale(idleCycles)).
 		plus(epochExtra.scale(epochsPerDay))
-	total := perContour.cu()*contours + auditAllowance
+	total := perWriter.cu()*writers + auditAllowance
 
-	t.Logf("projected %d CU/day for %d contour(s) at a %s interval, quota %d (%.0f%% used)\n%s",
-		total, contours, pollInterval, quotaCUPerDay,
-		100*float64(total)/quotaCUPerDay, perContour.table())
+	t.Logf("projected %d CU/day for %d writer(s) at a %s interval, quota %d (%.0f%% used)\n%s",
+		total, writers, pollInterval, quotaCUPerDay,
+		100*float64(total)/quotaCUPerDay, perWriter.table())
 
 	if total > quotaCUPerDay {
 		t.Fatalf(`a day of polling no longer fits the provider quota.
 
-  projected  %d CU/day  (%d contours at a %s interval, plus %d for audits)
+  projected  %d CU/day  (%d writers at a %s interval, plus %d for audits)
   quota      %d CU/day
   over by    %d
 
-per contour, per day:
+per writer, per day:
 %s
 Something under Cycle started making more calls. Either take the call back out, or — if
 it has to be there — say so by raising the interval in
-helm-charts-vroom/vroom-evm-kapi-writer/values-k8s-dev.yaml and pollInterval here, and
+the writer's deployment and pollInterval here, and
 work out whether the freshness it costs is acceptable. Do not raise the quota constant:
 it is what the provider grants, not a number we choose.`,
-			total, contours, pollInterval, auditAllowance,
-			quotaCUPerDay, total-quotaCUPerDay, perContour.table())
+			total, writers, pollInterval, auditAllowance,
+			quotaCUPerDay, total-quotaCUPerDay, perWriter.table())
 	}
 }
 
