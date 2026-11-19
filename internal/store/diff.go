@@ -80,7 +80,7 @@ func (a *App) DiffKeys(ctx context.Context, since, to string, moduleRef string, 
 	}
 
 	if fromBlock > toBlock {
-		return nil, fmt.Errorf("since (%d) is newer than to (%d)", fromBlock, toBlock)
+		return nil, ErrBadRequest{What: fmt.Sprintf("since (%d) is newer than to (%d)", fromBlock, toBlock), Ref: since}
 	}
 
 	// versionID, not just block: two versions share a height after a reorg.

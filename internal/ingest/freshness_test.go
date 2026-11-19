@@ -83,3 +83,31 @@ func TestEvaluate(t *testing.T) {
 		})
 	}
 }
+
+// Every rebuild moves the version, so a gap counted from it never comes due while nonces keep moving.
+func TestTheAuditCountsFromTheLastFullReadNotFromTheVersion(t *testing.T) {
+	v := version()
+
+	quiet := head()
+	quiet.AuditedAt = v.BlockNumber - 96
+	if got := Evaluate(v, quiet, 100); !got.Audit || got.Action != ActionRebuild {
+		t.Errorf("5 blocks past the version, 101 past the last full read: %s (%s), audit %t; want the audit",
+			got.Action, got.Reason, got.Audit)
+	}
+
+	moved := head()
+	moved.AuditedAt = v.BlockNumber - 96
+	moved.ModuleNonces["0x02"] = 21
+	got := Evaluate(v, moved, 100)
+	if !got.Audit {
+		t.Errorf("a nonce change with the audit due: %q, audit %t; want an audit", got.Reason, got.Audit)
+	}
+	if len(got.ChangedModules) != 1 {
+		t.Errorf("changed modules = %v, want the one whose nonce moved", got.ChangedModules)
+	}
+
+	moved.AuditedAt = v.BlockNumber - 90
+	if got := Evaluate(v, moved, 100); got.Audit {
+		t.Errorf("95 blocks since the last full read: %q is an audit, want none yet", got.Reason)
+	}
+}
