@@ -112,6 +112,25 @@ func TestAnUnknownHashRecordsTodaysBehaviour(t *testing.T) {
 	}
 }
 
+// Input, not a failure: still 400 now that an untyped diff error answers a bare 500.
+func TestADiffWithSinceNewerThanToAnswers400(t *testing.T) {
+	db := testpg.New(t)
+	ctx := context.Background()
+
+	spec := testreg.Spec{Modules: 1, OperatorsPerModule: 1, KeysPerOperator: 3}
+	older := testreg.At(db.Block(0))
+	spec.Publish(ctx, t, db.Writer, older)
+	newer := testreg.At(db.Block(1))
+	spec.WithSalt(spec.Salt+1).PublishModules(ctx, t, db.Writer, newer, 1)
+
+	srv := testpg.NewServer(t, db.Reader(t, "latest", 2))
+	res := srv.Get(t, fmt.Sprintf("/ext/v1/keys/diff?since=%d&to=%d", newer.BlockNumber, older.BlockNumber))
+	body := readBody(t, res)
+	if res.StatusCode != http.StatusBadRequest || !strings.Contains(body, "is newer than") {
+		t.Errorf("status %d, body %s; want 400 naming the order", res.StatusCode, body)
+	}
+}
+
 // A diff from a pruned version must refuse: retention deletes closed rows, so `removed` would come
 // back short and still apply cleanly. The 200 before the prune keeps the 410 from being vacuous.
 func TestADiffFromAPrunedVersionAnswers410(t *testing.T) {

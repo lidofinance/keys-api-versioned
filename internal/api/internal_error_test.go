@@ -4,11 +4,14 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/lidofinance/keys-api-versioned/internal/store"
 )
@@ -66,6 +69,32 @@ func TestErrorBodiesMatchTheCanonicalBytes(t *testing.T) {
 		New(tc.store, Config{ChainID: 1}).Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, tc.path, nil))
 		if got := rec.Body.String(); got != tc.want {
 			t.Errorf("%s: body %q, want %q", tc.name, got, tc.want)
+		}
+	}
+}
+
+// The diff routes answered 400 with the error text, so a database that is down or a pool that is
+// exhausted showed the database user, name and address to any client.
+func TestTheDiffRoutesHideADatabaseFailure(t *testing.T) {
+	pool, err := pgxpool.New(context.Background(), "postgres://diffuser:pw@127.0.0.1:1/diffdb?connect_timeout=1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+	handler := New(store.NewAppWithPool(pool, "latest"), Config{
+		ChainID: 1,
+		Log:     slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}).Handler()
+
+	for _, path := range []string{
+		"/ext/v1/keys/diff?since=1",
+		"/ext/v1/modules/diff?since=1",
+		"/ext/v1/modules/1/keys/diff?since=1",
+	} {
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, path, nil))
+		if got := rec.Body.String(); rec.Code != http.StatusInternalServerError || got != `{"statusCode":500,"message":"Internal server error"}` {
+			t.Errorf("%s: %d %s, want a bare 500", path, rec.Code, got)
 		}
 	}
 }

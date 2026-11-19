@@ -61,7 +61,7 @@ func (s *Server) handleKeysDiff(w http.ResponseWriter, r *http.Request) {
 	}
 	if err != nil {
 		if !writeStoreError(w, err) {
-			writeError(w, http.StatusBadRequest, err.Error())
+			s.internalError(w, r, err)
 		}
 		return
 	}
@@ -117,7 +117,7 @@ func (s *Server) handleModulesDiff(w http.ResponseWriter, r *http.Request) {
 	changed, err := app.ModuleDiff(r.Context(), since, q.Get("to"))
 	if err != nil {
 		if !writeStoreError(w, err) {
-			writeError(w, http.StatusBadRequest, err.Error())
+			s.internalError(w, r, err)
 		}
 		return
 	}
