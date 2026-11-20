@@ -47,3 +47,9 @@ func checksum(address string) string {
 	}
 	return string(out)
 }
+
+// IsChecksummed reports whether a 0x address is in its EIP-55 form. Uncached, unlike Checksum: it
+// takes addresses from requests, and caching those would let any client grow the cache.
+func IsChecksummed(address string) bool {
+	return checksum(address) == address
+}

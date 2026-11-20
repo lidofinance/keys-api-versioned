@@ -42,7 +42,8 @@ Generate load from inside the compose network. Through a published port on Docke
 | `GET /v1/modules/{id}/operators`, `…/operators/{operator_id}` | one module's operators, one operator |
 | `GET /v1/modules/{id}/operators/keys` | module, operators and keys in one stream |
 | `GET /v2/modules/operators/keys` | everything in one stream; what mev-monitoring reads |
-| `GET /v1/status` | `clBlockSnapshot` is null: no validator ingest |
+| `GET /v1/modules/{id}/validators/…/{operator_id}` | the two exit routes: validated as canonical, then canonical's 500 for a deployment without its validators registry |
+| `GET /v1/status` | `appVersion` is the tracked canonical release; `clBlockSnapshot` is null: no validator ingest |
 | `GET /docs`, `GET /openapi.yaml` | the API document, and a page that renders it |
 | `/health`, `/health/ready`, `/metrics` | liveness, readiness (503 until something is published), Prometheus |
 
@@ -77,7 +78,7 @@ The boundary is held by tests rather than by intent: `internal/e2e/surface_test.
 
 The document at `/openapi.yaml` is hand-written and embedded rather than generated: half of what a consumer needs to know is contract rather than struct shape — that a request without `snapshot` gets `latest`, that a cursor pins its version, that a diff's two sides reconstruct a dump when applied in order, that `409` carries the head to jump to. A test holds it to the router in both directions, so a route added without a spec entry fails the build.
 
-Not implemented: the validator exit endpoints (they need consensus layer ingest), throttling, CORS, Sentry.
+Not implemented: validator ingest from the consensus layer (the exit routes answer as a canonical deployment with `VALIDATOR_REGISTRY_ENABLE=false`), throttling, CORS, Sentry.
 
 ## One schema per chain
 
@@ -95,7 +96,7 @@ An existing deployment resyncs once when it picks this up: its rows are in `publ
 
 Tracked canonical version: **5.0.0**, plus the unreleased `develop` fixes to operator names and change detection (through `71fc5b3`). Since 4.0.1 that brought `totalWithdrawnKeys` on every operator, the `invalidName<index>` placeholder for undecodable names, CMv2 renames picked up from the `META_REGISTRY` event, and `Cache-Control` on reads.
 
-The contract is the canonical OpenAPI document itself, kept in `internal/api/testdata/canonical-openapi.json` as served by the mainnet deployment (identical, apart from `info`, to one generated from the `5.0.0` tag). `internal/api/canonical_spec_test.go` requires every canonical operation, parameter, status code and response field to be in `openapi.yaml` with a compatible type. `/openapi.yaml` is a superset: it adds `/ext/v1` and may widen a type. What is deliberately not served (the exit endpoints) or served narrower (`clBlockSnapshot`, always `null`) is listed in the test with its reason, and an entry that stops being a difference fails too. A weekly workflow compares the file with the deployment; `make canonical-spec` takes a new release. The document covers shape only: byte equality, error bodies and ignored parameters remain `cmd/diff`'s job.
+The contract is the canonical OpenAPI document itself, kept in `internal/api/testdata/canonical-openapi.json` as served by the mainnet deployment (identical, apart from `info`, to one generated from the `5.0.0` tag). `internal/api/canonical_spec_test.go` requires every canonical operation, parameter, status code and response field to be in `openapi.yaml` with a compatible type. `/openapi.yaml` is a superset: it adds `/ext/v1` and may widen a type. What is deliberately not served (the exit routes' 200, 404 and 425) or served narrower (`clBlockSnapshot`, always `null`) is listed in the test with its reason, and an entry that stops being a difference fails too. A weekly workflow compares the file with the deployment; `make canonical-spec` takes a new release. The document covers shape only: byte equality, error bodies and ignored parameters remain `cmd/diff`'s job.
 
 `cmd/diff` fetches the same endpoint from both services, sorts key arrays (neither implementation promises an order) and compares. `-live` tolerates the two being at different blocks, which they always are when both follow a chain.
 
