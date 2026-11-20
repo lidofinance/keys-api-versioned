@@ -30,8 +30,8 @@ import (
 	"github.com/lidofinance/keys-api-versioned/internal/store"
 )
 
-// appVersion is read by consumers from /v1/status, so it stays semver, not a build hash.
-const appVersion = "0.1.0-poc"
+// version is this service's own, for metrics and logs. /v1/status reports api.ContractVersion.
+const version = "0.1.0-poc"
 
 // commit is set at build time: -ldflags "-X main.commit=<sha>".
 var commit = "unknown"
@@ -107,9 +107,9 @@ func run(log *slog.Logger, masker *logmask.Masker) error {
 	chainID := int64(envInt("CHAIN_ID", 1))
 
 	// build_info's `network` label is the chain id: canonical dashboards filter on it.
-	m.SetBuildInfo("keys-api-versioned", appVersion,
+	m.SetBuildInfo("keys-api-versioned", version,
 		envOr("KEYS_API_ENV", "unknown"), strconv.FormatInt(chainID, 10))
-	m.SetBuildCommit(metricsNamespace, appVersion, commit)
+	m.SetBuildCommit(metricsNamespace, version, commit)
 
 	// One schema per chain: otherwise a store from another chain looks like a reorg deeper than the
 	// window and is silently rebuilt from scratch.
@@ -142,7 +142,7 @@ func run(log *slog.Logger, masker *logmask.Masker) error {
 
 	log.Info("keys-api starting",
 		"mode", mode, "source", envOr("KEYS_API_SOURCE", "lido-core"),
-		"app_version", appVersion, "commit", commit, "providers", redactedProviders(),
+		"app_version", version, "contract_version", api.ContractVersion, "commit", commit, "providers", redactedProviders(),
 		"pin", pin, "ext_pin", extPin)
 
 	var (
@@ -212,7 +212,7 @@ func run(log *slog.Logger, masker *logmask.Masker) error {
 		reader.Log = log
 		handler := api.New(reader, api.Config{
 			ChainID:        chainID,
-			AppVersion:     appVersion,
+			AppVersion:     api.ContractVersion,
 			ExtPin:         extPin,
 			Log:            log,
 			MetricsHandler: m.Handler(),

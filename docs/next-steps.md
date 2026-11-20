@@ -34,7 +34,7 @@ The security and weakness review of November 2026 is closed except for the items
 - **Event logs for the incremental path.** `eth_getLogs` over a range returns key additions without per-operator calls; `used`/`vetted` are state, so calls still supply the rest. `eth_subscribe("logs")` could replace polling in steady state.
 - **Erigon against geth** for wide log ranges: only geth was measured.
 - **E8, a lean TypeScript baseline** (bare HTTP, streaming query, hand-rolled serializer) against the same seeded database, to settle the language question with a number. Threshold: within 3× of the Go p50 and under 100 MiB peak at 1 CPU / 512 MiB.
-- **Validator exit endpoints** are not built.
+- **Validator ingest** from the consensus layer is not built: the exit routes answer "registry disabled". No known consumer reads them — the council daemon and the oracle do not.
 
 ## Decisions that need a person
 

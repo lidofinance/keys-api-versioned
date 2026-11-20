@@ -94,6 +94,10 @@ func (s *Server) routes() []route {
 		{pattern: "GET /v1/modules/{module_id}/operators/keys", handler: s.handleModuleOperatorsKeys, stream: true},
 		{pattern: "GET /v2/modules/operators/keys", handler: s.handleModulesOperatorsKeysStream, stream: true},
 
+		// Validated as the canonical service does, then answered as it answers without its registry.
+		{pattern: "GET /v1/modules/{module_id}/validators/validator-exits-to-prepare/{operator_id}", handler: s.handleValidatorExits},
+		{pattern: "GET /v1/modules/{module_id}/validators/generate-unsigned-exit-messages/{operator_id}", handler: s.handleValidatorExits},
+
 		{pattern: "GET /v1/status", handler: s.handleStatus},
 	}
 

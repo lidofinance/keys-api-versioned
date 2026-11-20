@@ -15,11 +15,23 @@ import (
 // canonical-spec` refreshes it; the canonical-spec workflow fails when the deployment moves on.
 const canonicalSpecFile = "testdata/canonical-openapi.json"
 
-// Canonical operations this service does not serve. Both need the consensus-layer validator set,
-// which is not ingested here.
-var canonicalNotServed = map[string]string{
-	"get /v1/modules/{module_id}/validators/validator-exits-to-prepare/{operator_id}":      "no validator ingest",
-	"get /v1/modules/{module_id}/validators/generate-unsigned-exit-messages/{operator_id}": "no validator ingest",
+// Canonical operations this service does not serve.
+var canonicalNotServed = map[string]string{}
+
+// Canonical status codes an operation never answers here, keyed "method path status". The exit
+// routes need the consensus-layer validator set, which is not ingested: after validation they
+// always answer the canonical service's 500 for a deployment without its registry.
+var canonicalStatusNotServed = map[string]string{}
+
+func init() {
+	for _, path := range []string{
+		"/v1/modules/{module_id}/validators/validator-exits-to-prepare/{operator_id}",
+		"/v1/modules/{module_id}/validators/generate-unsigned-exit-messages/{operator_id}",
+	} {
+		for _, code := range []string{"200", "404", "425"} {
+			canonicalStatusNotServed["get "+path+" "+code] = "no validator ingest"
+		}
+	}
 }
 
 // Canonical response fields this service declares narrower, keyed "method path status field".
@@ -30,7 +42,7 @@ var canonicalNarrowed = map[string]string{
 
 func TestOurSpecCoversTheCanonicalSpec(t *testing.T) {
 	canonical, ours := loadCanonicalSpec(t), loadOurSpec(t)
-	narrowedUsed := map[string]bool{}
+	narrowedUsed, statusNotServedUsed := map[string]bool{}, map[string]bool{}
 
 	for _, op := range operations(canonical) {
 		item := pathItem(ours, op.path)
@@ -63,6 +75,14 @@ func TestOurSpecCoversTheCanonicalSpec(t *testing.T) {
 		canonicalResponses, _ := op.op["responses"].(map[string]any)
 		for _, code := range sortedKeys(canonicalResponses) {
 			ourResponse, ok := ourResponses[code]
+			if reason, excluded := canonicalStatusNotServed[op.key()+" "+code]; excluded {
+				statusNotServedUsed[op.key()+" "+code] = true
+				if ok {
+					t.Errorf("%s: status %s is listed as not served (%s), but our spec documents it: drop it from canonicalStatusNotServed",
+						op.key(), code, reason)
+				}
+				continue
+			}
 			if !ok {
 				t.Errorf("%s: canonical status %s is not documented", op.key(), code)
 				continue
@@ -84,6 +104,11 @@ func TestOurSpecCoversTheCanonicalSpec(t *testing.T) {
 		}
 	}
 
+	for k, reason := range canonicalStatusNotServed {
+		if !statusNotServedUsed[k] {
+			t.Errorf("canonicalStatusNotServed %q (%s) is not in the canonical spec: drop it", k, reason)
+		}
+	}
 	for k, reason := range canonicalNarrowed {
 		if !narrowedUsed[k] {
 			t.Errorf("canonicalNarrowed %q (%s) no longer differs from the canonical spec: drop it", k, reason)

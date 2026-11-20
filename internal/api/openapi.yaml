@@ -73,6 +73,7 @@ tags:
   - name: keys
   - name: modules
   - name: operators
+  - name: validators
   - name: status
 
 paths:
@@ -531,6 +532,43 @@ paths:
         '404': { $ref: '#/components/responses/NotFound' }
         '425': { $ref: '#/components/responses/TooEarly' }
 
+  /v1/modules/{module_id}/validators/validator-exits-to-prepare/{operator_id}:
+    get:
+      tags: [validators]
+      summary: Oldest validators of an operator to exit — not served
+      description: |
+        Needs the consensus-layer validator set, which this service does not ingest.
+        Parameters are validated as the canonical service validates them; a valid
+        request gets the canonical answer for a deployment without its validators
+        registry.
+      parameters: &exitParameters
+        - $ref: '#/components/parameters/ModuleID'
+        - name: operator_id
+          in: path
+          required: true
+          schema: { type: integer, minimum: 0 }
+        - name: max_amount
+          in: query
+          required: false
+          schema: { type: integer, minimum: 0 }
+        - name: percent
+          in: query
+          required: false
+          schema: { type: integer, minimum: 0 }
+      responses:
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '500': { $ref: '#/components/responses/RegistryDisabled' }
+
+  /v1/modules/{module_id}/validators/generate-unsigned-exit-messages/{operator_id}:
+    get:
+      tags: [validators]
+      summary: Unsigned exit messages for an operator's oldest validators — not served
+      description: As `validator-exits-to-prepare`.
+      parameters: *exitParameters
+      responses:
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '500': { $ref: '#/components/responses/RegistryDisabled' }
+
   /v1/modules/{module_id}/operators/keys:
     get:
       tags: [operators]
@@ -746,6 +784,12 @@ components:
           schema: { $ref: '#/components/schemas/Error' }
     NotImplemented:
       description: This backend does not serve that part of the surface.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    RegistryDisabled:
+      description: |
+        Always, after validation: `Validators Registry is disabled. Check environment variables`.
       content:
         application/json:
           schema: { $ref: '#/components/schemas/Error' }
