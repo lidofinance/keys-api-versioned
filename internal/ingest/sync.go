@@ -23,9 +23,18 @@ type Syncer struct {
 	cfg    SyncConfig
 	log    *slog.Logger
 
-	// scannedTo is the highest block the operator event scan found empty. Without it the scan window
-	// grows from the version's block every cycle. Not persisted: a restart pays one wide scan.
+	// scannedTo is the block up to which every module's operators are known current: the scan found
+	// nothing up to it, or a rebuild read every module's operators there. A rebuild that left some
+	// modules' operators unread does not move it, so the next scan still covers its blocks. Not
+	// persisted: a restart scans from the version's block.
 	scannedTo int64
+
+	// sourceChange is kept until a rebuild publishes: the source reports a change once, and a failed
+	// rebuild must not lose it.
+	sourceChange string
+	// routerFields holds, per module address, the router fields of the published module row; nil
+	// until loaded from the store or set by a rebuild.
+	routerFields map[string]string
 
 	// Zero means never, so the first cycle does both epoch-paced reads.
 	lastScanAt      time.Time
@@ -245,7 +254,7 @@ func (s *Syncer) Cycle(ctx context.Context) (result CycleResult) {
 		result.Reason = "no published version"
 		result.VersionTimestamp = head.Timestamp
 		s.log.Info("cold start: no published version, reading every module", "head", head.BlockNumber)
-		if err := s.rebuild(ctx, readAt, nil, DepthKeys, 0, true, finalized, &result); err != nil {
+		if err := s.rebuild(ctx, readAt, nil, nil, DepthKeys, 0, true, finalized, &result); err != nil {
 			result.Err = err
 		} else {
 			result.VersionBlock = head.BlockNumber
@@ -312,6 +321,7 @@ func (s *Syncer) Cycle(ctx context.Context) (result CycleResult) {
 		result.ReorgFrom = forkPoint
 
 		s.scannedTo = 0
+		s.routerFields = nil
 
 		// Decide against the survivor: a one-block fork that changed nothing costs no key reads, where an
 		// unconditional rebuild cost a full 512 000-key mainnet read.
@@ -324,7 +334,7 @@ func (s *Syncer) Cycle(ctx context.Context) (result CycleResult) {
 			result.Action = ActionSupersede
 			result.Reason = fmt.Sprintf("reorg below the whole retained window (fork at %d): rebuilding from scratch", forkPoint)
 			s.log.Warn("reorg left no version to build on, rebuilding from scratch", "fork_point", forkPoint)
-			if err := s.rebuild(ctx, readAt, nil, DepthKeys, 0, true, finalized, &result); err != nil {
+			if err := s.rebuild(ctx, readAt, modules, nil, DepthKeys, 0, true, finalized, &result); err != nil {
 				result.Err = err
 			} else {
 				result.VersionBlock = head.BlockNumber
@@ -340,19 +350,25 @@ func (s *Syncer) Cycle(ctx context.Context) (result CycleResult) {
 		}
 	}
 
+	s.loadRouterFields(ctx, *latest)
 	state := HeadState{
-		BlockNumber:  readAt.BlockNumber,
-		BlockHash:    readAt.BlockHash,
-		ModuleNonces: nonceMap(modules),
-		AuditedAt:    s.auditedAt,
+		BlockNumber:    readAt.BlockNumber,
+		BlockHash:      readAt.BlockHash,
+		ModuleNonces:   nonceMap(modules),
+		ModulesChanged: s.routerFieldChanges(modules),
+		AuditedAt:      s.auditedAt,
 	}
-	// Asked after the module read (where a source notices it moved) and consumed, so one deploy causes
-	// one rebuild.
+	// Asked after the module read, where a source notices it moved. Kept until a rebuild publishes, so
+	// one deploy causes one successful rebuild.
 	if reporter, ok := s.source.(source.SourceChangeReporter); ok {
 		if reason, changed := reporter.SourceChanged(); changed {
-			state.SourceChange = reason
+			if s.sourceChange != "" {
+				reason = s.sourceChange + "; " + reason
+			}
+			s.sourceChange = reason
 		}
 	}
+	state.SourceChange = s.sourceChange
 
 	// The event scan runs only when the cheaper signals said nothing changed.
 	decision := Evaluate(latest.AsVersion(), state, s.cfg.MaxBlockGap)
@@ -412,7 +428,7 @@ func (s *Syncer) Cycle(ctx context.Context) (result CycleResult) {
 		if decision.Audit {
 			scope = nil
 		}
-		if err := s.rebuild(ctx, readAt, scope, decision.Depth, latest.BlockNumber, !decision.Audit, finalized, &result); err != nil {
+		if err := s.rebuild(ctx, readAt, modules, scope, decision.Depth, latest.BlockNumber, !decision.Audit, finalized, &result); err != nil {
 			result.Err = err
 			break
 		}
@@ -433,13 +449,16 @@ func (s *Syncer) Cycle(ctx context.Context) (result CycleResult) {
 }
 
 // rebuild inherits modules outside scope (nil = all) at no cost: their rows simply stay open.
-// published is the newest published block (0 = none); rows above it are an unfinished attempt's.
-func (s *Syncer) rebuild(ctx context.Context, head model.ELBlockSnapshot, scope []string, depth ReadDepth, published int64, reuse bool, finalized int64, result *CycleResult) error {
+// modules is the cycle's read at head (nil = read them here). published is the newest published
+// block (0 = none); rows above it are an unfinished attempt's.
+func (s *Syncer) rebuild(ctx context.Context, head model.ELBlockSnapshot, modules []model.StakingModule, scope []string, depth ReadDepth, published int64, reuse bool, finalized int64, result *CycleResult) error {
 	at := source.Ref{BlockHash: head.BlockHash, BlockNumber: head.BlockNumber}
 
-	modules, err := s.source.Modules(ctx, at)
-	if err != nil {
-		return fmt.Errorf("read modules: %w", err)
+	var err error
+	if modules == nil {
+		if modules, err = s.source.Modules(ctx, at); err != nil {
+			return fmt.Errorf("read modules: %w", err)
+		}
 	}
 	if len(modules) == 0 {
 		return errors.New("source returned no modules")
@@ -478,6 +497,12 @@ func (s *Syncer) rebuild(ctx context.Context, head model.ELBlockSnapshot, scope 
 	inScope := scopeSet(scope)
 	// Whether this rebuild read every key from the chain, which is what the block-gap audit counts from.
 	everyKey := inScope == nil && depth.reads(DepthKeys)
+	// Whether it read every module's operators, which is what the operator event scan counts from.
+	everyOperator := true
+	vetted, canRevet := build.(VettedFromOperators)
+	if _, derived := s.source.(source.StakingLimitVetting); !derived {
+		canRevet = false
+	}
 	for _, m := range modules {
 		read := depth
 		if inScope != nil && !inScope[m.RawAddress()] {
@@ -498,6 +523,7 @@ func (s *Syncer) rebuild(ctx context.Context, head model.ELBlockSnapshot, scope 
 			}
 		}
 		everyKey = everyKey && read.reads(DepthKeys)
+		everyOperator = everyOperator && read.reads(DepthOperators)
 		if read == DepthModule {
 			s.log.Debug("module: metadata only, contents inherited",
 				"module", m.ID, "nonce", m.Nonce)
@@ -546,12 +572,21 @@ func (s *Syncer) rebuild(ctx context.Context, head model.ELBlockSnapshot, scope 
 		if err != nil {
 			return err
 		}
-		contentChanged = contentChanged || changed > 0 || (keysKept && (inScope == nil || inScope[m.RawAddress()]))
+		// CSM and CMv2 can lower an operator's vetted count without moving the nonce. The keys were not
+		// read, so their flags follow the new staking limit here, without a key read.
+		var revetted int64
+		if canRevet && changed > 0 && !read.reads(DepthKeys) {
+			if revetted, err = vetted.VettedFromOperators(ctx, m); err != nil {
+				return err
+			}
+			result.KeysChanged += revetted
+		}
+		contentChanged = contentChanged || changed > 0 || revetted > 0 || (keysKept && (inScope == nil || inScope[m.RawAddress()]))
 
 		s.log.Info("module written",
 			"module", m.ID, "type", m.Type, "nonce", m.Nonce, "reads", read.String(),
 			"keys_read", diff.Staged, "keys_kept", diff.Kept, "keys_opened", diff.Opened, "keys_closed", diff.Closed,
-			"keys_unchanged", diff.Unchanged,
+			"keys_unchanged", diff.Unchanged, "keys_revetted", revetted,
 			"operators", len(operators), "operators_changed", changed,
 			"keys_took", keysTook.Round(time.Millisecond).String(),
 			"operators_took", time.Since(operatorsStarted).Round(time.Millisecond).String())
@@ -578,6 +613,12 @@ func (s *Syncer) rebuild(ctx context.Context, head model.ELBlockSnapshot, scope 
 	if everyKey {
 		s.auditedAt = head.BlockNumber
 	}
+	if everyOperator {
+		s.scannedTo = max(s.scannedTo, head.BlockNumber)
+	}
+	// Every rebuild writes every module row, so a pending source change is now applied.
+	s.sourceChange = ""
+	s.routerFields = routerFieldsOf(modules)
 	s.log.Debug("publish: status flipped",
 		"took", time.Since(publishStarted).Round(time.Millisecond).String())
 
@@ -765,11 +806,63 @@ func (s *Syncer) dueForEpochRead(last time.Time) bool {
 	return s.now().Sub(last) >= s.cfg.EpochDuration
 }
 
+// scanFloor is not the version's block once a mark exists: a rebuild scoped to other modules moves
+// the version without reading these operators.
 func (s *Syncer) scanFloor(versionBlock int64) int64 {
-	if s.scannedTo > versionBlock {
+	if s.scannedTo > 0 {
 		return s.scannedTo
 	}
 	return versionBlock
+}
+
+// loadRouterFields reads the published module rows once per process (and after a rollback). Without
+// the capability, or on an error, the first rebuild sets the baseline.
+func (s *Syncer) loadRouterFields(ctx context.Context, latest StoredVersion) {
+	if s.routerFields != nil {
+		return
+	}
+	reader, ok := s.store.(PublishedModules)
+	if !ok {
+		return
+	}
+	modules, err := reader.PublishedModules(ctx, latest)
+	if err != nil {
+		s.log.Warn("could not read the published module rows; router field changes wait for a rebuild", "err", err)
+		return
+	}
+	s.routerFields = routerFieldsOf(modules)
+}
+
+// routerFieldChanges is nil while the published rows are unknown. A module absent from them is left
+// to the nonce rule, which already sees it.
+func (s *Syncer) routerFieldChanges(modules []model.StakingModule) []string {
+	if s.routerFields == nil {
+		return nil
+	}
+	var changed []string
+	for _, m := range modules {
+		address := strings.ToLower(m.RawAddress())
+		if published, ok := s.routerFields[address]; ok && published != routerFieldsKey(m) {
+			changed = append(changed, m.RawAddress())
+		}
+	}
+	return changed
+}
+
+func routerFieldsOf(modules []model.StakingModule) map[string]string {
+	out := make(map[string]string, len(modules))
+	for _, m := range modules {
+		out[strings.ToLower(m.RawAddress())] = routerFieldsKey(m)
+	}
+	return out
+}
+
+// routerFieldsKey is the module row minus the nonce, which has a rule of its own, and minus
+// lastChangedBlockHash, which the writer derives.
+func routerFieldsKey(m model.StakingModule) string {
+	return fmt.Sprint(m.ID, "|", m.Type, "|", m.Name, "|", m.ModuleFee, "|", m.TreasuryFee, "|",
+		m.TargetShare, "|", m.Status, "|", m.LastDepositAt, "|", m.LastDepositBlock, "|",
+		m.ExitedValidatorsCount, "|", m.Active, "|", m.WithdrawalCredentialsType)
 }
 
 // operatorEvents: a grouped watcher answers for all modules with one eth_getLogs.

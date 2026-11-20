@@ -165,10 +165,20 @@ func (c *Client) aggregateChunk(ctx context.Context, at BlockRef, calls []Call, 
 		},
 	}})
 	if err != nil {
-		if !aggregateRefused(err) {
+		switch aggregateRefusal(err) {
+		case refusedForSize:
+			return c.aggregateFallback(ctx, at, calls, out, err)
+		case refusedUnknown:
+			// Wording no list knows says nothing about size: this chunk goes plain and the budget stays.
+			// Repeated, it pauses aggregation, which ends with the budget restored.
+			c.stats.fallbacks.Add(1)
+			c.log.Warn("aggregate failed with an unrecognised error, sending this chunk plainly",
+				"calls", len(calls), "method", calls[0].Method, "err", err)
+			c.noteSingleCallRefusal()
+			return c.callPlain(ctx, at, calls, out)
+		default:
 			return err
 		}
-		return c.aggregateFallback(ctx, at, calls, out, err)
 	}
 
 	var hexResult string
@@ -201,17 +211,39 @@ func (c *Client) aggregateChunk(ctx context.Context, at BlockRef, calls []Call, 
 	return nil
 }
 
-// aggregateRefused: an outage read as a size limit would shrink the budget for the rest of the run.
-func aggregateRefused(err error) bool {
+type refusal int
+
+const (
+	notRefused refusal = iota
+	refusedForSize
+	refusedUnknown
+)
+
+// aggregateRefusal: only a recognised refusal lowers the budget. An outage or an unrecognised error
+// read as a size limit would shrink it for the rest of the run, and at a budget of one no aggregate
+// is sent again, so nothing would ever restore it.
+func aggregateRefusal(err error) refusal {
 	var status *httpStatusError
 	if errors.As(err, &status) {
-		return status.status == http.StatusRequestEntityTooLarge
+		if status.status == http.StatusRequestEntityTooLarge {
+			return refusedForSize
+		}
+		return notRefused
 	}
 	var rpcErr *jsonRPCError
 	if !errors.As(err, &rpcErr) {
-		return false
+		return notRefused
 	}
-	return !endpointFailure(rpcErr.code, rpcErr.message) || sizeRefusal(rpcErr.message)
+	if sizeRefusal(rpcErr.message) {
+		return refusedForSize
+	}
+	switch endpoint, known := classify(rpcErr.code, rpcErr.message); {
+	case endpoint:
+		return notRefused
+	case !known:
+		return refusedUnknown
+	}
+	return refusedForSize
 }
 
 // aggregateFallback finds the size an endpoint tolerates by bisection and remembers it. A single

@@ -381,6 +381,31 @@ func (b *pgBuild) Operators(ctx context.Context, module model.StakingModule, ope
 	return changed, nil
 }
 
+// VettedFromOperators closes each kept key row whose flag disagrees with its operator's open row and
+// opens a copy with the flag corrected, the way Commit versions a changed key.
+func (b *pgBuild) VettedFromOperators(ctx context.Context, module model.StakingModule) (int64, error) {
+	tag, err := b.store.pool.Exec(ctx, `
+		with flipped as (
+			update key_version k set to_block = $2
+			  from operator_version o
+			 where k.module_id = $1 and k.to_block is null and k.from_block < $2
+			   and o.module_id = $1 and o.to_block is null and o.operator_index = k.operator_index
+			   and k.vetted <> (k.key_index < o.staking_limit)
+			returning k.operator_index, k.key_index, k.pubkey, k.signature, k.used,
+			          k.key_index < o.staking_limit as vetted)
+		insert into key_version
+			(module_id, operator_index, key_index, pubkey, signature, used, vetted, from_block, to_block)
+		select $1, operator_index, key_index, pubkey, signature, used, vetted, $2, null from flipped`,
+		module.ID, b.at.BlockNumber)
+	if err != nil {
+		return 0, fmt.Errorf("vetted flags of module %d: %w", module.ID, err)
+	}
+	if tag.RowsAffected() > 0 {
+		b.anyChanged = true
+	}
+	return tag.RowsAffected(), nil
+}
+
 func (b *pgBuild) Module(ctx context.Context, m model.StakingModule, contentChanged bool) error {
 	address, err := model.DecodeHex(m.RawAddress())
 	if err != nil {

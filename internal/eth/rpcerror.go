@@ -53,6 +53,8 @@ var endpointErrorPatterns = []string{
 	"missing trie node",
 	"state is not available",
 	"header not found",
+	// geth, for a call pinned to a block hash the node has not imported yet.
+	"header for hash not found",
 	"block range",
 	"query returned more than",
 	"response size exceeded",

@@ -25,6 +25,7 @@ func TestEndpointFailureClassification(t *testing.T) {
 		{"bad key", -32000, "invalid api key", true},
 		{"method missing", -32601, "the method eth_getProof does not exist/is not available", true},
 		{"archive state", -32000, "missing trie node", true},
+		{"block hash not imported yet", -32000, "header for hash not found", true},
 		{"range too wide", -32005, "query returned more than 10000 results", true},
 
 		// Load bearing: the Multicall3 bisect is driven by "out of gas".

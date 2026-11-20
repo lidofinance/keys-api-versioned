@@ -23,6 +23,8 @@ type fakeNode struct {
 	// Zero means no limit.
 	maxAggregate int
 	refuseAll    bool
+	// refuseNext refuses that many next aggregates, whatever their size.
+	refuseNext int
 	// refusal replaces "out of gas" as the message an aggregate is refused with.
 	refusal string
 
@@ -101,7 +103,10 @@ func (n *fakeNode) answerAggregate(id int, data []byte) rpcResponse {
 	calls := *abi.ConvertType(values[0], new([]call3)).(*[]call3)
 
 	n.mu.Lock()
-	refuse := n.refuseAll || (n.maxAggregate > 0 && len(calls) > n.maxAggregate)
+	refuse := n.refuseAll || (n.maxAggregate > 0 && len(calls) > n.maxAggregate) || n.refuseNext > 0
+	if n.refuseNext > 0 {
+		n.refuseNext--
+	}
 	refusal := n.refusal
 	n.mu.Unlock()
 	if refuse {
@@ -274,6 +279,33 @@ func TestAggregateBisectsWhenRefused(t *testing.T) {
 	}
 	if got := client.mcMaxCost.Load(); got > 2 {
 		t.Errorf("cost budget stayed at %d after a refusal", got)
+	}
+}
+
+// Wording no list knows says nothing about size. Read as a size refusal it cut a 3-call batch's budget
+// to 1, after which no aggregate went out again and nothing restored it.
+func TestAnUnrecognisedAggregateErrorKeepsTheBudget(t *testing.T) {
+	node := &fakeNode{code: []byte{0x60, 0x00}, refuseNext: 1, refusal: "something nobody has seen before"}
+	client := newTestClient(t, node, true)
+
+	calls := nonceCalls(3)
+	results, err := client.CallBatch(context.Background(), BlockRef{Tag: "latest"}, calls)
+	if err != nil {
+		t.Fatalf("CallBatch: %v", err)
+	}
+	assertNonces(t, calls, results)
+	if budget, on := client.Aggregation(); budget != defaultMulticallMaxCost || !on {
+		t.Errorf("after one unrecognised error: budget %d, on %t; want %d and true", budget, on, defaultMulticallMaxCost)
+	}
+	if stats := client.Stats(); stats.Splits != 0 {
+		t.Errorf("got stats %+v, want no split: nothing says the aggregate was too big", stats)
+	}
+
+	if _, err := client.CallBatch(context.Background(), BlockRef{Tag: "latest"}, nonceCalls(3)); err != nil {
+		t.Fatalf("second CallBatch: %v", err)
+	}
+	if _, _, aggregates := node.counts(); len(aggregates) != 1 || aggregates[0] != 3 {
+		t.Errorf("aggregates %v, want the next batch of 3 packed into one again", aggregates)
 	}
 }
 
