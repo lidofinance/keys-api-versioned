@@ -350,6 +350,11 @@ func (s *Syncer) Cycle(ctx context.Context) (result CycleResult) {
 		}
 	}
 
+	// Without a mark (a restart, a rollback) the version's block is the floor, fixed now: a rebuild on
+	// this cycle that reads no operators moves the version, and must not move the floor with it.
+	if s.scannedTo == 0 {
+		s.scannedTo = latest.BlockNumber
+	}
 	s.loadRouterFields(ctx, *latest)
 	state := HeadState{
 		BlockNumber:    readAt.BlockNumber,

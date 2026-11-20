@@ -433,6 +433,43 @@ func TestAScopedRebuildLeavesItsBlocksToTheNextScan(t *testing.T) {
 	}
 }
 
+// A restart has no mark, so the published version's block is the floor. A rebuild on the first cycle
+// that reads no operators moves the version; the floor must stay where the process found it.
+func TestARebuildRightAfterARestartKeepsTheScanFloor(t *testing.T) {
+	node := newBudgetNode()
+	server := httptest.NewServer(node)
+	defer server.Close()
+
+	first, store := budgetSyncer(t, server.URL)
+	if r := first.Cycle(context.Background()); r.Err != nil {
+		t.Fatalf("cold start: %v", r.Err)
+	}
+	published := store.latest.BlockNumber
+
+	restarted, _ := budgetSyncerOver(t, server.URL, store)
+	node.advance()
+	node.bumpNonce(budgetModules[2].address)
+	if r := restarted.Cycle(context.Background()); r.Err != nil || r.Action != ActionRebuild {
+		t.Fatalf("first cycle after the restart: action %q (%s), err %v; want a rebuild", r.Action, r.Reason, r.Err)
+	}
+
+	node.advance()
+	node.reset()
+	if r := restarted.Cycle(context.Background()); r.Err != nil || r.Action != ActionExtend {
+		t.Fatalf("next cycle: action %q (%s), err %v", r.Action, r.Reason, r.Err)
+	}
+	scans := node.scanned()
+	if len(scans) == 0 {
+		t.Fatal("no scan after the rebuild")
+	}
+	for _, scan := range scans {
+		if scan[0] != published+1 {
+			t.Errorf("scanned %d..%d, want it to start at %d, after the version the process started on",
+				scan[0], scan[1], published+1)
+		}
+	}
+}
+
 // With a scan mark each cycle scans only the blocks since the last empty scan; without it the
 // window grew by a block every cycle until the audit.
 func TestOperatorScanOnlyCoversNewBlocks(t *testing.T) {
