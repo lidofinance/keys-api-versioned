@@ -497,6 +497,7 @@ type fakeStore struct {
 	moduleWrites    []int32
 	// failOperators gives a rebuild that starts and does not finish.
 	failOperators  bool
+	failModules    bool
 	extends        int
 	staled         int
 	supersededFrom int64
@@ -598,6 +599,9 @@ func (b *fakeBuild) Operators(_ context.Context, m model.StakingModule, _ []mode
 }
 
 func (b *fakeBuild) Module(_ context.Context, m model.StakingModule, _ bool) error {
+	if b.store.failModules {
+		return errors.New("module write failed")
+	}
 	if b.nonces == nil {
 		b.nonces = map[string]int64{}
 	}

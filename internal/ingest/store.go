@@ -80,6 +80,19 @@ type PrefixKeeper interface {
 	KeepPrefix(keep map[int32]int32)
 }
 
+// PublishedModules (optional on Store) returns the module rows a version serves. A writer that just
+// started compares them with what the router reports; without it, the first rebuild sets the baseline.
+type PublishedModules interface {
+	PublishedModules(ctx context.Context, v StoredVersion) ([]model.StakingModule, error)
+}
+
+// VettedFromOperators (optional on Build) re-derives the vetted flag of a module's kept keys from the
+// operator rows just written: key index below the operator's staking limit. Only for sources that
+// derive the flag that way (source.StakingLimitVetting). Reports the rows changed.
+type VettedFromOperators interface {
+	VettedFromOperators(ctx context.Context, module model.StakingModule) (int64, error)
+}
+
 // LeftoverReporter (optional) lists modules with rows above block published (0 = all), which only a
 // build that never published can have written.
 type LeftoverReporter interface {

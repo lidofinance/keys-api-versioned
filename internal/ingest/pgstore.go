@@ -255,6 +255,39 @@ func (s *PGStore) Latest(ctx context.Context) (*StoredVersion, error) {
 	return v, nil
 }
 
+func (s *PGStore) PublishedModules(ctx context.Context, v StoredVersion) ([]model.StakingModule, error) {
+	rows, err := s.pool.Query(ctx, `
+		select module_id, address, type, name, nonce, module_fee, treasury_fee, target_share, status,
+		       last_deposit_at, last_deposit_block, exited_validators_count, active,
+		       withdrawal_credentials_type
+		  from module_version
+		 where from_block <= $1 and (to_block is null or to_block > $1)
+		 order by module_id`, v.BlockNumber)
+	if err != nil {
+		return nil, fmt.Errorf("modules of version %d: %w", v.BlockNumber, err)
+	}
+	defer rows.Close()
+
+	var out []model.StakingModule
+	for rows.Next() {
+		var (
+			m       model.StakingModule
+			id      int16
+			address []byte
+			nonce   int64
+		)
+		if err := rows.Scan(&id, &address, &m.Type, &m.Name, &nonce, &m.ModuleFee, &m.TreasuryFee,
+			&m.TargetShare, &m.Status, &m.LastDepositAt, &m.LastDepositBlock,
+			&m.ExitedValidatorsCount, &m.Active, &m.WithdrawalCredentialsType); err != nil {
+			return nil, fmt.Errorf("modules of version %d: %w", v.BlockNumber, err)
+		}
+		m.ID, m.Nonce = int32(id), int32(nonce)
+		m.SetRawAddress("0x" + hex.EncodeToString(address))
+		out = append(out, m)
+	}
+	return out, rows.Err()
+}
+
 func (s *PGStore) Recent(ctx context.Context, limit int) ([]StoredVersion, error) {
 	rows, err := s.pool.Query(ctx, `select `+versionColumns+`
 		from versions order by id desc limit $1`, limit)

@@ -301,6 +301,175 @@ func TestACMv2RenameAtTheMetaRegistryRereadsOperators(t *testing.T) {
 	}
 }
 
+// The DAO sets status, fees and share limits on the router, and no module nonce moves. Only the module
+// rows change, and the rebuild reuses the cycle's module read: the cycle costs what a quiet one does.
+func TestARouterFieldChangeRewritesModuleRowsAtNoExtraRequests(t *testing.T) {
+	node := newBudgetNode()
+	server := httptest.NewServer(node)
+	defer server.Close()
+
+	syncer, store := budgetSyncer(t, server.URL)
+	if r := syncer.Cycle(context.Background()); r.Err != nil {
+		t.Fatalf("cold start: %v", r.Err)
+	}
+	node.advance()
+	if r := syncer.Cycle(context.Background()); r.Err != nil {
+		t.Fatalf("quiet cycle: %v", r.Err)
+	}
+	keysBefore, operatorsBefore, modulesBefore := store.keyWrites, len(store.operatorWrites), len(store.moduleWrites)
+
+	node.advance()
+	node.setStatus(1)
+	node.reset()
+
+	r := syncer.Cycle(context.Background())
+	if r.Err != nil {
+		t.Fatalf("cycle after the status change: %v", r.Err)
+	}
+	if r.Action != ActionRebuild || !strings.Contains(r.Reason, "router fields") {
+		t.Fatalf("action %q (%s), want a rebuild for the router fields", r.Action, r.Reason)
+	}
+	assertEveryModuleWritten(t, store, modulesBefore)
+	if store.keyWrites != keysBefore || len(store.operatorWrites) != operatorsBefore {
+		t.Errorf("%d key and %d operator re-reads, want none: only the router's tuple moved",
+			store.keyWrites-keysBefore, len(store.operatorWrites)-operatorsBefore)
+	}
+	assertRequests(t, node, map[string]int{"eth_getBlockByNumber": 2, "eth_call": 2}, 4)
+
+	node.advance()
+	if next := syncer.Cycle(context.Background()); next.Err != nil || next.Action != ActionExtend {
+		t.Fatalf("next cycle: action %q (%s), err %v; want extend once the rows are rewritten", next.Action, next.Reason, next.Err)
+	}
+}
+
+// The source reports a contract version change once. A rebuild that fails must not use it up: with
+// the same nonces and the same decoded fields, nothing else would ever rewrite the module rows.
+func TestASourceChangeSurvivesAFailedRebuild(t *testing.T) {
+	node := newBudgetNode()
+	server := httptest.NewServer(node)
+	defer server.Close()
+
+	syncer, store := budgetSyncer(t, server.URL)
+	if r := syncer.Cycle(context.Background()); r.Err != nil {
+		t.Fatalf("cold start: %v", r.Err)
+	}
+	node.advance()
+	node.setVersion(routerContractVersion+1, 1)
+	store.failModules = true
+	if r := syncer.Cycle(context.Background()); r.Err == nil {
+		t.Fatal("want the rebuild to fail")
+	}
+
+	store.failModules = false
+	node.advance()
+	r := syncer.Cycle(context.Background())
+	if r.Err != nil {
+		t.Fatalf("cycle after the failure: %v", r.Err)
+	}
+	if r.Action != ActionRebuild || !strings.Contains(r.Reason, "contract version") {
+		t.Fatalf("action %q (%s), want the rebuild retried for the contract version", r.Action, r.Reason)
+	}
+
+	node.advance()
+	if next := syncer.Cycle(context.Background()); next.Action != ActionExtend {
+		t.Fatalf("action %q (%s), want extend once a rebuild has published", next.Action, next.Reason)
+	}
+}
+
+// A rebuild scoped to one module's keys moves the version but reads no other module's operators, so
+// the next scan must start where the last one ended, not at the new version's block. After a rebuild
+// that read every module's operators, it starts there.
+func TestAScopedRebuildLeavesItsBlocksToTheNextScan(t *testing.T) {
+	node := newBudgetNode()
+	server := httptest.NewServer(node)
+	defer server.Close()
+
+	syncer, _ := budgetSyncer(t, server.URL)
+	if r := syncer.Cycle(context.Background()); r.Err != nil {
+		t.Fatalf("cold start: %v", r.Err)
+	}
+	node.advance()
+	quiet := syncer.Cycle(context.Background())
+	if quiet.Err != nil || quiet.Action != ActionExtend {
+		t.Fatalf("quiet cycle: action %q, err %v", quiet.Action, quiet.Err)
+	}
+
+	node.advance()
+	node.bumpNonce(budgetModules[2].address)
+	if r := syncer.Cycle(context.Background()); r.Err != nil || r.Action != ActionRebuild {
+		t.Fatalf("nonce cycle: action %q (%s), err %v; want a rebuild", r.Action, r.Reason, r.Err)
+	}
+
+	node.advance()
+	node.reset()
+	if r := syncer.Cycle(context.Background()); r.Err != nil || r.Action != ActionExtend {
+		t.Fatalf("cycle after the rebuild: action %q (%s), err %v", r.Action, r.Reason, r.Err)
+	}
+	for _, scan := range node.scanned() {
+		if scan[0] != quiet.HeadBlock+1 {
+			t.Errorf("scanned %d..%d, want it to start at %d, the block after the last scan",
+				scan[0], scan[1], quiet.HeadBlock+1)
+		}
+	}
+
+	// An operator rebuild reads every module's operators: the next scan starts after it.
+	node.advance()
+	node.emitOperatorEvent(budgetModules[0].address)
+	rebuilt := syncer.Cycle(context.Background())
+	if rebuilt.Err != nil || rebuilt.Action != ActionRebuild {
+		t.Fatalf("event cycle: action %q (%s), err %v; want a rebuild", rebuilt.Action, rebuilt.Reason, rebuilt.Err)
+	}
+	node.clearOperatorEvents()
+	node.advance()
+	node.reset()
+	if r := syncer.Cycle(context.Background()); r.Err != nil || r.Action != ActionExtend {
+		t.Fatalf("cycle after the operator rebuild: action %q (%s), err %v", r.Action, r.Reason, r.Err)
+	}
+	for _, scan := range node.scanned() {
+		if scan[0] != rebuilt.HeadBlock+1 {
+			t.Errorf("scanned %d..%d, want it to start at %d, after the operator rebuild",
+				scan[0], scan[1], rebuilt.HeadBlock+1)
+		}
+	}
+}
+
+// A restart has no mark, so the published version's block is the floor. A rebuild on the first cycle
+// that reads no operators moves the version; the floor must stay where the process found it.
+func TestARebuildRightAfterARestartKeepsTheScanFloor(t *testing.T) {
+	node := newBudgetNode()
+	server := httptest.NewServer(node)
+	defer server.Close()
+
+	first, store := budgetSyncer(t, server.URL)
+	if r := first.Cycle(context.Background()); r.Err != nil {
+		t.Fatalf("cold start: %v", r.Err)
+	}
+	published := store.latest.BlockNumber
+
+	restarted, _ := budgetSyncerOver(t, server.URL, store)
+	node.advance()
+	node.bumpNonce(budgetModules[2].address)
+	if r := restarted.Cycle(context.Background()); r.Err != nil || r.Action != ActionRebuild {
+		t.Fatalf("first cycle after the restart: action %q (%s), err %v; want a rebuild", r.Action, r.Reason, r.Err)
+	}
+
+	node.advance()
+	node.reset()
+	if r := restarted.Cycle(context.Background()); r.Err != nil || r.Action != ActionExtend {
+		t.Fatalf("next cycle: action %q (%s), err %v", r.Action, r.Reason, r.Err)
+	}
+	scans := node.scanned()
+	if len(scans) == 0 {
+		t.Fatal("no scan after the rebuild")
+	}
+	for _, scan := range scans {
+		if scan[0] != published+1 {
+			t.Errorf("scanned %d..%d, want it to start at %d, after the version the process started on",
+				scan[0], scan[1], published+1)
+		}
+	}
+}
+
 // With a scan mark each cycle scans only the blocks since the last empty scan; without it the
 // window grew by a block every cycle until the audit.
 func TestOperatorScanOnlyCoversNewBlocks(t *testing.T) {
@@ -816,10 +985,12 @@ type budgetNode struct {
 	router    string
 	version   int64
 	wcType    uint8
-	nonces    map[string]int64
-	logHits   map[string]bool
-	scans     [][2]int64
-	finReads  int
+	// status is every module's router status (0 = active).
+	status   uint8
+	nonces   map[string]int64
+	logHits  map[string]bool
+	scans    [][2]int64
+	finReads int
 }
 
 func (n *budgetNode) finalizedReads() int {
@@ -883,6 +1054,12 @@ func (n *budgetNode) setVersion(version int64, wcType uint8) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	n.version, n.wcType = version, wcType
+}
+
+func (n *budgetNode) setStatus(status uint8) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	n.status = status
 }
 
 func (n *budgetNode) emitOperatorEvent(address string) {
@@ -1086,7 +1263,7 @@ func (n *budgetNode) answer(req budgetRequest) json.RawMessage {
 // Dispatch on selector, not address, as a node does: the router the locator left still answers.
 func (n *budgetNode) answerCall(id int, to string, data []byte) json.RawMessage {
 	n.mu.Lock()
-	router, nonces, version, wcType := n.router, n.nonces, n.version, n.wcType
+	router, nonces, version, wcType, status := n.router, n.nonces, n.version, n.wcType, n.status
 	n.mu.Unlock()
 
 	if len(data) < 4 {
@@ -1106,7 +1283,7 @@ func (n *budgetNode) answerCall(id int, to string, data []byte) json.RawMessage 
 		return budgetResult(id, word(big.NewInt(version).Bytes()))
 
 	case sel == selector(&eth.StakingRouterABI, "getStakingModules"):
-		packed, err := packStakingModules(wcType)
+		packed, err := packStakingModules(wcType, status)
 		if err != nil {
 			return budgetError(id, err.Error())
 		}
@@ -1196,7 +1373,7 @@ func selector(parsed *abi.ABI, method string) string {
 }
 
 // packStakingModules is real ABI encoding: the decoder reads it by reflection.
-func packStakingModules(wcType uint8) ([]byte, error) {
+func packStakingModules(wcType, status uint8) ([]byte, error) {
 	type module struct {
 		Id                         *big.Int
 		StakingModuleAddress       common.Address
@@ -1223,6 +1400,7 @@ func packStakingModules(wcType uint8) ([]byte, error) {
 			LastDepositBlock:          big.NewInt(0),
 			ExitedValidatorsCount:     big.NewInt(0),
 			WithdrawalCredentialsType: wcType,
+			Status:                    status,
 		})
 	}
 	return eth.StakingRouterABI.Methods["getStakingModules"].Outputs.Pack(modules)

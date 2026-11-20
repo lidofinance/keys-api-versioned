@@ -397,6 +397,9 @@ func (p *Provider) Operators(ctx context.Context, at source.Ref, m model.Staking
 	return r.Operators(ctx, p.client, blockRef(at), m)
 }
 
+// VettedBelowStakingLimit: both readers set Vetted as index < StakingLimit.
+func (p *Provider) VettedBelowStakingLimit() {}
+
 // Operators are read first: readers need vetted and deposited counts to set per-key flags.
 func (p *Provider) Keys(ctx context.Context, at source.Ref, m model.StakingModule, fn func(model.Key) error) error {
 	_, err := p.KeysFrom(ctx, at, m, nil, fn)
@@ -561,5 +564,6 @@ var (
 	_ source.OperatorWatcher        = (*Provider)(nil)
 	_ source.GroupedOperatorWatcher = (*Provider)(nil)
 	_ source.SourceChangeReporter   = (*Provider)(nil)
+	_ source.StakingLimitVetting    = (*Provider)(nil)
 	_ source.ChainIdentifier        = (*Provider)(nil)
 )

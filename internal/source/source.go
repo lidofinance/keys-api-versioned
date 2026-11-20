@@ -49,6 +49,13 @@ type GroupedOperatorWatcher interface {
 	OperatorsChangedAny(ctx context.Context, modules []model.StakingModule, fromBlock, toBlock int64) (bool, error)
 }
 
+// StakingLimitVetting marks a source whose keys are vetted exactly when their index is below the
+// operator's StakingLimit. A writer can then correct the flags after an operator read alone: a
+// module can lower the vetted count without moving its nonce.
+type StakingLimitVetting interface {
+	VettedBelowStakingLimit()
+}
+
 // SourceChangeReporter reports reading from different contracts (a redeploy or version bump can keep
 // every nonce equal); reading the report clears it.
 type SourceChangeReporter interface {

@@ -32,6 +32,9 @@ type HeadState struct {
 	// SourceChange names a replaced router or contract version (empty = none). No other signal sees
 	// it: a replacement router can report the same modules with the same nonces.
 	SourceChange string
+	// ModulesChanged lists modules whose router fields (status, fees, share limits, credentials type)
+	// differ from the published row. The DAO sets them on the router, so no module nonce moves.
+	ModulesChanged []string
 	// AuditedAt is the block of the last rebuild that read every key (0 = the version's block).
 	AuditedAt int64
 }
@@ -136,6 +139,17 @@ func Evaluate(v Version, head HeadState, maxBlockGap int64) Decision {
 
 	if head.OperatorEvents {
 		return Decision{Action: ActionRebuild, Reason: "operator events in range", Depth: DepthOperators}
+	}
+
+	// Last: every rebuild above rewrites every module row anyway.
+	if len(head.ModulesChanged) > 0 {
+		changed := append([]string(nil), head.ModulesChanged...)
+		sort.Strings(changed)
+		return Decision{
+			Action: ActionRebuild,
+			Reason: "router fields changed for " + strings.Join(changed, ", "),
+			Depth:  DepthModule,
+		}
 	}
 
 	return Decision{
