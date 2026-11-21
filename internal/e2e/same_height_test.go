@@ -111,3 +111,23 @@ func TestARollbackAfterTheLastReadFailsTheResponse(t *testing.T) {
 		t.Fatalf("snapshot returned %v, want ErrSuperseded", err)
 	}
 }
+
+// A client that hangs up after the last byte cancels the request mid re-check: the response failed
+// and pgx dropped the pooled connection.
+func TestAClientGoneAfterTheLastReadDoesNotFailTheResponse(t *testing.T) {
+	db := testpg.New(t)
+	ctx := context.Background()
+	spec := testreg.Spec{Modules: 1, OperatorsPerModule: 1, KeysPerOperator: 2}
+	spec.Publish(ctx, t, db.Writer, testreg.At(db.Block(0)))
+
+	reqCtx, hangUp := context.WithCancel(ctx)
+	defer hangUp()
+	err := db.Reader(t, "latest", 1).Snapshot(reqCtx, func(snap store.Snapshot) error {
+		_, err := snap.KeysByPubkeys(reqCtx, testreg.ModuleAddress(1), []string{model.EncodeHex(testreg.Pubkey(1, 0, 0, 0))})
+		hangUp()
+		return err
+	})
+	if err != nil {
+		t.Fatalf("snapshot returned %v after its last read, want nil", err)
+	}
+}

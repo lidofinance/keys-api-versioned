@@ -6,6 +6,8 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+
+	"github.com/lidofinance/keys-api-versioned/internal/store"
 )
 
 // Two-int advisory key with a constant class; leases (internal/store) take their class from the
@@ -13,7 +15,7 @@ import (
 const (
 	writerLockClass  = 0x6b617069 // "kapi"
 	migrateLockClass = writerLockClass + 1
-	writerLockKey    = `hashtext(current_setting('search_path'))`
+	writerLockKey    = `hashtext(` + store.SchemaKey + `)`
 )
 
 const (

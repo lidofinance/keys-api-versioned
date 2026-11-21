@@ -13,7 +13,11 @@ import (
 //
 // Two-int key: (class of this schema, block). The writer lock's class is a constant, so the two
 // never collide, and other advisory locks in the database are not read as leases.
-const leaseKey = `hashtext('keys-api lease ' || current_setting('search_path')), $1::int4`
+const leaseKey = `hashtext('keys-api lease ' || ` + SchemaKey + `), $1::int4`
+
+// SchemaKey names the schema unqualified tables resolve to, so every spelling of one search_path
+// takes one lock. Before that schema exists it is the raw search_path, which for chain_<id> is the same text.
+const SchemaKey = `coalesce((current_schemas(false))[1], current_setting('search_path'))`
 
 // LeaseVersion's lock lives on the caller's connection: release it before the connection
 // returns to the pool.
@@ -49,7 +53,7 @@ func LeasedVersions(ctx context.Context, pool *pgxpool.Pool) ([]int64, error) {
 		  from pg_locks
 		 where locktype = 'advisory'
 		   and objsubid = 2
-		   and classid = hashtext('keys-api lease ' || current_setting('search_path'))::oid
+		   and classid = hashtext('keys-api lease ' || `+SchemaKey+`)::oid
 		   and granted
 		   and database = (select oid from pg_database where datname = current_database())`)
 	if err != nil {
