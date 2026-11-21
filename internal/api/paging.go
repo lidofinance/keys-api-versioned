@@ -61,9 +61,12 @@ func parsePage(r *http.Request) (pageRequest, error) {
 	return p, nil
 }
 
-// pinFor: the cursor carries an exact block, so later pages follow page one's version.
+// pinFor: the cursor names page one's version by hash, so one replaced mid-walk answers 409.
 func (p pageRequest) pinFor(r *http.Request) string {
 	if p.after != nil {
+		if p.after.Hash != "" {
+			return p.after.Hash
+		}
 		return strconv.FormatInt(p.after.Block, 10)
 	}
 	return r.URL.Query().Get("snapshot")
