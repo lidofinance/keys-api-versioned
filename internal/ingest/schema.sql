@@ -42,6 +42,19 @@ create table if not exists schema_fingerprint (
     applied_at  timestamptz not null default now()
 );
 
+-- Which writer may write: each one that takes the lock bumps the epoch, and every write
+-- transaction reads it `for share` first. The bump waits for those, so a writer that lost the
+-- lock either finishes before the next one starts or finds a newer epoch and rolls back.
+-- Seeded from the clock in microseconds: a rebuild recreates the row, and an epoch counted from
+-- zero again could equal the one an old writer still holds.
+create table if not exists writer_fence (
+    id    smallint primary key default 1 check (id = 1),
+    epoch bigint   not null
+);
+insert into writer_fence (id, epoch)
+values (1, (extract(epoch from clock_timestamp()) * 1000000)::bigint)
+on conflict do nothing;
+
 create table if not exists versions (
     id                      bigserial primary key,
     -- The block the data was read at. This is the version's identity and it never

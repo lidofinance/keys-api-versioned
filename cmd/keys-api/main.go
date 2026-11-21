@@ -320,7 +320,11 @@ func runWriter(ctx context.Context, pgStore *ingest.PGStore, syncer *ingest.Sync
 		if err := pgStore.Migrate(ctx); err != nil {
 			return err
 		}
-		log.Info("schema applied")
+		epoch, err := pgStore.TakeEpoch(ctx)
+		if err != nil {
+			return err
+		}
+		log.Info("schema applied", "writer_epoch", epoch)
 		log.Info("ingest starting",
 			"source", envOr("KEYS_API_SOURCE", "lido-core"),
 			"interval_ms", envInt("UPDATE_KEYS_INTERVAL_MS", 5000),

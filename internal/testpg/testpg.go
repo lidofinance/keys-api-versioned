@@ -100,6 +100,9 @@ func New(tb testing.TB, opts ...Option) *DB {
 	if err := db.Writer.Migrate(ctx); err != nil {
 		tb.Fatalf("migrate %s: %v", schema, err)
 	}
+	if _, err := db.Writer.TakeEpoch(ctx); err != nil {
+		tb.Fatalf("writer epoch: %v", err)
+	}
 	// A wrong search_path would otherwise surface much later as an empty database.
 	db.requireSchema(tb)
 

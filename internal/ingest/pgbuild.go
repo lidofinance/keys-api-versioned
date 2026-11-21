@@ -185,7 +185,7 @@ func (k *pgModuleKeys) Commit(ctx context.Context) (KeyDiff, error) {
 		return KeyDiff{}, err
 	}
 
-	tx, err := k.conn.Begin(ctx)
+	tx, err := k.build.store.beginWrite(ctx, k.conn)
 	if err != nil {
 		return KeyDiff{}, fmt.Errorf("begin key write: %w", err)
 	}
@@ -280,7 +280,7 @@ func (b *pgBuild) Operators(ctx context.Context, module model.StakingModule, ope
 	}
 	defer conn.Release()
 
-	tx, err := conn.Begin(ctx)
+	tx, err := b.store.beginWrite(ctx, conn)
 	if err != nil {
 		return 0, fmt.Errorf("begin operator write: %w", err)
 	}
@@ -384,7 +384,12 @@ func (b *pgBuild) Operators(ctx context.Context, module model.StakingModule, ope
 // VettedFromOperators closes each kept key row whose flag disagrees with its operator's open row and
 // opens a copy with the flag corrected, the way Commit versions a changed key.
 func (b *pgBuild) VettedFromOperators(ctx context.Context, module model.StakingModule) (int64, error) {
-	tag, err := b.store.pool.Exec(ctx, `
+	tx, err := b.store.beginWrite(ctx, b.store.pool)
+	if err != nil {
+		return 0, fmt.Errorf("vetted flags of module %d: %w", module.ID, err)
+	}
+	defer tx.Rollback(ctx)
+	tag, err := tx.Exec(ctx, `
 		with flipped as (
 			update key_version k set to_block = $2
 			  from operator_version o
@@ -398,6 +403,9 @@ func (b *pgBuild) VettedFromOperators(ctx context.Context, module model.StakingM
 		select $1, operator_index, key_index, pubkey, signature, used, vetted, $2, null from flipped`,
 		module.ID, b.at.BlockNumber)
 	if err != nil {
+		return 0, fmt.Errorf("vetted flags of module %d: %w", module.ID, err)
+	}
+	if err := tx.Commit(ctx); err != nil {
 		return 0, fmt.Errorf("vetted flags of module %d: %w", module.ID, err)
 	}
 	if tag.RowsAffected() > 0 {
@@ -417,7 +425,7 @@ func (b *pgBuild) Module(ctx context.Context, m model.StakingModule, contentChan
 	}
 	b.nonces[strings.ToLower(m.RawAddress())] = int64(m.Nonce)
 
-	tx, err := b.store.pool.Begin(ctx)
+	tx, err := b.store.beginWrite(ctx, b.store.pool)
 	if err != nil {
 		return err
 	}
@@ -501,7 +509,7 @@ func (b *pgBuild) Publish(ctx context.Context, label string, finalized int64) er
 		return err
 	}
 
-	tx, err := b.store.pool.Begin(ctx)
+	tx, err := b.store.beginWrite(ctx, b.store.pool)
 	if err != nil {
 		return err
 	}
@@ -525,6 +533,7 @@ func (b *pgBuild) Publish(ctx context.Context, label string, finalized int64) er
 }
 
 // Abort leaves rows for retention: deleting them would be a second long write on a failing path.
+// Unfenced: it only retires this build's own row, which a fenced-out writer must still do.
 func (b *pgBuild) Abort(ctx context.Context) {
 	_, _ = b.store.pool.Exec(ctx,
 		`update versions set status = 'superseded' where id = $1 and status = 'building'`, b.id)

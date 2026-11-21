@@ -152,6 +152,10 @@ func (s *Syncer) Run(ctx context.Context) error {
 	failures := 0
 	for {
 		result := s.Cycle(ctx)
+		if fenced := (ErrFenced{}); errors.As(result.Err, &fenced) {
+			// Another writer holds the lock: retrying here only fails again until the ping notices.
+			return result.Err
+		}
 		failed := result.Err != nil && !errors.Is(result.Err, context.Canceled)
 		if failed {
 			failures++

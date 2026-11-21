@@ -276,3 +276,50 @@ func TestALostWriterLockStopsTheWriterAndTakesTheLockAgain(t *testing.T) {
 		t.Fatal("RunExclusive did not return after its context ended")
 	}
 }
+
+// The next writer's epoch bump waits for a write that already passed the fence check, so the old
+// writer's transaction and the new writer's first write never interleave.
+func TestTakingTheEpochWaitsForAWriteInFlight(t *testing.T) {
+	db := testpg.New(t)
+	ctx := context.Background()
+
+	tx, err := db.Writer.BeginWriteForTest(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback(ctx)
+
+	next, err := ingest.NewPGStore(ctx, db.DSN, ingest.PGOptions{Source: "testpg"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer next.Close()
+	taken := make(chan error, 1)
+	go func() {
+		_, err := next.TakeEpoch(ctx)
+		taken <- err
+	}()
+	select {
+	case err := <-taken:
+		t.Fatalf("the epoch was taken (err %v) while a write that passed the fence was open", err)
+	case <-time.After(300 * time.Millisecond):
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-taken:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the epoch was not taken after the write committed")
+	}
+	stale, err := db.Writer.BeginWriteForTest(ctx)
+	if err == nil {
+		_ = stale.Rollback(ctx)
+	}
+	if !errors.As(err, new(ingest.ErrFenced)) {
+		t.Errorf("a write by the previous writer got %v, want ErrFenced", err)
+	}
+}

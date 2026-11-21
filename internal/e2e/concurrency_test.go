@@ -273,6 +273,75 @@ func TestTwoConcurrentBuildsOverOneModuleFailRatherThanCorrupt(t *testing.T) {
 	}
 }
 
+// KAV-WRITER-01: the lock session dies mid-build, a waiting writer takes over and publishes, and the
+// first writer reaches its key commit before its ping notices.
+func TestAWriterThatLostItsLockCannotCommit(t *testing.T) {
+	testpg.Exclusive(t)
+	db := testpg.New(t)
+	ctx := context.Background()
+	spec := testreg.Spec{Modules: 1, OperatorsPerModule: 1, KeysPerOperator: 3}
+	spec.Publish(ctx, t, db.Writer, testreg.At(db.Block(0)))
+
+	lock, err := db.Writer.LockWriter(ctx, ingest.WriterLockOptions{CheckInterval: time.Hour})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lock.Release()
+	build, err := db.Writer.Begin(ctx, testreg.At(db.Block(1)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	stale := spec.WithSalt(1)
+	keys, err := build.Keys(ctx, stale.Module(1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < stale.KeysPerOperator; i++ {
+		if err := keys.Add(ctx, stale.Key(1, 0, i)); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if _, err := db.Admin().Exec(ctx, `select pg_terminate_backend(pid) from pg_locks
+		where locktype = 'advisory' and objsubid = 2 and granted and classid = x'6b617069'::int::oid
+		  and database = (select oid from pg_database where datname = current_database())`); err != nil {
+		t.Fatal(err)
+	}
+	next, err := ingest.NewPGStore(ctx, db.DSN, ingest.PGOptions{Source: "testpg"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer next.Close()
+	lockCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	nextLock, err := next.LockWriter(lockCtx, ingest.WriterLockOptions{})
+	if err != nil {
+		t.Fatalf("the waiting writer did not get the lock: %v", err)
+	}
+	defer nextLock.Release()
+	if _, err := next.TakeEpoch(ctx); err != nil {
+		t.Fatal(err)
+	}
+	current := spec.WithSalt(2)
+	current.Publish(ctx, t, next, testreg.At(db.Block(2)))
+
+	if _, err := keys.Commit(ctx); !errors.As(err, new(ingest.ErrFenced)) {
+		t.Fatalf("the old writer's key commit returned %v, want ErrFenced", err)
+	}
+	build.Abort(ctx)
+
+	srv := testpg.NewServer(t, db.Reader(t, "latest", 2))
+	resp := srv.Get(t, "/v1/keys")
+	defer resp.Body.Close()
+	verifier := testreg.NewVerifier(current)
+	if _, err := verifier.V1Keys(resp.Body); err != nil {
+		t.Fatalf("the newest version does not serve the new writer's keys: %v", err)
+	}
+	if err := verifier.Done(); err != nil {
+		t.Fatal(err)
+	}
+}
+
 // writeAsASeparateWriter is a writer process in miniature: its own store, the writer lock, one build.
 func writeAsASeparateWriter(ctx context.Context, db *testpg.DB, spec testreg.Spec, head func() model.ELBlockSnapshot, afterHead func()) (int64, error) {
 	writer, err := ingest.NewPGStore(ctx, db.DSN, ingest.PGOptions{Source: "test"})
@@ -285,6 +354,9 @@ func writeAsASeparateWriter(ctx context.Context, db *testpg.DB, spec testreg.Spe
 		return 0, err
 	}
 	defer lock.Release()
+	if _, err := writer.TakeEpoch(ctx); err != nil {
+		return 0, err
+	}
 	at := head()
 	afterHead()
 	return at.BlockNumber, buildAndPublish(ctx, writer, spec, at)
