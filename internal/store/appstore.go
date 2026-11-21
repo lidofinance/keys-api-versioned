@@ -15,6 +15,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/lidofinance/keys-api-versioned/internal/ethaddr"
+	"github.com/lidofinance/keys-api-versioned/internal/logmask"
 	"github.com/lidofinance/keys-api-versioned/internal/model"
 )
 
@@ -39,7 +40,7 @@ func (a *App) logger() *slog.Logger {
 func NewApp(ctx context.Context, dsn string, maxConns int32, pin string) (*App, error) {
 	cfg, err := pgxpool.ParseConfig(dsn)
 	if err != nil {
-		return nil, fmt.Errorf("parse dsn: %w", err)
+		return nil, fmt.Errorf("parse dsn: %w", logmask.DSNParseError(err))
 	}
 	if maxConns > 0 {
 		cfg.MaxConns = maxConns
@@ -118,7 +119,15 @@ func (a *App) Snapshot(ctx context.Context, fn func(Snapshot) error) error {
 			"confirmed_at", meta.BlockNumber, "status", status,
 			"last_changed", meta.LastChangedBlockHash)
 	}
-	return fn(snap)
+	if err := fn(snap); err != nil {
+		return err
+	}
+	// Reads run outside a transaction: a rollback committed after the last check reopens rows the
+	// last statement then saw under this version's label. One primary-key read closes that window.
+	if meta != nil {
+		return snap.stillOnChain(ctx)
+	}
+	return nil
 }
 
 func (a *App) PinnedSnapshot(ctx context.Context, pin string, fn func(Snapshot) error) error {
@@ -287,7 +296,9 @@ type appSnapshot struct {
 	// versionID: a reorg plus rebuild puts two versions at one height, so the status re-check must
 	// go by id.
 	versionID int64
-	stale     bool
+	// versionHash is the version's own block hash, set by stillOnChain; cursors carry it.
+	versionHash string
+	stale       bool
 
 	modules []model.StakingModule
 	idByHex map[string]int16
@@ -315,7 +326,7 @@ func (s *appSnapshot) ELMeta(context.Context) (*model.ELBlockSnapshot, error) {
 func (s *appSnapshot) stillOnChain(ctx context.Context) error {
 	var status string
 	err := s.conn.QueryRow(ctx,
-		`select status from versions where id = $1`, s.versionID).Scan(&status)
+		`select status, block_hash from versions where id = $1`, s.versionID).Scan(&status, &s.versionHash)
 	if errors.Is(err, pgx.ErrNoRows) {
 		// The lease should have stopped retention; whatever dropped it, the pin is gone.
 		return ErrPruned{Ref: strconv.FormatInt(s.block, 10)}

@@ -47,6 +47,9 @@ func (a *App) DiffKeys(ctx context.Context, since, to string, moduleRef string, 
 	if err != nil {
 		return nil, err
 	}
+	if err := refuseAmbiguousHeight(ctx, conn, since, fromBlock); err != nil {
+		return nil, err
+	}
 	if fromBlock == 0 {
 		return nil, ErrNotFound{Ref: since, What: "snapshot"}
 	}
@@ -205,6 +208,9 @@ func (a *App) ModuleDiff(ctx context.Context, since, to string) (map[int32]bool,
 	if err != nil {
 		return nil, err
 	}
+	if err := refuseAmbiguousHeight(ctx, conn, since, fromBlock); err != nil {
+		return nil, err
+	}
 	if fromBlock > 0 {
 		release, err := LeaseVersion(ctx, conn, fromBlock)
 		if err != nil {
@@ -272,3 +278,31 @@ func (a *App) ModuleDiff(ctx context.Context, since, to string) (map[int32]bool,
 }
 
 var _ DiffStore = (*App)(nil)
+
+// refuseAmbiguousHeight: after a reorg and a rebuild at one height a block number names two versions,
+// and a diff from the replacement applies cleanly to a base from the losing branch. A hash names one.
+func refuseAmbiguousHeight(ctx context.Context, conn pinReader, since string, block int64) error {
+	if block == 0 {
+		return nil
+	}
+	if _, err := strconv.ParseInt(since, 10, 64); err != nil {
+		return nil
+	}
+	var ambiguous bool
+	err := conn.QueryRow(ctx, `select exists (
+		select 1 from versions lost join versions served on served.block_number = lost.block_number
+		 where lost.block_number = $1 and lost.status = '`+StatusSuperseded+`'
+		   and served.status in ('`+StatusPublished+`', '`+StatusStale+`')
+		   and lost.block_hash <> served.block_hash)`, block).Scan(&ambiguous)
+	if err != nil {
+		return fmt.Errorf("check height %d for a replaced version: %w", block, err)
+	}
+	if !ambiguous {
+		return nil
+	}
+	head, lastChanged, err := appHead(ctx, conn)
+	if err != nil {
+		return err
+	}
+	return ErrSuperseded{Ref: since, HeadBlockNumber: head, HeadLastChangedBlock: lastChanged}
+}

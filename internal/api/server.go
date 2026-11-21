@@ -215,6 +215,27 @@ func markStale(w http.ResponseWriter, snap store.Snapshot) {
 	}
 }
 
+// deferJSON marshals inside a snapshot and writeBody sends it after: the pooled connection and the
+// lease go back before a slow client reads.
+func deferJSON(body *[]byte, v any) error {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+	*body = b
+	return nil
+}
+
+// writeBody writes nothing for a nil body: the snapshot already answered (425, 404).
+func writeBody(w http.ResponseWriter, body []byte) {
+	if body == nil {
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	extendWriteDeadline(w, streamWriteTimeout)
+	w.Write(body)
+}
+
 // writeJSON writes no trailing newline (json.Encoder adds one, Fastify does not): byte-identical
 // rather than merely equal.
 func writeJSON(w http.ResponseWriter, v any) error {

@@ -91,11 +91,6 @@ func Evaluate(v Version, head HeadState, maxBlockGap int64) Decision {
 		return Decision{Action: ActionSupersede, Reason: "reorg detected", Depth: DepthKeys}
 	}
 
-	// Above the nonce rule: the module rows came from a contract no longer in use; keys are not implicated.
-	if head.SourceChange != "" {
-		return Decision{Action: ActionRebuild, Reason: head.SourceChange, Depth: DepthModule}
-	}
-
 	var changed []string
 	for module, nonce := range head.ModuleNonces {
 		known, ok := v.ModuleNonces[module]
@@ -115,6 +110,10 @@ func Evaluate(v Version, head HeadState, maxBlockGap int64) Decision {
 	if len(changed) > 0 {
 		sort.Strings(changed)
 		reason := "nonce changed for " + strings.Join(changed, ", ")
+		// The scoped rebuild still rewrites every other module row, which is all a source change needs.
+		if head.SourceChange != "" {
+			reason = head.SourceChange + "; " + reason
+		}
 		if auditDue {
 			reason += fmt.Sprintf("; block gap %d since the last full read is at or above the limit %d", gap, maxBlockGap)
 		}
@@ -125,6 +124,11 @@ func Evaluate(v Version, head HeadState, maxBlockGap int64) Decision {
 			Audit:          auditDue,
 			Depth:          DepthKeys,
 		}
+	}
+
+	// The module rows came from a contract no longer in use; with no nonce moved, keys are not implicated.
+	if head.SourceChange != "" {
+		return Decision{Action: ActionRebuild, Reason: head.SourceChange, Depth: DepthModule}
 	}
 
 	if auditDue {

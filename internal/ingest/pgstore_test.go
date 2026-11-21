@@ -435,3 +435,100 @@ func TestUnfinishedBuildsCountsWhatADeadWriterLeft(t *testing.T) {
 		t.Fatalf("UnfinishedBuilds = %d, %v; want 1", n, err)
 	}
 }
+
+// Failed attempts above the only published version must not push it out of the retention window.
+func TestRetentionKeepsThePublishedVersionThroughFailedAttempts(t *testing.T) {
+	db := testpg.New(t)
+	ctx := context.Background()
+
+	spec := testreg.Spec{Modules: 1, OperatorsPerModule: 1, KeysPerOperator: 2}
+	published := testreg.At(db.Block(0))
+	spec.Publish(ctx, t, db.Writer, published)
+
+	const keep = 3
+	for i := int64(1); i <= keep+2; i++ {
+		build, err := db.Writer.Begin(ctx, testreg.At(db.Block(i)))
+		if err != nil {
+			t.Fatalf("begin attempt %d: %v", i, err)
+		}
+		build.Abort(ctx)
+	}
+
+	if _, err := db.Writer.Prune(ctx, keep); err != nil {
+		t.Fatalf("prune: %v", err)
+	}
+	latest, err := db.Writer.Latest(ctx)
+	if err != nil {
+		t.Fatalf("latest: %v", err)
+	}
+	if latest == nil || latest.BlockNumber != published.BlockNumber {
+		t.Fatalf("latest after prune is %+v, want the published version at %d", latest, published.BlockNumber)
+	}
+}
+
+// Every claim holds a lock-table slot until commit. A backlog is drained in batches, oldest first,
+// and what a batch leaves stays for the next prune.
+func TestRetentionDrainsABacklogInBatches(t *testing.T) {
+	db := testpg.New(t)
+	ctx := context.Background()
+	defer ingest.SetPruneClaimBatchForTest(2)()
+
+	spec := testreg.Spec{Modules: 1, OperatorsPerModule: 1, KeysPerOperator: 1}
+	for i := int64(0); i < 6; i++ {
+		spec.Publish(ctx, t, db.Writer, testreg.At(db.Block(i)))
+	}
+
+	count := func() int {
+		var n int
+		if err := db.Writer.Pool().QueryRow(ctx, "select count(*) from versions").Scan(&n); err != nil {
+			t.Fatalf("count versions: %v", err)
+		}
+		return n
+	}
+	for _, want := range []int{4, 2, 1, 1} {
+		if _, err := db.Writer.Prune(ctx, 1); err != nil {
+			t.Fatalf("prune: %v", err)
+		}
+		if got := count(); got != want {
+			t.Fatalf("%d versions after a prune, want %d", got, want)
+		}
+	}
+}
+
+// A static source gets a schema of its own; chain stores keep theirs.
+func TestAStaticSourceDoesNotShareTheChainsSchema(t *testing.T) {
+	dsn := testpg.DSN(t)
+	ctx := context.Background()
+	static, err := ingest.NewPGStore(ctx, dsn, ingest.PGOptions{Source: "static", ChainID: 1, Lazy: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer static.Close()
+	if got := static.Schema(); got != "static_1" {
+		t.Errorf("static source schema %q, want static_1", got)
+	}
+	chain, err := ingest.NewPGStore(ctx, dsn, ingest.PGOptions{Source: "lido-core", ChainID: 1, Lazy: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer chain.Close()
+	if got := chain.Schema(); got != "chain_1" {
+		t.Errorf("chain source schema %q, want chain_1: existing stores must not move", got)
+	}
+}
+
+// With an explicit search_path two sources can still meet in one store: the second one refuses.
+func TestMigrateRefusesAStoreAnotherSourceWrote(t *testing.T) {
+	db := testpg.New(t)
+	ctx := context.Background()
+	testreg.Spec{Modules: 1, OperatorsPerModule: 1, KeysPerOperator: 1}.Publish(ctx, t, db.Writer, testreg.At(db.Block(0)))
+
+	other, err := ingest.NewPGStore(ctx, db.DSN, ingest.PGOptions{Source: "static-other"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer other.Close()
+	if err := other.Migrate(ctx); err == nil || !strings.Contains(err.Error(), "source") {
+		t.Errorf("migrate over another source's versions: got %v, want a refusal naming the source", err)
+	}
+}

@@ -357,6 +357,7 @@ func (s *Server) findKeys(w http.ResponseWriter, r *http.Request, pubkeys []stri
 	}
 
 	ctx := r.Context()
+	var body []byte
 	err := s.snapshot(ctx, r, func(snap store.Snapshot) error {
 		markStale(w, snap)
 
@@ -389,11 +390,15 @@ func (s *Server) findKeys(w http.ResponseWriter, r *http.Request, pubkeys []stri
 			return nil
 		}
 
-		return writeJSON(w, response{Data: collected, Meta: meta{ELBlockSnapshot: elMeta}})
+		return deferJSON(&body, response{Data: collected, Meta: meta{ELBlockSnapshot: elMeta}})
 	})
-	if err != nil && !writeStoreError(w, err) {
-		s.internalError(w, r, err)
+	if err != nil {
+		if !writeStoreError(w, err) {
+			s.internalError(w, r, err)
+		}
+		return
 	}
+	writeBody(w, body)
 }
 
 func (s *Server) handleModuleKeysFind(w http.ResponseWriter, r *http.Request) {
@@ -414,6 +419,7 @@ func (s *Server) handleModuleKeysFind(w http.ResponseWriter, r *http.Request) {
 	ref := r.PathValue("module_id")
 	ctx := r.Context()
 
+	var body []byte
 	err := s.snapshot(ctx, r, func(snap store.Snapshot) error {
 		module, err := snap.ModuleByRef(ctx, ref)
 		if err != nil {
@@ -444,12 +450,16 @@ func (s *Server) handleModuleKeysFind(w http.ResponseWriter, r *http.Request) {
 			keys = []model.Key{}
 		}
 
-		return writeJSON(w, response{
+		return deferJSON(&body, response{
 			Data: data{Keys: keys, Module: *module},
 			Meta: meta{ELBlockSnapshot: elMeta},
 		})
 	})
-	if err != nil && !writeStoreError(w, err) {
-		s.internalError(w, r, err)
+	if err != nil {
+		if !writeStoreError(w, err) {
+			s.internalError(w, r, err)
+		}
+		return
 	}
+	writeBody(w, body)
 }

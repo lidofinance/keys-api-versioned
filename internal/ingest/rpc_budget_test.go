@@ -50,8 +50,8 @@ func TestQuietCycleRequestBudget(t *testing.T) {
 	}
 
 	want := map[string]int{
-		// Head plus finality pin (pacing is off here). The reorg probe is skipped while the version's
-		// block is finalized, and the head header carries the timestamp.
+		// Head plus finality pin (pacing is off here). No reorg probe: the version was built at a final
+		// block. The head header carries the timestamp.
 		"eth_getBlockByNumber": 2,
 		// One request for locator, contract version and module set; one for every getType and getNonce.
 		"eth_call": 2,
@@ -339,6 +339,90 @@ func TestARouterFieldChangeRewritesModuleRowsAtNoExtraRequests(t *testing.T) {
 	node.advance()
 	if next := syncer.Cycle(context.Background()); next.Err != nil || next.Action != ActionExtend {
 		t.Fatalf("next cycle: action %q (%s), err %v; want extend once the rows are rewritten", next.Action, next.Reason, next.Err)
+	}
+}
+
+// A router upgrade that moves a nonce in the same read still re-reads that module's keys.
+func TestARouterUpgradeWithANonceChangeRereadsThatModulesKeys(t *testing.T) {
+	node := newBudgetNode()
+	server := httptest.NewServer(node)
+	defer server.Close()
+
+	syncer, store := budgetSyncer(t, server.URL)
+	if r := syncer.Cycle(context.Background()); r.Err != nil {
+		t.Fatalf("cold start: %v", r.Err)
+	}
+	node.advance()
+	if r := syncer.Cycle(context.Background()); r.Err != nil {
+		t.Fatalf("quiet cycle: %v", r.Err)
+	}
+	keysBefore, modulesBefore := len(store.keyWriteModules), len(store.moduleWrites)
+
+	node.advance()
+	node.setVersion(routerContractVersion+1, 1)
+	node.bumpNonce(budgetModules[2].address)
+
+	r := syncer.Cycle(context.Background())
+	if r.Err != nil {
+		t.Fatalf("cycle after the upgrade: %v", r.Err)
+	}
+	if r.Action != ActionRebuild || !strings.Contains(r.Reason, "contract version") || !strings.Contains(r.Reason, "nonce changed") {
+		t.Fatalf("action %q (%s), want a rebuild naming both the upgrade and the nonce", r.Action, r.Reason)
+	}
+	assertEveryModuleWritten(t, store, modulesBefore)
+	if got := store.keyWriteModules[keysBefore:]; len(got) != 1 || got[0] != int32(budgetModules[2].id) {
+		t.Errorf("keys re-read for modules %v, want only module %d, whose nonce moved", got, budgetModules[2].id)
+	}
+
+	node.advance()
+	if next := syncer.Cycle(context.Background()); next.Err != nil || next.Action != ActionExtend {
+		t.Fatalf("next cycle: action %q (%s), err %v; want extend", next.Action, next.Reason, next.Err)
+	}
+}
+
+// Reading at the finalized block, a version is confirmed at that block, not at a head whose nonces
+// nobody compared: during a finality stall the confirmed age must climb.
+func TestAFinalizedReadConfirmsAtTheFinalizedBlock(t *testing.T) {
+	node := newBudgetNode()
+	server := httptest.NewServer(node)
+	defer server.Close()
+
+	client := eth.NewClient(server.URL, eth.Options{Concurrency: 4, BatchSize: 100, Multicall: false})
+	provider := lidocore.NewProvider(client, budgetLocator, lidocore.Options{})
+	store := newFakeStore()
+	syncer := NewSyncer(provider, store, SyncConfig{MaxBlockGap: 1000, BuildAtFinalized: true}, nil)
+
+	node.setFinal(990)
+	if r := syncer.Cycle(context.Background()); r.Err != nil {
+		t.Fatalf("cold start: %v", r.Err)
+	}
+	node.advance()
+	node.setFinal(992)
+	r := syncer.Cycle(context.Background())
+	if r.Err != nil || r.Action != ActionExtend {
+		t.Fatalf("cycle: action %q (%s), err %v; want extend", r.Action, r.Reason, r.Err)
+	}
+	if got := store.latest.HeadBlockNumber; got != 992 {
+		t.Errorf("confirmed at %d, want 992, the finalized block that was read", got)
+	}
+	if want := budgetHeader(992)["timestamp"]; hexInt(r.HeadTimestamp) != want {
+		t.Errorf("health timestamp %s, want the finalized block's %s", hexInt(r.HeadTimestamp), want)
+	}
+
+	// Finality stalls while the head moves: no module read, and the confirmation stays put.
+	for i := 0; i < 3; i++ {
+		node.advance()
+		node.reset()
+		r := syncer.Cycle(context.Background())
+		if r.Err != nil || r.Action != ActionExtend {
+			t.Fatalf("stalled cycle %d: action %q (%s), err %v", i, r.Action, r.Reason, r.Err)
+		}
+		if got := node.count("eth_call"); got != 0 {
+			t.Errorf("stalled cycle %d: eth_call %d, want 0 while the read point holds still", i, got)
+		}
+	}
+	if got := store.latest.HeadBlockNumber; got != 992 {
+		t.Errorf("confirmed at %d after the stall, want 992", got)
 	}
 }
 
@@ -991,6 +1075,8 @@ type budgetNode struct {
 	logHits  map[string]bool
 	scans    [][2]int64
 	finReads int
+	// final pins the block the finalized tag answers with; 0 answers with the head.
+	final int64
 }
 
 func (n *budgetNode) finalizedReads() int {
@@ -1048,6 +1134,12 @@ func (n *budgetNode) advance() {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	n.block++
+}
+
+func (n *budgetNode) setFinal(block int64) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	n.final = block
 }
 
 func (n *budgetNode) setVersion(version int64, wcType uint8) {
@@ -1196,12 +1288,15 @@ func (n *budgetNode) answer(req budgetRequest) json.RawMessage {
 
 		var tag string
 		_ = json.Unmarshal(req.Params[0], &tag)
+		block := head
 		if tag == "finalized" {
 			n.mu.Lock()
 			n.finReads++
+			if n.final > 0 {
+				block = n.final
+			}
 			n.mu.Unlock()
 		}
-		block := head
 		if strings.HasPrefix(tag, "0x") {
 			asked, ok := new(big.Int).SetString(strings.TrimPrefix(tag, "0x"), 16)
 			if !ok {

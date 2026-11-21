@@ -8,6 +8,8 @@ import (
 	"net/url"
 	"strings"
 	"testing"
+
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 const (
@@ -117,5 +119,35 @@ func TestFromURLsFallsBackToTheWholeTail(t *testing.T) {
 	want := []string{"/rpc/shortkey?token=abc", "not a url"}
 	if strings.Join(got, "|") != strings.Join(want, "|") {
 		t.Fatalf("FromURLs = %q, want %q", got, want)
+	}
+}
+
+// Spellings the driver accepts that a whitespace split reads differently.
+func TestFromDSNReadsTheDriversGrammar(t *testing.T) {
+	cases := map[string]struct{ dsn, leaked string }{
+		"spaces around =":    {"host=pg user=keys password = Zx81kP0qWm7Lr2 dbname=keys", "Zx81kP0qWm7Lr2"},
+		"space before =":     {"host=pg password =Zx81kP0qWm7Lr2", "Zx81kP0qWm7Lr2"},
+		"escaped space":      {`host=pg password=abcdef\ ghijkl dbname=keys`, `abcdef\ ghijkl`},
+		"quoted":             {"host=pg password='Zx81 kP0qWm7Lr2'", "Zx81 kP0qWm7Lr2"},
+		"unencoded @ in URL": {"postgres://keys:Qa7@Lm92XcVb4Tz@pg.invalid:5432/keys", "Lm92XcVb4Tz"},
+		"encoded URL":        {"postgres://keys:Qa7%40Lm92XcVb4Tz@pg:5432/keys", "Qa7@Lm92XcVb4Tz"},
+	}
+	for name, c := range cases {
+		var m Masker
+		m.Add(FromDSN(c.dsn)...)
+		if line := m.Mask("err: cannot parse `" + c.dsn + "`: lookup " + c.leaked + "@pg.invalid"); strings.Contains(line, c.leaked) {
+			t.Errorf("%s: %q still shows %q", name, line, c.leaked)
+		}
+	}
+}
+
+// The driver's parse error quotes the whole connection string.
+func TestDSNParseErrorDropsTheConnectionString(t *testing.T) {
+	_, err := pgxpool.ParseConfig("host=pg user=keys password = Zx81kP0qWm7Lr2 sslmode=verify-full sslrootcert=/missing/ca.crt")
+	if err == nil {
+		t.Fatal("want a parse error for a missing CA file")
+	}
+	if got := DSNParseError(err).Error(); strings.Contains(got, "Zx81kP0qWm7Lr2") || !strings.Contains(got, "CA file") {
+		t.Errorf("got %q: want the cause without the password", got)
 	}
 }

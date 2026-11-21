@@ -4,6 +4,7 @@ package logmask
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/url"
@@ -11,6 +12,8 @@ import (
 	"strings"
 	"sync"
 	"unicode"
+
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
 // Replacement is what a secret becomes; the same token as the canonical service's logger.
@@ -95,23 +98,113 @@ func FromURLs(list string) []string {
 	return out
 }
 
-// FromDSN returns the password of a Postgres DSN, URL or key=value form.
+// FromDSN returns the password of a Postgres DSN, URL or key=value form, read with the driver's grammar.
 func FromDSN(dsn string) []string {
-	if u, err := url.Parse(dsn); err == nil && u.Scheme != "" {
+	var found []string
+	if strings.HasPrefix(dsn, "postgres://") || strings.HasPrefix(dsn, "postgresql://") {
+		found = fromDSNURL(dsn)
+	} else {
+		found = fromKeywordValue(dsn)
+	}
+	var out []string
+	seen := map[string]bool{}
+	for _, v := range found {
+		if v != "" && !seen[v] {
+			seen[v] = true
+			out = append(out, v)
+		}
+	}
+	return out
+}
+
+// fromDSNURL: net/url ends userinfo at the last '@', the driver at the first. With an unencoded '@'
+// in the password the driver puts its tail into the host, and lookup errors print it.
+func fromDSNURL(dsn string) []string {
+	var out []string
+	if u, err := url.Parse(dsn); err == nil {
 		if p, ok := u.User.Password(); ok {
-			return []string{p}
+			out = append(out, p)
 		}
 		if p := u.Query().Get("password"); p != "" {
-			return []string{p}
+			out = append(out, p)
 		}
-		return nil
-	}
-	for _, field := range strings.Fields(dsn) {
-		if v, ok := strings.CutPrefix(field, "password="); ok {
-			return []string{strings.Trim(v, "'")}
+		if p := u.Query().Get("sslpassword"); p != "" {
+			out = append(out, p)
 		}
 	}
-	return nil
+	rest := dsn[strings.Index(dsn, "://")+3:]
+	if end := strings.IndexAny(rest, "/?"); end >= 0 {
+		rest = rest[:end]
+	}
+	if last := strings.LastIndex(rest, "@"); last >= 0 {
+		userinfo := rest[:last]
+		if _, password, ok := strings.Cut(userinfo, ":"); ok {
+			out = append(out, password)
+			if unescaped, err := url.PathUnescape(password); err == nil {
+				out = append(out, unescaped)
+			}
+			for _, part := range strings.Split(password, "@") {
+				out = append(out, part)
+			}
+		}
+	}
+	return out
+}
+
+// fromKeywordValue follows libpq: spaces around '=', single-quoted values, backslash escapes. Both
+// the raw text and the value are returned, since an error may quote either.
+func fromKeywordValue(dsn string) []string {
+	var out []string
+	s := dsn
+	for {
+		s = strings.TrimLeft(s, " \t\n\r\f\v")
+		if s == "" {
+			return out
+		}
+		eq := strings.IndexByte(s, '=')
+		if eq < 0 {
+			return out
+		}
+		key := strings.TrimSpace(s[:eq])
+		s = strings.TrimLeft(s[eq+1:], " \t\n\r\f\v")
+		var raw, value strings.Builder
+		if strings.HasPrefix(s, "'") {
+			raw.WriteByte('\'')
+			i := 1
+			for ; i < len(s); i++ {
+				c := s[i]
+				raw.WriteByte(c)
+				if c == '\\' && i+1 < len(s) {
+					i++
+					raw.WriteByte(s[i])
+					value.WriteByte(s[i])
+					continue
+				}
+				if c == '\'' {
+					break
+				}
+				value.WriteByte(c)
+			}
+			s = s[min(i+1, len(s)):]
+		} else {
+			i := 0
+			for ; i < len(s) && !unicode.IsSpace(rune(s[i])); i++ {
+				c := s[i]
+				raw.WriteByte(c)
+				if c == '\\' && i+1 < len(s) {
+					i++
+					raw.WriteByte(s[i])
+					value.WriteByte(s[i])
+					continue
+				}
+				value.WriteByte(c)
+			}
+			s = s[i:]
+		}
+		if key == "password" || key == "sslpassword" {
+			out = append(out, raw.String(), strings.Trim(raw.String(), "'"), value.String())
+		}
+	}
 }
 
 // keyLike: long enough and mixing letters with digits, so "ogrpc" or "eth-beacon-chain" stay
@@ -195,4 +288,17 @@ func (h *Handler) maskAttr(a slog.Attr) slog.Attr {
 	default:
 		return slog.Attr{Key: a.Key, Value: v}
 	}
+}
+
+// DSNParseError drops the connection string a driver parse error quotes: its own redaction misses
+// spellings such as "password = value". The cause after it carries no credential.
+func DSNParseError(err error) error {
+	var parse *pgconn.ParseConfigError
+	if !errors.As(err, &parse) {
+		return err
+	}
+	if inner := parse.Unwrap(); inner != nil {
+		return fmt.Errorf("invalid connection string: %w", inner)
+	}
+	return errors.New("invalid connection string")
 }

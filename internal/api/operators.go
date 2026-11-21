@@ -72,6 +72,7 @@ func (s *Server) handleOperators(w http.ResponseWriter, r *http.Request) {
 	}
 
 	ctx := r.Context()
+	var body []byte
 	err := s.snapshot(ctx, r, func(snap store.Snapshot) error {
 		markStale(w, snap)
 
@@ -98,11 +99,15 @@ func (s *Server) handleOperators(w http.ResponseWriter, r *http.Request) {
 			out.Data = append(out.Data, group{Operators: renderOperators(r, operators), Module: modules[i]})
 		}
 
-		return writeJSON(w, out)
+		return deferJSON(&body, out)
 	})
-	if err != nil && !writeStoreError(w, err) {
-		s.internalError(w, r, err)
+	if err != nil {
+		if !writeStoreError(w, err) {
+			s.internalError(w, r, err)
+		}
+		return
 	}
+	writeBody(w, body)
 }
 
 func (s *Server) handleModuleOperators(w http.ResponseWriter, r *http.Request) {
@@ -118,6 +123,7 @@ func (s *Server) handleModuleOperators(w http.ResponseWriter, r *http.Request) {
 	ref := r.PathValue("module_id")
 	ctx := r.Context()
 
+	var body []byte
 	err := s.snapshot(ctx, r, func(snap store.Snapshot) error {
 		module, err := snap.ModuleByRef(ctx, ref)
 		if err != nil {
@@ -145,14 +151,18 @@ func (s *Server) handleModuleOperators(w http.ResponseWriter, r *http.Request) {
 			return err
 		}
 
-		return writeJSON(w, response{
+		return deferJSON(&body, response{
 			Data: data{Operators: renderOperators(r, operators), Module: *module},
 			Meta: meta{ELBlockSnapshot: elMeta},
 		})
 	})
-	if err != nil && !writeStoreError(w, err) {
-		s.internalError(w, r, err)
+	if err != nil {
+		if !writeStoreError(w, err) {
+			s.internalError(w, r, err)
+		}
+		return
 	}
+	writeBody(w, body)
 }
 
 func (s *Server) handleModuleOperator(w http.ResponseWriter, r *http.Request) {
@@ -180,6 +190,7 @@ func (s *Server) handleModuleOperator(w http.ResponseWriter, r *http.Request) {
 	}
 
 	ctx := r.Context()
+	var body []byte
 	err = s.snapshot(ctx, r, func(snap store.Snapshot) error {
 		module, err := snap.ModuleByRef(ctx, ref)
 		if err != nil {
@@ -212,14 +223,18 @@ func (s *Server) handleModuleOperator(w http.ResponseWriter, r *http.Request) {
 			return nil
 		}
 
-		return writeJSON(w, response{
+		return deferJSON(&body, response{
 			Data: data{Operator: renderOperator(r, operators[0]), Module: *module},
 			Meta: meta{ELBlockSnapshot: elMeta},
 		})
 	})
-	if err != nil && !writeStoreError(w, err) {
-		s.internalError(w, r, err)
+	if err != nil {
+		if !writeStoreError(w, err) {
+			s.internalError(w, r, err)
+		}
+		return
 	}
+	writeBody(w, body)
 }
 
 func asNotImplemented(err error) bool {

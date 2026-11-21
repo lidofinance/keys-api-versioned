@@ -19,23 +19,30 @@ type KeyCursor struct {
 	ModuleID      int32
 	OperatorIndex int32
 	KeyIndex      int32
+	// Hash tells apart two versions a reorg left at one height. Empty in cursors issued before it,
+	// which resume by height.
+	Hash string
 }
 
 // String is readable rather than opaque, so a stuck consumer's position is visible.
 func (c KeyCursor) String() string {
-	return fmt.Sprintf("%d.%d.%d.%d", c.Block, c.ModuleID, c.OperatorIndex, c.KeyIndex)
+	s := fmt.Sprintf("%d.%d.%d.%d", c.Block, c.ModuleID, c.OperatorIndex, c.KeyIndex)
+	if c.Hash != "" {
+		s += "." + c.Hash
+	}
+	return s
 }
 
 func ParseKeyCursor(s string) (KeyCursor, error) {
 	parts := strings.Split(s, ".")
-	if len(parts) != 4 {
-		return KeyCursor{}, fmt.Errorf("cursor must be block.module.operator.index, got %q", s)
+	if len(parts) != 4 && len(parts) != 5 {
+		return KeyCursor{}, fmt.Errorf("cursor must be block.module.operator.index.hash, got %q", s)
 	}
 	var (
 		c      KeyCursor
 		values [4]int64
 	)
-	for i, p := range parts {
+	for i, p := range parts[:4] {
 		bits := 32
 		if i == 0 {
 			bits = 64
@@ -50,7 +57,25 @@ func ParseKeyCursor(s string) (KeyCursor, error) {
 	c.ModuleID = int32(values[1])
 	c.OperatorIndex = int32(values[2])
 	c.KeyIndex = int32(values[3])
+	if len(parts) == 5 {
+		if !isBlockHash(parts[4]) {
+			return KeyCursor{}, fmt.Errorf("cursor part 5 is not a block hash: %q", parts[4])
+		}
+		c.Hash = strings.ToLower(parts[4])
+	}
 	return c, nil
+}
+
+func isBlockHash(s string) bool {
+	if len(s) != 66 || !strings.HasPrefix(s, "0x") {
+		return false
+	}
+	for _, r := range s[2:] {
+		if !(r >= '0' && r <= '9' || r >= 'a' && r <= 'f' || r >= 'A' && r <= 'F') {
+			return false
+		}
+	}
+	return true
 }
 
 type KeyPage struct {
@@ -147,6 +172,7 @@ func (s *appSnapshot) StreamKeysPage(ctx context.Context, f model.KeysFilter, pa
 		sent++
 		last = KeyCursor{
 			Block:         s.block,
+			Hash:          s.versionHash,
 			ModuleID:      int32(moduleID),
 			OperatorIndex: k.OperatorIndex,
 			KeyIndex:      k.Index,

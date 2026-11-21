@@ -194,3 +194,37 @@ func verifyContent(t *testing.T, db *testpg.DB, salts map[int]uint64) {
 		t.Fatalf("read the latest version: %v", err)
 	}
 }
+
+// A retried audit re-reads rows an unfinished attempt already opened, so its own diff is empty; the
+// version's lastChangedBlockHash must still move.
+func TestARetriedAuditMovesTheRefreshSignal(t *testing.T) {
+	db := testpg.New(t)
+	ctx := context.Background()
+	src := newSpecSource(db.Block(0))
+	// Every cycle is an audit: reuse is off, as in the periodic full read.
+	syncer := ingest.NewSyncer(src, db.Writer, ingest.SyncConfig{MaxBlockGap: 1}, nil)
+	if r := syncer.Cycle(ctx); r.Err != nil {
+		t.Fatalf("cold sync: %v", r.Err)
+	}
+
+	src.salts[2] = 1
+	src.failKeys[3] = 1
+	if r := syncer.Cycle(ctx); r.Err == nil {
+		t.Fatal("the audit should fail on module 3, after module 2 is written")
+	}
+	r := syncer.Cycle(ctx)
+	if r.Err != nil || !r.Rebuilt {
+		t.Fatalf("the retry: rebuilt %t, err %v", r.Rebuilt, r.Err)
+	}
+	verifyContent(t, db, src.salts)
+
+	var block, hash, lastChanged string
+	if err := db.Writer.Pool().QueryRow(ctx, `select block_number::text, block_hash, last_changed_block_hash
+		  from versions where status = 'published' order by block_number desc limit 1`).
+		Scan(&block, &hash, &lastChanged); err != nil {
+		t.Fatalf("newest version: %v", err)
+	}
+	if lastChanged != hash {
+		t.Errorf("version %s reports lastChangedBlockHash %s, want its own hash %s: module 2 changed", block, lastChanged, hash)
+	}
+}

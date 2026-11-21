@@ -2,13 +2,16 @@ package e2e
 
 import (
 	"context"
+	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/lidofinance/keys-api-versioned/internal/api"
+	"github.com/lidofinance/keys-api-versioned/internal/model"
 	"github.com/lidofinance/keys-api-versioned/internal/store"
 	"github.com/lidofinance/keys-api-versioned/internal/testpg"
 	"github.com/lidofinance/keys-api-versioned/internal/testreg"
@@ -94,5 +97,51 @@ func TestHeldDumpsLeaveThePoolForProbesAndStatus(t *testing.T) {
 			t.Fatalf("%d connection(s) still acquired after the held dumps ended", pool.Stat().AcquiredConns())
 		}
 		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// A client that stops reading a buffered answer must not hold a pooled connection: one such client
+// per connection would leave readiness nothing.
+func TestAStalledLookupDoesNotHoldThePool(t *testing.T) {
+	testpg.Exclusive(t)
+
+	db := testpg.New(t)
+	ctx := context.Background()
+	spec := testreg.Streaming()
+	spec.Publish(ctx, t, db.Writer, testreg.At(db.Block(0)))
+
+	pool := db.ReaderPool(t, 1)
+	reader := store.NewAppWithPool(pool, "")
+	reader.AcquireTimeout = time.Second
+	srv := testpg.NewServer(t, reader)
+
+	// About 4 MB of answer, far beyond what the sockets buffer.
+	var body strings.Builder
+	body.WriteString(`{"pubkeys":[`)
+	for i := 0; i < 10000; i++ {
+		if i > 0 {
+			body.WriteByte(',')
+		}
+		body.WriteString(`"` + model.EncodeHex(testreg.Pubkey(1+i%spec.Modules, (i/spec.Modules)%spec.OperatorsPerModule, i/(spec.Modules*spec.OperatorsPerModule), 0)) + `"`)
+	}
+	body.WriteString(`]}`)
+
+	conn, err := net.Dial("tcp", strings.TrimPrefix(srv.URL, "http://"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	conn.(*net.TCPConn).SetReadBuffer(4 << 10)
+	fmt.Fprintf(conn, "POST /v1/keys/find HTTP/1.1\r\nHost: test\r\nContent-Type: application/json\r\nContent-Length: %d\r\n\r\n%s",
+		body.Len(), body.String())
+
+	// Give the handler time to reach its write and stall on the unread socket.
+	time.Sleep(500 * time.Millisecond)
+
+	resp := srv.Get(t, "/health/ready")
+	io.Copy(io.Discard, resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("readiness with a stalled lookup: status %d, want 200", resp.StatusCode)
 	}
 }

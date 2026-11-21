@@ -722,13 +722,19 @@ components:
         version. Pin on the first page if you want a particular one, then send the cursor
         alone — repeating `?snapshot=finalized` on every page would resolve the label
         again each time and walk across two versions as finality advances.
+
+        The cursor ends with the version's block hash: after a reorg and a rebuild at the same
+        height the walk answers `409` instead of continuing on the other branch.
       schema: { type: string }
-      example: 25609646.1.0.9999
+      example: 25609646.1.0.9999.0x5595e30e2db14337c148e8f6441833caaf12f02df378c39708bacf3de752669e
     Since:
       name: since
       in: query
       required: true
-      description: The version to diff from — a block number, a block hash, or `finalized`.
+      description: |
+        The version to diff from — a block number, a block hash, or `finalized`. A hash names
+        one version; a block number answers `409` when a reorg replaced the version at that
+        height, so pass `meta.to.blockHash` from the previous diff.
       schema: { type: string }
     To:
       name: to

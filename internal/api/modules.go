@@ -20,6 +20,7 @@ func (s *Server) handleModules(w http.ResponseWriter, r *http.Request) {
 	}
 
 	ctx := r.Context()
+	var body []byte
 	err := s.snapshot(ctx, r, func(snap store.Snapshot) error {
 		markStale(w, snap)
 
@@ -40,11 +41,15 @@ func (s *Server) handleModules(w http.ResponseWriter, r *http.Request) {
 			modules = []model.StakingModule{}
 		}
 
-		return writeJSON(w, response{Data: modules, ELBlockSnapshot: elMeta})
+		return deferJSON(&body, response{Data: modules, ELBlockSnapshot: elMeta})
 	})
-	if err != nil && !writeStoreError(w, err) {
-		s.internalError(w, r, err)
+	if err != nil {
+		if !writeStoreError(w, err) {
+			s.internalError(w, r, err)
+		}
+		return
 	}
+	writeBody(w, body)
 }
 
 func (s *Server) handleModule(w http.ResponseWriter, r *http.Request) {
@@ -56,6 +61,7 @@ func (s *Server) handleModule(w http.ResponseWriter, r *http.Request) {
 	ref := r.PathValue("module_id")
 	ctx := r.Context()
 
+	var body []byte
 	err := s.snapshot(ctx, r, func(snap store.Snapshot) error {
 		module, err := snap.ModuleByRef(ctx, ref)
 		if err != nil {
@@ -78,15 +84,20 @@ func (s *Server) handleModule(w http.ResponseWriter, r *http.Request) {
 			return nil
 		}
 
-		return writeJSON(w, response{Data: *module, ELBlockSnapshot: elMeta})
+		return deferJSON(&body, response{Data: *module, ELBlockSnapshot: elMeta})
 	})
-	if err != nil && !writeStoreError(w, err) {
-		s.internalError(w, r, err)
+	if err != nil {
+		if !writeStoreError(w, err) {
+			s.internalError(w, r, err)
+		}
+		return
 	}
+	writeBody(w, body)
 }
 
 func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
+	var body []byte
 	err := s.snapshot(ctx, r, func(snap store.Snapshot) error {
 		markStale(w, snap)
 
@@ -95,14 +106,18 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 			return err
 		}
 
-		return writeJSON(w, model.Status{
+		return deferJSON(&body, model.Status{
 			AppVersion:      s.cfg.AppVersion,
 			ChainID:         s.cfg.ChainID,
 			ELBlockSnapshot: elMeta,
 			CLBlockSnapshot: nil,
 		})
 	})
-	if err != nil && !writeStoreError(w, err) {
-		s.internalError(w, r, err)
+	if err != nil {
+		if !writeStoreError(w, err) {
+			s.internalError(w, r, err)
+		}
+		return
 	}
+	writeBody(w, body)
 }

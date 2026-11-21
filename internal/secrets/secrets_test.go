@@ -205,3 +205,16 @@ func TestAFileReadableByOthersIsReported(t *testing.T) {
 		}
 	}
 }
+
+// An empty string is a template default for a field that is gone, like a null.
+func TestAnEmptyValueIsSkippedLikeANull(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config")
+	render(t, path, `{"DATABASE_URL":"","PROVIDERS_URLS":"http://node:8545"}`)
+	values, err := Read(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := values["DATABASE_URL"]; ok || values["PROVIDERS_URLS"] == "" {
+		t.Errorf("read %v, want the empty DATABASE_URL skipped", values)
+	}
+}
