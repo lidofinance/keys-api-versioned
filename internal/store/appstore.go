@@ -122,10 +122,10 @@ func (a *App) Snapshot(ctx context.Context, fn func(Snapshot) error) error {
 	if err := fn(snap); err != nil {
 		return err
 	}
-	// Reads run outside a transaction: a rollback committed after the last check reopens rows the
-	// last statement then saw under this version's label. One primary-key read closes that window.
+	// Reads run outside a transaction, so a rollback after the last check reopens rows under this label.
+	// Not on ctx: a client that hangs up after the last byte would cancel it and drop the connection.
 	if meta != nil {
-		return snap.stillOnChain(ctx)
+		return snap.stillOnChain(context.WithoutCancel(ctx))
 	}
 	return nil
 }
