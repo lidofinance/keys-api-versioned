@@ -14,6 +14,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/lidofinance/keys-api-versioned/internal/logmask"
 	"github.com/lidofinance/keys-api-versioned/internal/model"
 	"github.com/lidofinance/keys-api-versioned/internal/store"
 )
@@ -35,6 +36,14 @@ func chainSchema(chainID int64) string {
 	return fmt.Sprintf("chain_%d", chainID)
 }
 
+// storeSchema: a static file declaring chain 1 would otherwise share mainnet's schema and writer lock.
+func storeSchema(source string, chainID int64) string {
+	if source == "static" {
+		return fmt.Sprintf("static_%d", chainID)
+	}
+	return chainSchema(chainID)
+}
+
 type PGOptions struct {
 	MaxConns int32
 	Source   string
@@ -52,12 +61,12 @@ const maxConnectBackoff = 30 * time.Second
 func NewPGStore(ctx context.Context, dsn string, o PGOptions) (*PGStore, error) {
 	cfg, err := pgxpool.ParseConfig(dsn)
 	if err != nil {
-		return nil, fmt.Errorf("parse dsn: %w", err)
+		return nil, fmt.Errorf("parse dsn: %w", logmask.DSNParseError(err))
 	}
 	// A runtime parameter, not a suffix on the DSN: that only worked for the URL form.
 	schema := ""
 	if o.ChainID != 0 && cfg.ConnConfig.RuntimeParams["search_path"] == "" {
-		schema = chainSchema(o.ChainID)
+		schema = storeSchema(o.Source, o.ChainID)
 		cfg.ConnConfig.RuntimeParams["search_path"] = schema
 	}
 	if o.MaxConns > 0 {
@@ -152,6 +161,18 @@ func (s *PGStore) Migrate(ctx context.Context) error {
 			return fmt.Errorf("the schema landed in %q, want %q: the search_path in the DSN "+
 				"is not taking effect", landed, s.schema)
 		}
+	}
+
+	// An explicit search_path can still point two sources at one store. Their versions would interleave
+	// and neither writer would see the other as a reorg.
+	var foreign string
+	err = tx.QueryRow(ctx, `select source from versions where source <> $1 limit 1`, s.source).Scan(&foreign)
+	if err == nil {
+		return fmt.Errorf("the store holds versions from source %q, and this process is %q: give it "+
+			"its own schema or database", foreign, s.source)
+	}
+	if !errors.Is(err, pgx.ErrNoRows) {
+		return fmt.Errorf("check the store's source: %w", err)
 	}
 
 	if _, err := tx.Exec(ctx, `
@@ -504,9 +525,11 @@ func (s *PGStore) Prune(ctx context.Context, keep int) (Pruned, error) {
 	}
 	defer tx.Rollback(ctx)
 
+	// Served versions only: failed attempts in the window would push the only published one out.
 	err = tx.QueryRow(ctx, `
 		select coalesce(min(block_number), 0) from (
-			select block_number from versions order by block_number desc limit $1
+			select block_number from versions where status in ('published', 'stale')
+			 order by block_number desc limit $1
 		) k`, keep).Scan(&out.OldestKept)
 	if err != nil {
 		return out, fmt.Errorf("retention window: %w", err)
@@ -529,9 +552,15 @@ func (s *PGStore) Prune(ctx context.Context, keep int) (Pruned, error) {
 
 	// A leased version holds the boundary at itself: deleting rows mid-stream would corrupt a
 	// response. Held versions are pruned on a later cycle.
-	doomed, err := blocksBelow(ctx, tx, boundary)
+	// Each claim holds a slot of the server-wide lock table until commit: a backlog claimed in one
+	// transaction runs out of shared memory and fails every prune after it. The rest goes next cycle.
+	doomed, err := blocksBelow(ctx, tx, boundary, pruneClaimBatch+1)
 	if err != nil {
 		return out, err
+	}
+	if len(doomed) > pruneClaimBatch {
+		boundary = doomed[pruneClaimBatch]
+		doomed = doomed[:pruneClaimBatch]
 	}
 	for _, block := range doomed {
 		claimed, err := store.TryClaimForPrune(ctx, tx, block)
@@ -571,9 +600,12 @@ func (s *PGStore) Prune(ctx context.Context, keep int) (Pruned, error) {
 
 var pruneBeforeCommit func()
 
-func blocksBelow(ctx context.Context, tx pgx.Tx, boundary int64) ([]int64, error) {
+// pruneClaimBatch is far below the lock table of a default server (64 per connection, 100 connections).
+var pruneClaimBatch = 500
+
+func blocksBelow(ctx context.Context, tx pgx.Tx, boundary int64, limit int) ([]int64, error) {
 	rows, err := tx.Query(ctx, `select distinct block_number from versions
-		where block_number < $1 order by block_number`, boundary)
+		where block_number < $1 order by block_number limit $2`, boundary, limit)
 	if err != nil {
 		return nil, fmt.Errorf("versions to prune: %w", err)
 	}

@@ -43,6 +43,9 @@ type Syncer struct {
 	finalized model.ELBlockSnapshot
 	// retentionHeldAt is the last prune's HeldAt, reported on every cycle.
 	retentionHeldAt int64
+	// confirmedHash: the version the last reorg probe found on chain; finalHash: one known on chain at or
+	// below finality. In memory only, so a restart probes again.
+	confirmedHash, finalHash string
 	// auditedAt is the block of the last rebuild that read every key from the chain. Not persisted: a
 	// restart starts it at the published version, as the block-gap rule always counted from there.
 	auditedAt int64
@@ -222,17 +225,25 @@ func (s *Syncer) Cycle(ctx context.Context) (result CycleResult) {
 		return result
 	}
 
-	// Head unchanged, so nothing can have changed. Most 5s polls of a 12s chain end here.
-	if latest != nil && head.BlockHash != "" && sameHash(head.BlockHash, latest.HeadBlockHash) {
+	// Read point unchanged, so nothing can have changed. Most 5s polls of a 12s chain end here; at
+	// finalized, every poll of an epoch does.
+	unchanged := func(readAt model.ELBlockSnapshot) bool {
+		if latest == nil || readAt.BlockHash == "" || !sameHash(readAt.BlockHash, latest.HeadBlockHash) {
+			return false
+		}
 		result.Action = ActionExtend
-		result.Reason = fmt.Sprintf("head is still %d, nothing to confirm", head.BlockNumber)
+		result.Reason = fmt.Sprintf("block %d is still the read point, nothing to confirm", readAt.BlockNumber)
 		result.VersionBlock = latest.BlockNumber
 		result.VersionTimestamp = latest.Timestamp
 		result.FinalizedBlock = s.finalized.BlockNumber
 		// Modules left empty: gauges keep their last value, and the version row is keyed by address, so
 		// rebuilding ids from it would collapse every module onto one series.
-		s.log.Debug("cycle: head unchanged, nothing to do",
-			"head", head.BlockNumber, "hash", head.BlockHash, "version", latest.BlockNumber)
+		s.log.Debug("cycle: read point unchanged, nothing to do",
+			"head", head.BlockNumber, "read_at", readAt.BlockNumber, "hash", readAt.BlockHash,
+			"version", latest.BlockNumber)
+		return true
+	}
+	if !s.cfg.BuildAtFinalized && unchanged(head) {
 		return result
 	}
 
@@ -244,6 +255,12 @@ func (s *Syncer) Cycle(ctx context.Context) (result CycleResult) {
 	readAt := head
 	if s.cfg.BuildAtFinalized && final.BlockNumber > 0 {
 		readAt = final
+		// The version is confirmed at the block whose nonces were compared, not at a head nobody read:
+		// otherwise a finality stall would look current to the confirmed-age alert.
+		result.HeadTimestamp = readAt.Timestamp
+	}
+	if s.cfg.BuildAtFinalized && unchanged(readAt) {
+		return result
 	}
 
 	s.log.Debug("cycle: head", "block", head.BlockNumber, "hash", head.BlockHash,
@@ -252,12 +269,12 @@ func (s *Syncer) Cycle(ctx context.Context) (result CycleResult) {
 	if latest == nil {
 		result.Action = ActionRebuild
 		result.Reason = "no published version"
-		result.VersionTimestamp = head.Timestamp
+		result.VersionTimestamp = readAt.Timestamp
 		s.log.Info("cold start: no published version, reading every module", "head", head.BlockNumber)
 		if err := s.rebuild(ctx, readAt, nil, nil, DepthKeys, 0, true, finalized, &result); err != nil {
 			result.Err = err
 		} else {
-			result.VersionBlock = head.BlockNumber
+			result.VersionBlock = readAt.BlockNumber
 		}
 		s.prune(ctx)
 		return result
@@ -286,17 +303,21 @@ func (s *Syncer) Cycle(ctx context.Context) (result CycleResult) {
 	}
 	result.Modules = moduleNonces(modules)
 
-	// Probe skipped once the version's block is finalized. That is the common case: an unchanged
-	// version sinks below finality within ~2 epochs.
+	// Skipped only once a probe found the version on chain at or below finality: one orphaned while the
+	// writer was down is caught on the first cycle back.
 	reorged, forkPoint := false, int64(0)
-	if finalized > 0 && latest.BlockNumber <= finalized {
-		s.log.Debug("reorg probe skipped: the version's block is finalized",
+	if finalized > 0 && latest.BlockNumber <= finalized && sameHash(s.finalHash, latest.BlockHash) {
+		s.log.Debug("reorg probe skipped: the version was found on chain once final",
 			"version", latest.BlockNumber, "finalized", finalized)
 	} else {
+		s.confirmedHash = ""
 		reorged, forkPoint, err = s.detectReorg(ctx, *latest)
 		if err != nil {
 			result.Err = err
 			return result
+		}
+		if sameHash(s.confirmedHash, latest.BlockHash) && finalized > 0 && latest.BlockNumber <= finalized {
+			s.finalHash = latest.BlockHash
 		}
 	}
 	if reorged {
@@ -337,8 +358,8 @@ func (s *Syncer) Cycle(ctx context.Context) (result CycleResult) {
 			if err := s.rebuild(ctx, readAt, modules, nil, DepthKeys, 0, true, finalized, &result); err != nil {
 				result.Err = err
 			} else {
-				result.VersionBlock = head.BlockNumber
-				result.VersionTimestamp = head.Timestamp
+				result.VersionBlock = readAt.BlockNumber
+				result.VersionTimestamp = readAt.Timestamp
 			}
 			s.prune(ctx)
 			return result
@@ -414,11 +435,11 @@ func (s *Syncer) Cycle(ctx context.Context) (result CycleResult) {
 	case ActionExtend:
 		// Version block and timestamp stay on the version's own block: moving them to head would be
 		// freshness by relabelling.
-		if err := s.store.Extend(ctx, *latest, head, state.ModuleNonces, finalized); err != nil {
+		if err := s.store.Extend(ctx, *latest, readAt, state.ModuleNonces, finalized); err != nil {
 			result.Err = err
 		} else {
 			s.log.Debug("cycle: extended", "version", latest.BlockNumber,
-				"confirmed_at", head.BlockNumber, "last_changed", latest.LastChangedBlockHash)
+				"confirmed_at", readAt.BlockNumber, "last_changed", latest.LastChangedBlockHash)
 		}
 
 	case ActionRebuild, ActionSupersede:
@@ -437,8 +458,8 @@ func (s *Syncer) Cycle(ctx context.Context) (result CycleResult) {
 			result.Err = err
 			break
 		}
-		result.VersionBlock = head.BlockNumber
-		result.VersionTimestamp = head.Timestamp
+		result.VersionBlock = readAt.BlockNumber
+		result.VersionTimestamp = readAt.Timestamp
 
 		// The audit is the only check that nonces move with keys: a healthy one writes nothing. One that
 		// coincides with a nonce change writes that change, so it proves nothing either way.
@@ -513,13 +534,12 @@ func (s *Syncer) rebuild(ctx context.Context, head model.ELBlockSnapshot, module
 		if inScope != nil && !inScope[m.RawAddress()] {
 			read = DepthModule
 		}
-		keysKept := false
 		if left, ok := leftovers[m.ID]; ok {
 			switch {
 			case reuse && left.reusable(m):
 				// A failed attempt wrote this module's keys at a block still on chain, at today's
 				// nonce: a cold mainnet retry skips 40 s of module 1 reads.
-				read, keysKept = DepthOperators, true
+				read = DepthOperators
 				s.log.Info("module: keys kept from an unfinished attempt",
 					"module", m.ID, "nonce", m.Nonce, "attempt_block", left.Block)
 			default:
@@ -586,7 +606,10 @@ func (s *Syncer) rebuild(ctx context.Context, head model.ELBlockSnapshot, module
 			}
 			result.KeysChanged += revetted
 		}
-		contentChanged = contentChanged || changed > 0 || revetted > 0 || (keysKept && (inScope == nil || inScope[m.RawAddress()]))
+		// An unfinished attempt's rows are already open, so this build's own diff against them is empty.
+		// The attempt wrote them only because they differ from the published version.
+		_, attempted := leftovers[m.ID]
+		contentChanged = contentChanged || changed > 0 || revetted > 0 || attempted
 
 		s.log.Info("module written",
 			"module", m.ID, "type", m.Type, "nonce", m.Nonce, "reads", read.String(),
@@ -620,6 +643,10 @@ func (s *Syncer) rebuild(ctx context.Context, head model.ELBlockSnapshot, module
 	}
 	if everyOperator {
 		s.scannedTo = max(s.scannedTo, head.BlockNumber)
+	}
+	// Read at a final block: no reorg can take it, so no probe needs to vouch for it.
+	if finalized > 0 && head.BlockNumber <= finalized {
+		s.finalHash = head.BlockHash
 	}
 	// Every rebuild writes every module row, so a pending source change is now applied.
 	s.sourceChange = ""
@@ -726,8 +753,12 @@ func (s *Syncer) detectReorg(ctx context.Context, latest StoredVersion) (bool, i
 	if err != nil {
 		return false, 0, fmt.Errorf("block hash at %d: %w", latest.BlockNumber, err)
 	}
-	if onChain == "" || sameHash(onChain, latest.BlockHash) {
-		// Empty means the node lacks that height yet: a lagging endpoint, not a reorg.
+	if onChain == "" {
+		// The node lacks that height yet: a lagging endpoint, not a reorg.
+		return false, 0, nil
+	}
+	if sameHash(onChain, latest.BlockHash) {
+		s.confirmedHash = latest.BlockHash
 		return false, 0, nil
 	}
 
@@ -738,6 +769,11 @@ func (s *Syncer) detectReorg(ctx context.Context, latest StoredVersion) (bool, i
 
 	for _, v := range versions {
 		if v.BlockNumber >= latest.BlockNumber {
+			continue
+		}
+		// Only served versions anchor: a superseded one matches again when the chain returns to its
+		// branch, and would keep the losing branch's version at the same height.
+		if v.Status != "published" && v.Status != "stale" {
 			continue
 		}
 		hash, err := s.source.BlockHashAt(ctx, v.BlockNumber)

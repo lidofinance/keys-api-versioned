@@ -740,3 +740,112 @@ func TestACycleReportsHeldRetentionAndUnfinishedBuilds(t *testing.T) {
 		t.Errorf("a store that cannot count reported %d, want -1", r.UnfinishedBuilds)
 	}
 }
+
+// finalSource reports a finalized block the test sets, and counts reorg probes.
+type finalSource struct {
+	*fakeSource
+	final  int64
+	probes int
+}
+
+func (f *finalSource) FinalizedBlock(context.Context) (model.ELBlockSnapshot, error) {
+	return model.ELBlockSnapshot{BlockNumber: f.final, BlockHash: f.hashAt(f.final), Timestamp: f.final * 12}, nil
+}
+
+func (f *finalSource) BlockHashAt(ctx context.Context, block int64) (string, error) {
+	f.probes++
+	return f.fakeSource.BlockHashAt(ctx, block)
+}
+
+// A version orphaned while the writer was down is rolled back on the first cycle back, though final.
+func TestAVersionNoCycleProbedIsCheckedOnceFinal(t *testing.T) {
+	src := &finalSource{fakeSource: newFakeSource(2), final: 990}
+	store := newFakeStore()
+	s := NewSyncer(src, store, SyncConfig{}, nil)
+
+	if r := s.Cycle(context.Background()); r.Err != nil {
+		t.Fatalf("cold start: %v", r.Err)
+	}
+	published := store.latest.BlockNumber
+
+	src.forkAt(published)
+	for i := 0; i < 40; i++ {
+		src.advance()
+	}
+	src.final = published + 30
+
+	r := s.Cycle(context.Background())
+	if r.Err != nil {
+		t.Fatalf("cycle after the outage: %v", r.Err)
+	}
+	if r.Action != ActionSupersede || store.supersededFrom != published {
+		t.Fatalf("action %q (%s), rolled back from %d; want a rollback from %d",
+			r.Action, r.Reason, store.supersededFrom, published)
+	}
+}
+
+// Once a probe has found a final version on chain it cannot move: later cycles skip the probe.
+func TestAFinalVersionIsProbedOnce(t *testing.T) {
+	src := &finalSource{fakeSource: newFakeSource(2), final: 990}
+	store := newFakeStore()
+	s := NewSyncer(src, store, SyncConfig{}, nil)
+
+	if r := s.Cycle(context.Background()); r.Err != nil {
+		t.Fatalf("cold start: %v", r.Err)
+	}
+	src.final = store.latest.BlockNumber
+	for i := 0; i < 3; i++ {
+		src.advance()
+		src.probes = 0
+		if r := s.Cycle(context.Background()); r.Err != nil || r.Action != ActionExtend {
+			t.Fatalf("cycle %d: action %q (%s), err %v", i, r.Action, r.Reason, r.Err)
+		}
+		want := 0
+		if i == 0 {
+			want = 1
+		}
+		if src.probes != want {
+			t.Errorf("cycle %d: %d probes, want %d", i, src.probes, want)
+		}
+	}
+}
+
+// Chain a -> b -> a: the rollback must not anchor on a superseded version from branch a.
+func TestARollbackDoesNotAnchorOnASupersededVersion(t *testing.T) {
+	src := newFakeSource(2)
+	store := newFakeStore()
+	s := NewSyncer(src, store, SyncConfig{}, nil)
+
+	if r := s.Cycle(context.Background()); r.Err != nil {
+		t.Fatalf("cold start: %v", r.Err)
+	}
+	a0 := *store.latest
+	hashOn := func(branch string, block int64) string { return fmt.Sprintf("0x%s%063x", branch, block) }
+	version := func(id, block int64, branch, status string) StoredVersion {
+		v := a0
+		v.ID, v.BlockNumber, v.BlockHash, v.Status = id, block, hashOn(branch, block), status
+		v.HeadBlockNumber, v.HeadBlockHash = block, v.BlockHash
+		return v
+	}
+	// a1 published, then superseded by branch b, which published b1 and b3. The chain is back on a.
+	store.published = []StoredVersion{
+		a0,
+		version(a0.ID+1, a0.BlockNumber+1, "a", "superseded"),
+		version(a0.ID+2, a0.BlockNumber+1, "b", StatusPublished),
+		version(a0.ID+3, a0.BlockNumber+3, "b", StatusPublished),
+	}
+	latest := store.published[3]
+	store.latest = &latest
+	for src.block < a0.BlockNumber+4 {
+		src.advance()
+	}
+
+	r := s.Cycle(context.Background())
+	if r.Err != nil {
+		t.Fatalf("cycle: %v", r.Err)
+	}
+	if store.supersededFrom != a0.BlockNumber+1 {
+		t.Errorf("rolled back from %d, want %d: b1 at that height is from the losing branch",
+			store.supersededFrom, a0.BlockNumber+1)
+	}
+}
