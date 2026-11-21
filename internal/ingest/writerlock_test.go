@@ -3,10 +3,16 @@ package ingest_test
 import (
 	"context"
 	"errors"
+	"net/url"
+	"slices"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgxpool"
+
 	"github.com/lidofinance/keys-api-versioned/internal/ingest"
+	"github.com/lidofinance/keys-api-versioned/internal/store"
 	"github.com/lidofinance/keys-api-versioned/internal/testpg"
 )
 
@@ -75,6 +81,93 @@ func TestWritersOfDifferentSchemasDoNotWaitForEachOther(t *testing.T) {
 	defer lockB.Release()
 	if waited {
 		t.Error("a writer of another schema waited for this one")
+	}
+}
+
+// respell names the test's schema as an operator might: another case, with public after it.
+func respell(t *testing.T, db *testpg.DB) string {
+	t.Helper()
+	dsn := strings.Replace(db.DSN, "search_path="+db.Schema,
+		"search_path="+url.QueryEscape(strings.ToUpper(db.Schema)+", public"), 1)
+	pool, err := pgxpool.New(context.Background(), dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+	var resolved string
+	if err := pool.QueryRow(context.Background(), `select (current_schemas(false))[1]`).Scan(&resolved); err != nil {
+		t.Fatal(err)
+	}
+	if resolved != db.Schema {
+		t.Fatalf("the respelled search_path resolves to %q, want %q", resolved, db.Schema)
+	}
+	return dsn
+}
+
+func TestWritersThatSpellOneSchemaDifferentlyWaitForEachOther(t *testing.T) {
+	db := testpg.New(t)
+	ctx := context.Background()
+
+	first, err := db.Writer.LockWriter(ctx, ingest.WriterLockOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer first.Release()
+
+	second, err := ingest.NewPGStore(ctx, respell(t, db), ingest.PGOptions{Source: "testpg"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer second.Close()
+
+	waitCtx, cancel := context.WithTimeout(ctx, time.Second)
+	defer cancel()
+	waited := false
+	lock, err := second.LockWriter(waitCtx, ingest.WriterLockOptions{OnWait: func() { waited = true }})
+	if err == nil {
+		lock.Release()
+	}
+	if !waited {
+		t.Error("a writer of the same schema under another spelling did not wait for the first")
+	}
+}
+
+func TestALeaseUnderAnotherSpellingHoldsRetention(t *testing.T) {
+	testpg.Exclusive(t)
+	db := testpg.New(t)
+	ctx := context.Background()
+
+	readers, err := pgxpool.New(ctx, respell(t, db))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer readers.Close()
+	conn, err := readers.Acquire(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Release()
+	block := db.Block(0)
+	release, err := store.LeaseVersion(ctx, conn, block)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer release()
+
+	tx, err := db.Writer.Pool().Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback(ctx)
+	claimed, err := store.TryClaimForPrune(ctx, tx, block)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if claimed {
+		t.Error("retention claimed a version a reader of the same schema leases under another spelling")
+	}
+	if leases := db.Leases(t); !slices.Contains(leases, block) {
+		t.Errorf("leases are %v, want %d among them", leases, block)
 	}
 }
 
