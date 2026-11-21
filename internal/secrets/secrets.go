@@ -43,6 +43,10 @@ func Read(path string) (map[string]string, error) {
 	for key, value := range raw {
 		switch v := value.(type) {
 		case string:
+			if v == "" {
+				// Same as a null: a template default for a field that is gone.
+				continue
+			}
 			values[key] = v
 		case nil:
 			// A null is a template that resolved to nothing; stored as "null" it would reach a URL parser.
@@ -76,17 +80,35 @@ func Split(values map[string]string) (map[string]string, []string) {
 // LoadIntoEnv makes the file the single source for env-read values, so a rotation cannot leave
 // callers half-rotated. Returns what it applied and the keys it ignored.
 func LoadIntoEnv(path string) (map[string]string, []string, error) {
+	applied, ignored, _, err := LoadIntoEnvChecked(path, nil)
+	return applied, ignored, err
+}
+
+// LoadIntoEnvChecked applies only the values check accepts; the environment keeps its own for the
+// rest, whose errors come back by key.
+func LoadIntoEnvChecked(path string, check func(key, value string) error) (map[string]string, []string, map[string]error, error) {
 	values, err := Read(path)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	kept, ignored := Split(values)
+	var rejected map[string]error
 	for key, value := range kept {
+		if check != nil {
+			if err := check(key, value); err != nil {
+				if rejected == nil {
+					rejected = map[string]error{}
+				}
+				rejected[key] = err
+				delete(kept, key)
+				continue
+			}
+		}
 		if err := os.Setenv(key, value); err != nil {
-			return nil, nil, fmt.Errorf("set %s from %s: %w", key, path, err)
+			return nil, nil, nil, fmt.Errorf("set %s from %s: %w", key, path, err)
 		}
 	}
-	return kept, ignored, nil
+	return kept, ignored, rejected, nil
 }
 
 // LooseMode reports a file readable by group or others.

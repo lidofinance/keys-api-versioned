@@ -18,6 +18,8 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgxpool"
+
 	"github.com/lidofinance/keys-api-versioned/internal/api"
 	"github.com/lidofinance/keys-api-versioned/internal/eth"
 	"github.com/lidofinance/keys-api-versioned/internal/ingest"
@@ -55,10 +57,13 @@ func run(log *slog.Logger, masker *logmask.Masker) error {
 	// Before anything reads the environment, so the file is the source for every envOr below.
 	// A broken file is logged and ignored: the environment still holds a working configuration.
 	secretsPath := envOr("SECRETS_FILE_PATH", secrets.DefaultPath)
-	appliedSecrets, ignoredSecrets, err := secrets.LoadIntoEnv(secretsPath)
+	appliedSecrets, ignoredSecrets, rejectedSecrets, err := secrets.LoadIntoEnvChecked(secretsPath, checkSecret)
 	addSecrets(masker, appliedSecrets)
 	if err != nil {
 		log.Error("secrets file unusable, reading configuration from the environment", "path", secretsPath, "err", err)
+	}
+	for key, err := range rejectedSecrets {
+		log.Error("secrets file: value rejected, keeping the environment's", "path", secretsPath, "key", key, "err", err)
 	}
 	if len(ignoredSecrets) > 0 {
 		log.Warn("secrets file: only credentials are read from it, other keys are ignored",
@@ -369,6 +374,12 @@ func applyRotatedSecrets(
 	m *metrics.Metrics,
 ) error {
 	if value, ok := values["DATABASE_URL"]; ok && value != os.Getenv("DATABASE_URL") {
+		// The restart reads the file at boot: a value boot would reject stops every replica at once.
+		for key, value := range values {
+			if err := checkSecret(key, value); err != nil {
+				return fmt.Errorf("%s: %w; not restarting for the new DATABASE_URL", key, err)
+			}
+		}
 		m.SecretsReloads.WithLabelValues("restart_required").Inc()
 		select {
 		case restart <- errors.New("DATABASE_URL changed in the secrets file; exiting so the orchestrator restarts with it"):
@@ -392,6 +403,19 @@ func applyRotatedSecrets(
 	}
 	log.Info("applied rotated secrets", "keys", "PROVIDERS_URLS")
 	m.SecretsReloads.WithLabelValues("success").Inc()
+	return nil
+}
+
+// checkSecret drops the DSN parse error: it quotes the connection string.
+func checkSecret(key, value string) error {
+	switch key {
+	case "DATABASE_URL":
+		if _, err := pgxpool.ParseConfig(value); err != nil {
+			return errors.New("not a usable Postgres connection string")
+		}
+	case "PROVIDERS_URLS":
+		return validateProviderURLs(value)
+	}
 	return nil
 }
 
@@ -705,9 +729,10 @@ func validateEnv() error {
 			}
 		}
 	}
-	// Streams at the pool size leave readiness, /v1/status and the writer nothing to acquire.
-	if os.Getenv("STREAM_MAX_CONCURRENT") != "" && maxStreams() >= databaseMaxConns() {
-		errs = append(errs, "STREAM_MAX_CONCURRENT must be below DATABASE_MAX_CONNS")
+	// Streams at the pool size leave readiness, /v1/status and the writer nothing to acquire. Checked on
+	// the default too: half of a pool of 1 rounds up to the whole pool.
+	if envOr("KEYS_API_MODE", "all") != "ingest" && maxStreams() >= databaseMaxConns() {
+		errs = append(errs, "STREAM_MAX_CONCURRENT must be below DATABASE_MAX_CONNS, which must be at least 2 to serve")
 	}
 	if len(errs) == 0 {
 		return nil
