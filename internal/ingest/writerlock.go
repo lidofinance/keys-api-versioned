@@ -2,6 +2,7 @@ package ingest
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -32,7 +33,12 @@ type WriterLockOptions struct {
 	OnStop func(error)
 	// RetryDelay (RunExclusive): the pause before taking the lock again; zero means 5 s.
 	RetryDelay time.Duration
+
+	noWait bool
 }
+
+// ErrTakenOver: this writer lost its lock, and another took it before this one could again.
+var ErrTakenOver = errors.New("another writer took the writer lock this one lost")
 
 // WriterLock is held by a session of its own for the writer's life. Two writers of one schema
 // rewrite each other's rows and both report success, so the second waits for the first.
@@ -59,6 +65,9 @@ func (s *PGStore) LockWriter(ctx context.Context, o WriterLockOptions) (*WriterL
 		return fail(err)
 	}
 	if !got {
+		if o.noWait {
+			return fail(ErrTakenOver)
+		}
 		if o.OnWait != nil {
 			o.OnWait()
 		}
@@ -104,17 +113,23 @@ func (l *WriterLock) Lost() <-chan struct{} { return l.lost }
 func (l *WriterLock) Err() error { return l.err }
 
 // RunExclusive runs fn while holding the writer lock. A lost lock cancels fn, and the lock is taken
-// again after the retry delay; only ctx ends it, so a database restart does not stop the process.
+// again after the retry delay, so a database restart does not stop the process. It returns once
+// another writer has taken over (ErrFenced, ErrTakenOver): only a writer that never held the lock
+// waits for it, as a new pod does in a rollout.
 func (s *PGStore) RunExclusive(ctx context.Context, o WriterLockOptions, fn func(context.Context) error) error {
 	retry := o.RetryDelay
 	if retry <= 0 {
 		retry = defaultWriterRetry
 	}
 	for {
-		err := s.runLocked(ctx, o, fn)
+		held, err := s.runLocked(ctx, o, fn)
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
+		if fenced := (ErrFenced{}); errors.As(err, &fenced) || errors.Is(err, ErrTakenOver) {
+			return err
+		}
+		o.noWait = o.noWait || held
 		if o.OnStop != nil {
 			o.OnStop(err)
 		}
@@ -128,10 +143,10 @@ func (s *PGStore) RunExclusive(ctx context.Context, o WriterLockOptions, fn func
 	}
 }
 
-func (s *PGStore) runLocked(ctx context.Context, o WriterLockOptions, fn func(context.Context) error) error {
+func (s *PGStore) runLocked(ctx context.Context, o WriterLockOptions, fn func(context.Context) error) (bool, error) {
 	lock, err := s.LockWriter(ctx, o)
 	if err != nil {
-		return err
+		return false, err
 	}
 	defer lock.Release()
 
@@ -145,15 +160,18 @@ func (s *PGStore) runLocked(ctx context.Context, o WriterLockOptions, fn func(co
 		}
 	}()
 	err = fn(runCtx)
+	if fenced := (ErrFenced{}); errors.As(err, &fenced) {
+		return true, err
+	}
 	select {
 	case <-lock.Lost():
-		return lock.Err()
+		return true, lock.Err()
 	default:
 	}
 	if err == nil {
 		err = fmt.Errorf("writer returned")
 	}
-	return err
+	return true, err
 }
 
 // Release closes the session, which releases the lock.
