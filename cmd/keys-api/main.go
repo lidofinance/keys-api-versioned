@@ -151,7 +151,7 @@ func run(log *slog.Logger, masker *logmask.Masker) error {
 		"pin", pin, "ext_pin", extPin)
 
 	var (
-		syncer       *ingest.Syncer
+		newSyncer    func() *ingest.Syncer
 		syncerSource source.Provider
 	)
 	if mode != "server" {
@@ -174,15 +174,19 @@ func run(log *slog.Logger, masker *logmask.Masker) error {
 		}
 
 		syncerSource = provider
-		syncer = ingest.NewSyncer(provider, pgStore, ingest.SyncConfig{
+		cfg := ingest.SyncConfig{
 			Interval:         time.Duration(envInt("UPDATE_KEYS_INTERVAL_MS", 5000)) * time.Millisecond,
 			MaxBlockGap:      int64(envInt("MAX_BLOCKS_OVERLAP", 1000)),
 			RetainVersions:   envInt("RETAIN_VERSIONS", 20),
 			BuildAtFinalized: envBool("KEYS_API_BUILD_AT_FINALIZED", false),
 			EpochDuration:    epochDuration(),
-		}, log)
-		syncer.OnCycle = func(r ingest.CycleResult) { observeCycle(m, r) }
-		syncer.OnModule = func(r ingest.ModuleResult) { observeModule(m, r) }
+		}
+		newSyncer = func() *ingest.Syncer {
+			syncer := ingest.NewSyncer(provider, pgStore, cfg, log)
+			syncer.OnCycle = func(r ingest.CycleResult) { observeCycle(m, r) }
+			syncer.OnModule = func(r ingest.ModuleResult) { observeModule(m, r) }
+			return syncer
+		}
 	}
 
 	errs := make(chan error, 3)
@@ -198,7 +202,7 @@ func run(log *slog.Logger, masker *logmask.Masker) error {
 		}
 	}()
 
-	if syncer == nil {
+	if newSyncer == nil {
 		close(syncDone)
 	} else {
 		go func() {
@@ -207,7 +211,7 @@ func run(log *slog.Logger, masker *logmask.Masker) error {
 				errs <- err
 				return
 			}
-			errs <- runWriter(ctx, pgStore, syncer, log)
+			errs <- runWriter(ctx, pgStore, newSyncer, log)
 		}()
 	}
 
@@ -306,7 +310,7 @@ var chainRetryStart = time.Second
 
 // runWriter waits for the writer lock without holding up the API: in KEYS_API_MODE=all a rollout
 // keeps the old pod, and its lock, until the new one is ready. Only the writer applies the schema.
-func runWriter(ctx context.Context, pgStore *ingest.PGStore, syncer *ingest.Syncer, log *slog.Logger) error {
+func runWriter(ctx context.Context, pgStore *ingest.PGStore, newSyncer func() *ingest.Syncer, log *slog.Logger) error {
 	if err := pgStore.WaitForDatabase(ctx, func(err error, next time.Duration) {
 		log.Warn("database unreachable, retrying", "err", err, "in", next.String())
 	}); err != nil {
@@ -314,20 +318,25 @@ func runWriter(ctx context.Context, pgStore *ingest.PGStore, syncer *ingest.Sync
 	}
 	return pgStore.RunExclusive(ctx, ingest.WriterLockOptions{
 		OnWait: func() { log.Warn("another writer holds the writer lock for this schema; waiting for it to stop") },
-		OnStop: func(err error) { log.Error("writer stopped; taking the writer lock again", "err", err) },
+		OnStop: func(err error) { log.Error("writer stopped; trying the writer lock again", "err", err) },
 	}, func(ctx context.Context) error {
 		log.Info("writer lock acquired")
 		if err := pgStore.Migrate(ctx); err != nil {
 			return err
 		}
-		log.Info("schema applied")
+		epoch, err := pgStore.TakeEpoch(ctx)
+		if err != nil {
+			return err
+		}
+		log.Info("schema applied", "writer_epoch", epoch)
 		log.Info("ingest starting",
 			"source", envOr("KEYS_API_SOURCE", "lido-core"),
 			"interval_ms", envInt("UPDATE_KEYS_INTERVAL_MS", 5000),
 			"retain_versions", envInt("RETAIN_VERSIONS", 20),
 			"epoch", epochDuration().String(),
 			"metered", meteredEndpoints())
-		return syncer.Run(ctx)
+		// A syncer per lock: what it holds in memory is only true while no other writer wrote.
+		return newSyncer().Run(ctx)
 	})
 }
 

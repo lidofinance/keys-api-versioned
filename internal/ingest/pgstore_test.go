@@ -273,6 +273,9 @@ func TestTwoChainsCannotShareOneStore(t *testing.T) {
 		if err := s.Migrate(ctx); err != nil {
 			t.Fatalf("migrate chain %d: %v", chainID, err)
 		}
+		if _, err := s.TakeEpoch(ctx); err != nil {
+			t.Fatalf("writer epoch: %v", err)
+		}
 		return s
 	}
 
@@ -356,6 +359,9 @@ func TestASchemaChangeRebuildsRatherThanMigrates(t *testing.T) {
 		}
 		if err := s.Migrate(ctx); err != nil {
 			t.Fatalf("migrate: %v", err)
+		}
+		if _, err := s.TakeEpoch(ctx); err != nil {
+			t.Fatalf("writer epoch: %v", err)
 		}
 		return s
 	}

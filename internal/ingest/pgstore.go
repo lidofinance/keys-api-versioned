@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -28,6 +29,7 @@ type PGStore struct {
 	// schema is empty when the DSN decides; statements are unqualified and land via search_path.
 	schema        string
 	keyStageBatch int
+	epoch         atomic.Int64
 }
 
 // One schema per chain: a mainnet node pointed at a Hoodi database would otherwise "reorg" every
@@ -331,11 +333,17 @@ func (s *PGStore) Recent(ctx context.Context, limit int) ([]StoredVersion, error
 // Begin refuses a block below what the store already holds: Commit closes rows at the build's
 // block, so a lower build after a higher one rewrites ranges the newer version reads.
 func (s *PGStore) Begin(ctx context.Context, at model.ELBlockSnapshot) (Build, error) {
+	tx, err := s.beginWrite(ctx, s.pool)
+	if err != nil {
+		return nil, fmt.Errorf("begin version: %w", err)
+	}
+	defer tx.Rollback(ctx)
+
 	var (
 		newerVersion bool
 		newestRow    int64
 	)
-	if err := s.pool.QueryRow(ctx, `
+	if err := tx.QueryRow(ctx, `
 		select exists (
 		         select 1 from versions
 		          where status in ('published', 'stale', 'building')
@@ -352,7 +360,7 @@ func (s *PGStore) Begin(ctx context.Context, at model.ELBlockSnapshot) (Build, e
 	}
 
 	var id int64
-	err := s.pool.QueryRow(ctx, `
+	err = tx.QueryRow(ctx, `
 		insert into versions
 			(block_number, block_hash, timestamp, head_block_number, head_block_hash, head_timestamp,
 			 last_changed_block_hash, label, status, source)
@@ -362,13 +370,16 @@ func (s *PGStore) Begin(ctx context.Context, at model.ELBlockSnapshot) (Build, e
 		at.BlockNumber, strings.ToLower(at.BlockHash), at.Timestamp, s.source).Scan(&id)
 	if errors.Is(err, pgx.ErrNoRows) {
 		var status string
-		if err := s.pool.QueryRow(ctx, `select status from versions where block_number = $1 and block_hash = $2`,
+		if err := tx.QueryRow(ctx, `select status from versions where block_number = $1 and block_hash = $2`,
 			at.BlockNumber, strings.ToLower(at.BlockHash)).Scan(&status); err != nil {
 			return nil, ErrVersionExists
 		}
 		return nil, ExistingVersionError{Status: status}
 	}
 	if err != nil {
+		return nil, fmt.Errorf("begin version: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
 		return nil, fmt.Errorf("begin version: %w", err)
 	}
 
@@ -385,7 +396,12 @@ func (s *PGStore) Extend(ctx context.Context, v StoredVersion, at model.ELBlockS
 	if err != nil {
 		return err
 	}
-	_, err = s.pool.Exec(ctx, `
+	tx, err := s.beginWrite(ctx, s.pool)
+	if err != nil {
+		return fmt.Errorf("extend version %d: %w", v.BlockNumber, err)
+	}
+	defer tx.Rollback(ctx)
+	_, err = tx.Exec(ctx, `
 		update versions
 		   set head_block_number = $2, head_block_hash = $3, head_timestamp = $4, module_nonces = $5,
 		       finalized_block_number = greatest(finalized_block_number, $6)
@@ -394,16 +410,20 @@ func (s *PGStore) Extend(ctx context.Context, v StoredVersion, at model.ELBlockS
 	if err != nil {
 		return fmt.Errorf("extend version %d: %w", v.BlockNumber, err)
 	}
-	return nil
+	return tx.Commit(ctx)
 }
 
 func (s *PGStore) MarkStale(ctx context.Context, v StoredVersion) error {
-	_, err := s.pool.Exec(ctx,
-		`update versions set status = 'stale' where id = $1 and status = 'published'`, v.ID)
+	tx, err := s.beginWrite(ctx, s.pool)
 	if err != nil {
 		return fmt.Errorf("mark stale: %w", err)
 	}
-	return nil
+	defer tx.Rollback(ctx)
+	if _, err := tx.Exec(ctx,
+		`update versions set status = 'stale' where id = $1 and status = 'published'`, v.ID); err != nil {
+		return fmt.Errorf("mark stale: %w", err)
+	}
+	return tx.Commit(ctx)
 }
 
 func (s *PGStore) UnfinishedBuilds(ctx context.Context) (int64, error) {
@@ -417,7 +437,7 @@ func (s *PGStore) UnfinishedBuilds(ctx context.Context) (int64, error) {
 func (s *PGStore) SupersedeFrom(ctx context.Context, block int64) (Superseded, error) {
 	var out Superseded
 
-	tx, err := s.pool.Begin(ctx)
+	tx, err := s.beginWrite(ctx, s.pool)
 	if err != nil {
 		return out, err
 	}
@@ -519,7 +539,7 @@ func (s *PGStore) Prune(ctx context.Context, keep int) (Pruned, error) {
 		return out, nil
 	}
 
-	tx, err := s.pool.Begin(ctx)
+	tx, err := s.beginWrite(ctx, s.pool)
 	if err != nil {
 		return out, err
 	}

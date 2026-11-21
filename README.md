@@ -27,7 +27,7 @@ docker compose --profile static up -d --build keys-api-static
 
 It shares the database with the chain-fed service but writes schema `static_<chain id>`, so the demo registry never lands among the mainnet rows. A process refuses to start on a store another source has written.
 
-Ours listens on 3010, the canonical service on 3000. Environment variables are documented at the top of [cmd/keys-api/main.go](cmd/keys-api/main.go); the names the canonical service already uses are reused. `KEYS_API_MODE=server` serves without syncing and `KEYS_API_MODE=ingest` syncs without serving, so several read replicas can sit behind one writer.
+Ours listens on 3010, the canonical service on 3000. Environment variables are documented at the top of [cmd/keys-api/main.go](cmd/keys-api/main.go); the names the canonical service already uses are reused. `KEYS_API_MODE=server` serves without syncing and `KEYS_API_MODE=ingest` syncs without serving, so several read replicas can sit behind one writer. Running more than one writer on a schema is safe: one holds the writer lock and the others wait. A writer whose lock session died cannot commit once another has taken over (`writer_fence`), and it exits instead of queueing behind it.
 
 Generate load from inside the compose network. Through a published port on Docker Desktop the host hop caps everything at ~188 MiB/s and every service looks identical.
 

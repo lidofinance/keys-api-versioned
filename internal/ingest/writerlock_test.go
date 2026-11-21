@@ -276,3 +276,182 @@ func TestALostWriterLockStopsTheWriterAndTakesTheLockAgain(t *testing.T) {
 		t.Fatal("RunExclusive did not return after its context ended")
 	}
 }
+
+// The next writer's epoch bump waits for a write that already passed the fence check, so the old
+// writer's transaction and the new writer's first write never interleave.
+func TestTakingTheEpochWaitsForAWriteInFlight(t *testing.T) {
+	db := testpg.New(t)
+	ctx := context.Background()
+
+	tx, err := db.Writer.BeginWriteForTest(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback(ctx)
+
+	next, err := ingest.NewPGStore(ctx, db.DSN, ingest.PGOptions{Source: "testpg"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer next.Close()
+	taken := make(chan error, 1)
+	go func() {
+		_, err := next.TakeEpoch(ctx)
+		taken <- err
+	}()
+	select {
+	case err := <-taken:
+		t.Fatalf("the epoch was taken (err %v) while a write that passed the fence was open", err)
+	case <-time.After(300 * time.Millisecond):
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-taken:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the epoch was not taken after the write committed")
+	}
+	stale, err := db.Writer.BeginWriteForTest(ctx)
+	if err == nil {
+		_ = stale.Rollback(ctx)
+	}
+	if !errors.As(err, new(ingest.ErrFenced)) {
+		t.Errorf("a write by the previous writer got %v, want ErrFenced", err)
+	}
+}
+
+// A writer whose lock went to another writer stops instead of queueing behind it.
+func TestAWriterWhoseLockWentToAnotherStops(t *testing.T) {
+	testpg.Exclusive(t)
+	db := testpg.New(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	starts := make(chan struct{}, 4)
+	done := make(chan error, 1)
+	go func() {
+		done <- db.Writer.RunExclusive(ctx, ingest.WriterLockOptions{
+			CheckInterval: 50 * time.Millisecond,
+			RetryDelay:    500 * time.Millisecond,
+		}, func(ctx context.Context) error {
+			starts <- struct{}{}
+			<-ctx.Done()
+			return ctx.Err()
+		})
+	}()
+	select {
+	case <-starts:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the writer did not start")
+	}
+
+	terminateWriterSessions(t, db, true)
+	next, err := ingest.NewPGStore(ctx, db.DSN, ingest.PGOptions{Source: "testpg"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer next.Close()
+	lock, err := next.LockWriter(ctx, ingest.WriterLockOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lock.Release()
+
+	select {
+	case err := <-done:
+		if !errors.Is(err, ingest.ErrTakenOver) {
+			t.Errorf("RunExclusive returned %v, want ErrTakenOver", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the writer kept going after another took its lock")
+	}
+	if len(starts) > 0 {
+		t.Error("the writer started again under another writer's lock")
+	}
+}
+
+func TestAFencedWriterStops(t *testing.T) {
+	db := testpg.New(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	runs := 0
+	err := db.Writer.RunExclusive(ctx, ingest.WriterLockOptions{RetryDelay: 10 * time.Millisecond},
+		func(context.Context) error {
+			runs++
+			return ingest.ErrFenced{Own: 1, Current: 2}
+		})
+	if !errors.As(err, new(ingest.ErrFenced)) || runs != 1 {
+		t.Errorf("RunExclusive returned %v after %d runs, want ErrFenced after 1", err, runs)
+	}
+}
+
+// Only a writer that held the lock stops on finding it taken: a new pod in a rollout keeps waiting
+// for the old one, even when its waiting session is cut.
+func TestAWriterThatNeverHeldTheLockKeepsWaiting(t *testing.T) {
+	testpg.Exclusive(t)
+	db := testpg.New(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	held, err := db.Writer.LockWriter(ctx, ingest.WriterLockOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer held.Release()
+	next, err := ingest.NewPGStore(ctx, db.DSN, ingest.PGOptions{Source: "testpg"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer next.Close()
+
+	waits := make(chan struct{}, 4)
+	starts := make(chan struct{}, 1)
+	done := make(chan error, 1)
+	go func() {
+		done <- next.RunExclusive(ctx, ingest.WriterLockOptions{
+			OnWait:     func() { waits <- struct{}{} },
+			RetryDelay: 50 * time.Millisecond,
+		}, func(ctx context.Context) error {
+			starts <- struct{}{}
+			<-ctx.Done()
+			return ctx.Err()
+		})
+	}()
+	for i := range 2 {
+		select {
+		case <-waits:
+		case err := <-done:
+			t.Fatalf("the waiting writer returned %v", err)
+		case <-time.After(5 * time.Second):
+			t.Fatalf("wait %d did not happen", i+1)
+		}
+		if i == 0 {
+			time.Sleep(100 * time.Millisecond) // let it block in pg_advisory_lock
+			terminateWriterSessions(t, db, false)
+		}
+	}
+
+	held.Release()
+	select {
+	case <-starts:
+	case err := <-done:
+		t.Fatalf("the waiting writer returned %v instead of taking the lock", err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("the waiting writer did not take the released lock")
+	}
+}
+
+func terminateWriterSessions(t *testing.T, db *testpg.DB, granted bool) {
+	t.Helper()
+	if _, err := db.Admin().Exec(context.Background(), `
+		select pg_terminate_backend(pid) from pg_locks
+		 where locktype = 'advisory' and objsubid = 2 and classid = x'6b617069'::int::oid and granted = $1
+		   and database = (select oid from pg_database where datname = current_database())`, granted); err != nil {
+		t.Fatal(err)
+	}
+}

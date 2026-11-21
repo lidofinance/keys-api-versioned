@@ -82,6 +82,10 @@ func TestConcurrentMigrationsOfAChangedSchemaSucceed(t *testing.T) {
 	}
 
 	for round := 0; round < 5; round++ {
+		// Each round's rebuild recreates the fence: first is a new writer again.
+		if _, err := first.TakeEpoch(ctx); err != nil {
+			t.Fatal(err)
+		}
 		testreg.Spec{Modules: 1, OperatorsPerModule: 1, KeysPerOperator: 1}.
 			Publish(ctx, t, first, testreg.At(int64(1000+round)))
 		if _, err := first.Pool().Exec(ctx, `update schema_fingerprint set fingerprint = 'older layout'`); err != nil {
