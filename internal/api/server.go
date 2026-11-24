@@ -216,7 +216,15 @@ func (s *Server) handleReady(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if err != nil || !ready {
-		writeError(w, http.StatusServiceUnavailable, "no published version yet")
+		reason := "no published version yet"
+		if explains, ok := s.store.(interface {
+			NotServingReason(context.Context) (string, error)
+		}); ok && err == nil {
+			if why, whyErr := explains.NotServingReason(ctx); whyErr == nil && why != "" {
+				reason = why
+			}
+		}
+		writeError(w, http.StatusServiceUnavailable, reason)
 		return
 	}
 	w.WriteHeader(http.StatusOK)

@@ -92,6 +92,8 @@ Naming the schema after the chain makes that impossible instead of detectable. A
 
 What naming cannot catch is a devnet reusing chain id 1, which lands in the same schema as mainnet with entirely different contracts. For that, the loop refuses to roll back when the stored module set and the chain's share no address — something no reorg can produce, since a fork cannot change which contracts exist.
 
+The other mistake is the release. `schema.sql` carries a number that only grows (`store.SchemaVersion`, pinned to the file by a test). A writer from a newer release rebuilds an older store and says so in a WARN line. A writer from an older release finds a newer store, changes nothing and exits, naming both numbers; before the number it dropped the store, and the newer writer dropped it again when it came back. Releases from before the number cannot read it and still drop a newer store. A server answering 425 logs why at most once a minute: no store in its schema, a writer on an older release, a hold for an overdue full read, or the first sync still running. An unready pod puts the same text in its `/health/ready` body.
+
 An existing deployment resyncs once when it picks this up: its rows are in `public` and the service now looks in `chain_<id>`. Nothing is deleted.
 
 ## Parity

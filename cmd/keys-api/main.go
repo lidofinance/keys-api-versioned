@@ -119,6 +119,7 @@ func run(log *slog.Logger, masker *logmask.Masker) error {
 	// One schema per chain: otherwise a store from another chain looks like a reorg deeper than the
 	// window and is silently rebuilt from scratch.
 	pgStore, err := ingest.NewPGStore(ctx, dsn, ingest.PGOptions{
+		Log:      log,
 		MaxConns: int32(databaseMaxConns()),
 		Source:   envOr("KEYS_API_SOURCE", "lido-core"),
 		ChainID:  chainID,

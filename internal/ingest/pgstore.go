@@ -8,6 +8,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"log/slog"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -30,6 +32,26 @@ type PGStore struct {
 	schema        string
 	keyStageBatch int
 	epoch         atomic.Int64
+	log           *slog.Logger
+}
+
+func (s *PGStore) logger() *slog.Logger {
+	if s.log == nil {
+		return slog.New(slog.NewTextHandler(io.Discard, nil))
+	}
+	return s.log
+}
+
+// ErrNewerStore: the store was built by a newer release. Dropping it would cost every reader a cold
+// sync and the newer writer another one when it comes back, so the writer stops instead.
+type ErrNewerStore struct {
+	Stored, Own int
+}
+
+func (e ErrNewerStore) Error() string {
+	return fmt.Sprintf("the store was built by a newer release (schema version %d, this binary has %d): "+
+		"run that release or a later one, or point DATABASE_URL at an empty database; nothing was changed",
+		e.Stored, e.Own)
 }
 
 // One schema per chain: a mainnet node pointed at a Hoodi database would otherwise "reorg" every
@@ -53,6 +75,7 @@ type PGOptions struct {
 	ChainID int64
 	// KeyStageBatch is the COPY batch size; 0 means 20 000.
 	KeyStageBatch int
+	Log           *slog.Logger
 	// Lazy skips the ping: the pool connects on first use, so a database that is down at boot does
 	// not stop the process (WaitForDatabase is the blocking variant).
 	Lazy bool
@@ -89,7 +112,7 @@ func NewPGStore(ctx context.Context, dsn string, o PGOptions) (*PGStore, error) 
 	if batch <= 0 {
 		batch = 20_000
 	}
-	return &PGStore{pool: pool, source: o.Source, schema: schema, keyStageBatch: batch}, nil
+	return &PGStore{pool: pool, source: o.Source, schema: schema, keyStageBatch: batch, log: o.Log}, nil
 }
 
 func (s *PGStore) Close() { s.pool.Close() }
@@ -134,12 +157,19 @@ func (s *PGStore) Migrate(ctx context.Context) error {
 		return fmt.Errorf("migrate: lock: %w", err)
 	}
 
+	stored, version, err := storedFingerprint(ctx, tx)
+	if err != nil {
+		return err
+	}
+	populated := schemaHasTables(ctx, tx)
+	if populated && version > store.SchemaVersion {
+		return ErrNewerStore{Stored: version, Own: store.SchemaVersion}
+	}
 	if s.schema != "" {
-		stored, err := storedFingerprint(ctx, tx)
-		if err != nil {
-			return err
-		}
-		if stored != fingerprint && schemaHasTables(ctx, tx) {
+		if stored != fingerprint && populated {
+			s.logger().Warn("rebuilding the store for this release's schema: a cold sync follows, and "+
+				"readers answer 425 until it publishes",
+				"schema", s.schema, "from_version", version, "to_version", store.SchemaVersion)
 			if _, err := tx.Exec(ctx, `drop schema `+pgIdentifier(s.schema)+` cascade`); err != nil {
 				return fmt.Errorf("drop schema %s for rebuild: %w", s.schema, err)
 			}
@@ -178,35 +208,42 @@ func (s *PGStore) Migrate(ctx context.Context) error {
 	}
 
 	if _, err := tx.Exec(ctx, `
-		insert into schema_fingerprint (id, fingerprint) values (1, $1)
-		on conflict (id) do update set fingerprint = excluded.fingerprint, applied_at = now()`,
-		fingerprint); err != nil {
+		insert into schema_fingerprint (id, fingerprint, version) values (1, $1, $2)
+		on conflict (id) do update
+		  set fingerprint = excluded.fingerprint, version = excluded.version, applied_at = now()`,
+		fingerprint, store.SchemaVersion); err != nil {
 		return fmt.Errorf("record the schema fingerprint: %w", err)
 	}
 	return tx.Commit(ctx)
 }
 
 // storedFingerprint: "" for a schema with tables means an unknown layout, rebuilt like a mismatch.
-func storedFingerprint(ctx context.Context, tx pgx.Tx) (string, error) {
+// Version 0 is a store from before versions were recorded.
+func storedFingerprint(ctx context.Context, tx pgx.Tx) (string, int, error) {
 	// to_regclass answers NULL for a missing name, including a missing schema, instead of failing.
 	var exists bool
 	if err := tx.QueryRow(ctx,
 		`select to_regclass('schema_fingerprint') is not null`).Scan(&exists); err != nil {
-		return "", fmt.Errorf("look for the schema fingerprint: %w", err)
+		return "", 0, fmt.Errorf("look for the schema fingerprint: %w", err)
 	}
 	if !exists {
-		return "", nil
+		return "", 0, nil
 	}
 
-	var fingerprint string
-	err := tx.QueryRow(ctx, `select fingerprint from schema_fingerprint where id = 1`).Scan(&fingerprint)
+	var (
+		fingerprint string
+		version     int
+	)
+	// to_jsonb reads a column an older layout does not have as null.
+	err := tx.QueryRow(ctx, `select fingerprint, coalesce((to_jsonb(f)->>'version')::int, 0)
+		from schema_fingerprint f where id = 1`).Scan(&fingerprint, &version)
 	if errors.Is(err, pgx.ErrNoRows) {
-		return "", nil
+		return "", 0, nil
 	}
 	if err != nil {
-		return "", fmt.Errorf("read the schema fingerprint: %w", err)
+		return "", 0, fmt.Errorf("read the schema fingerprint: %w", err)
 	}
-	return fingerprint, nil
+	return fingerprint, version, nil
 }
 
 func schemaHasTables(ctx context.Context, tx pgx.Tx) bool {

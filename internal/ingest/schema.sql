@@ -39,6 +39,9 @@
 create table if not exists schema_fingerprint (
     id          smallint    primary key default 1 check (id = 1),
     fingerprint text        not null,
+    -- store.SchemaVersion of the release that built it: a fingerprint says the layout differs, this
+    -- says which side is older, so an older writer refuses instead of dropping a newer store.
+    version     integer     not null,
     applied_at  timestamptz not null default now()
 );
 

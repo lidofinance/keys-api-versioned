@@ -474,3 +474,19 @@ func terminateWriterSessions(t *testing.T, db *testpg.DB, granted bool) {
 		t.Fatal(err)
 	}
 }
+
+// A newer release's store stays newer, so the writer exits for the pod status to show it.
+func TestANewerStoreStopsTheWriterInsteadOfRetrying(t *testing.T) {
+	db := testpg.New(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	calls := 0
+	err := db.Writer.RunExclusive(ctx, ingest.WriterLockOptions{RetryDelay: time.Millisecond}, func(context.Context) error {
+		calls++
+		return ingest.ErrNewerStore{Stored: 2, Own: 1}
+	})
+	var newer ingest.ErrNewerStore
+	if !errors.As(err, &newer) || calls != 1 {
+		t.Errorf("RunExclusive returned %v after %d runs, want ErrNewerStore after one", err, calls)
+	}
+}
