@@ -69,10 +69,10 @@ func TestAnOperatorIndexBeyondInt32IsNotOperatorZero(t *testing.T) {
 	srv := testpg.NewServer(t, db.Reader(t, "latest", 2))
 
 	for path, want := range map[string]int{
-		"/v1/modules/1/operators/4294967296":                                       http.StatusNotFound,
-		"/v1/keys?operatorIndex=4294967296":                                        http.StatusBadRequest,
-		"/v1/modules/1/keys?operatorIndex=4294967296":                              http.StatusBadRequest,
-		fmt.Sprintf("/ext/v1/keys?limit=10&cursor=%d.1.4294967296.0", db.Block(0)): http.StatusBadRequest,
+		"/v1/modules/1/operators/4294967296":          http.StatusNotFound,
+		"/v1/keys?operatorIndex=4294967296":           http.StatusBadRequest,
+		"/v1/modules/1/keys?operatorIndex=4294967296": http.StatusBadRequest,
+		fmt.Sprintf("/ext/v1/keys?limit=10&cursor=%d.1.4294967296.0.%s", db.Block(0), testreg.HashAt(db.Block(0))): http.StatusBadRequest,
 	} {
 		resp := srv.Get(t, path)
 		body, _ := io.ReadAll(resp.Body)
