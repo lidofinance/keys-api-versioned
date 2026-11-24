@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
+	"net/http"
 	"slices"
 	"sync"
 	"testing"
@@ -313,4 +315,95 @@ func TestARetriedAuditMovesTheRefreshSignal(t *testing.T) {
 	if lastChanged != hash {
 		t.Errorf("version %s reports lastChangedBlockHash %s, want its own hash %s: module 2 changed", block, lastChanged, hash)
 	}
+}
+
+// The audit's count survives a restart: counted from the version instead, restarts more often than
+// the window put the audit off for good.
+func TestRestartsDoNotPutTheAuditOff(t *testing.T) {
+	db := testpg.New(t)
+	ctx := context.Background()
+	src := newSpecSource(db.Block(0))
+	cfg := ingest.SyncConfig{MaxBlockGap: 4}
+	if r := ingest.NewSyncer(src, db.Writer, cfg, nil).Cycle(ctx); r.Err != nil {
+		t.Fatalf("cold sync: %v", r.Err)
+	}
+	for i := 1; i <= 6; i++ {
+		src.salts[2] = uint64(i)
+		r := ingest.NewSyncer(src, db.Writer, cfg, nil).Cycle(ctx)
+		if r.Err != nil {
+			t.Fatalf("restart %d: %v", i, r.Err)
+		}
+		if r.Audit {
+			return
+		}
+	}
+	t.Fatal("no audit across 6 restarts with a gap limit of 4")
+}
+
+// A writer that comes up with the full read overdue may have been down for long: latest answers 425
+// until the full read publishes. The pod stays ready, and a version pinned by number is still served.
+func TestAnOverdueFullReadOnStartWithholdsLatest(t *testing.T) {
+	db := testpg.New(t)
+	ctx := context.Background()
+	src := newSpecSource(db.Block(0))
+	cfg := ingest.SyncConfig{MaxBlockGap: 4}
+	if r := ingest.NewSyncer(src, db.Writer, cfg, nil).Cycle(ctx); r.Err != nil {
+		t.Fatalf("cold sync: %v", r.Err)
+	}
+	version := src.block
+	srv := testpg.NewServer(t, db.Reader(t, "latest", 3))
+
+	src.block += 10
+	src.failKeys[1] = 1
+	restarted := ingest.NewSyncer(src, db.Writer, cfg, nil)
+	if r := restarted.Cycle(ctx); r.Err == nil {
+		t.Fatal("the full read should fail on module 1")
+	}
+	for path, want := range map[string]int{
+		"/v1/keys":      http.StatusTooEarly,
+		"/health/ready": http.StatusOK,
+		fmt.Sprintf("/ext/v1/keys?snapshot=%d&limit=1", version): http.StatusOK,
+	} {
+		if got := statusOf(t, srv, path); got != want {
+			t.Errorf("%s while the full read is pending: status %d, want %d", path, got, want)
+		}
+	}
+
+	if r := restarted.Cycle(ctx); r.Err != nil || !r.Audit {
+		t.Fatalf("the retry: audit %t, err %v", r.Audit, r.Err)
+	}
+	if got := statusOf(t, srv, "/v1/keys"); got != http.StatusOK {
+		t.Errorf("/v1/keys after the full read: status %d, want 200", got)
+	}
+}
+
+// A start with the full read not due lifts a hold a previous writer left.
+func TestAStartWithTheFullReadNotDueLiftsTheHold(t *testing.T) {
+	db := testpg.New(t)
+	ctx := context.Background()
+	src := newSpecSource(db.Block(0))
+	if r := ingest.NewSyncer(src, db.Writer, ingest.SyncConfig{MaxBlockGap: 4}, nil).Cycle(ctx); r.Err != nil {
+		t.Fatalf("cold sync: %v", r.Err)
+	}
+	srv := testpg.NewServer(t, db.Reader(t, "latest", 3))
+
+	src.block += 10
+	src.failKeys[1] = 1
+	if r := ingest.NewSyncer(src, db.Writer, ingest.SyncConfig{MaxBlockGap: 4}, nil).Cycle(ctx); r.Err == nil {
+		t.Fatal("the full read should fail on module 1")
+	}
+	if r := ingest.NewSyncer(src, db.Writer, ingest.SyncConfig{MaxBlockGap: 1000}, nil).Cycle(ctx); r.Err != nil {
+		t.Fatalf("start with a wider window: %v", r.Err)
+	}
+	if got := statusOf(t, srv, "/v1/keys"); got != http.StatusOK {
+		t.Errorf("/v1/keys: status %d, want 200", got)
+	}
+}
+
+func statusOf(t *testing.T, srv *testpg.Server, path string) int {
+	t.Helper()
+	resp := srv.Get(t, path)
+	io.Copy(io.Discard, resp.Body)
+	resp.Body.Close()
+	return resp.StatusCode
 }

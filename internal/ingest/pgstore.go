@@ -243,7 +243,7 @@ func pgIdentifier(name string) string {
 
 const versionColumns = `id, block_number, block_hash, timestamp,
 	head_block_number, head_block_hash, head_timestamp, finalized_block_number,
-	last_changed_block_hash, label, status, module_nonces`
+	last_changed_block_hash, label, status, module_nonces, audited_block`
 
 func scanVersion(row pgx.Row) (*StoredVersion, error) {
 	var (
@@ -252,7 +252,7 @@ func scanVersion(row pgx.Row) (*StoredVersion, error) {
 	)
 	if err := row.Scan(&v.ID, &v.BlockNumber, &v.BlockHash, &v.Timestamp,
 		&v.HeadBlockNumber, &v.HeadBlockHash, &v.HeadTimestamp, &v.FinalizedBlockNumber,
-		&v.LastChangedBlockHash, &v.Label, &v.Status, &noncesJSON); err != nil {
+		&v.LastChangedBlockHash, &v.Label, &v.Status, &noncesJSON, &v.AuditedBlock); err != nil {
 		return nil, err
 	}
 	if err := json.Unmarshal(noncesJSON, &v.ModuleNonces); err != nil {
@@ -423,6 +423,22 @@ func (s *PGStore) MarkStale(ctx context.Context, v StoredVersion) error {
 	if _, err := tx.Exec(ctx,
 		`update versions set status = 'stale' where id = $1 and status = 'published'`, v.ID); err != nil {
 		return fmt.Errorf("mark stale: %w", err)
+	}
+	return tx.Commit(ctx)
+}
+
+func (s *PGStore) Hold(ctx context.Context, on bool) error {
+	tx, err := s.beginWrite(ctx, s.pool)
+	if err != nil {
+		return fmt.Errorf("serving hold: %w", err)
+	}
+	defer tx.Rollback(ctx)
+	q := `delete from serving_hold`
+	if on {
+		q = `insert into serving_hold (id) values (1) on conflict do nothing`
+	}
+	if _, err := tx.Exec(ctx, q); err != nil {
+		return fmt.Errorf("serving hold: %w", err)
 	}
 	return tx.Commit(ctx)
 }

@@ -141,6 +141,23 @@ const appVersionCols = `id, block_number, coalesce(nullif(head_block_number, 0),
 	coalesce(nullif(head_timestamp, 0), timestamp),
 	last_changed_block_hash, status`
 
+// notHeld: while the writer holds serving for an overdue full read, `latest` and `finalized` resolve to
+// nothing, as before the first publish. A pin by number or hash names its block and stays served.
+const notHeld = `not exists (select 1 from serving_hold)`
+
+// Withheld reports a serving hold: a version exists, so the pod is ready and answers 425 itself.
+func (a *App) Withheld(ctx context.Context) (bool, error) {
+	var held bool
+	err := a.pool.QueryRow(ctx, `select exists (select 1 from serving_hold)`).Scan(&held)
+	if missingSchema(err) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("serving hold: %w", err)
+	}
+	return held, nil
+}
+
 // resolveAppPin reports the status too, so the API can flag a known-stale read.
 func resolveAppPin(ctx context.Context, conn pinReader, pin string) (*model.ELBlockSnapshot, int64, int64, string, error) {
 	var (
@@ -150,13 +167,13 @@ func resolveAppPin(ctx context.Context, conn pinReader, pin string) (*model.ELBl
 	switch {
 	case pin == "latest":
 		q = `select ` + appVersionCols + ` from versions
-		     where status in ('` + StatusPublished + `', '` + StatusStale + `')
+		     where status in ('` + StatusPublished + `', '` + StatusStale + `') and ` + notHeld + `
 		     order by id desc limit 1`
 	case pin == "finalized":
 		// By predicate, not a label a writer must move (the old `safe` label was never set and answered
 		// 425 forever). Never answers 409; the finalized block comes from versions, not a node.
 		q = `select ` + appVersionCols + ` from versions
-		     where status in ('` + StatusPublished + `', '` + StatusStale + `')
+		     where status in ('` + StatusPublished + `', '` + StatusStale + `') and ` + notHeld + `
 		       and block_number <= (select max(finalized_block_number) from versions)
 		     order by id desc limit 1`
 	case strings.HasPrefix(pin, "0x"):

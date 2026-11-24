@@ -50,9 +50,11 @@ type Syncer struct {
 	// confirmedHash: the version the last reorg probe found on chain; finalHash: one known on chain at or
 	// below finality. In memory only, so a restart probes again.
 	confirmedHash, finalHash string
-	// auditedAt is the block of the last rebuild that read every key from the chain. Not persisted: a
-	// restart starts it at the published version, as the block-gap rule always counted from there.
+	// auditedAt is the block of the last rebuild that read every key from the chain, loaded from the
+	// published version on start.
 	auditedAt int64
+	// holdSettled: this process has decided whether readers wait for an overdue full read.
+	holdSettled bool
 
 	now func() time.Time
 	// wait sleeps between cycles; tests replace it to record the schedule.
@@ -290,7 +292,16 @@ func (s *Syncer) Cycle(ctx context.Context) (result CycleResult) {
 	result.VersionBlock = latest.BlockNumber
 	result.VersionTimestamp = latest.Timestamp
 	if s.auditedAt == 0 {
-		s.auditedAt = latest.BlockNumber
+		s.auditedAt = latest.AuditedBlock
+		if s.auditedAt == 0 {
+			s.auditedAt = latest.BlockNumber
+		}
+	}
+	if !s.holdSettled {
+		if err := s.settleHold(ctx, readAt.BlockNumber, latest.BlockNumber); err != nil {
+			result.Err = err
+			return result
+		}
 	}
 
 	// Head behind the published version: a rolled-back node or a lagging replica. Wait, don't undo it.
@@ -662,6 +673,13 @@ func (s *Syncer) rebuild(ctx context.Context, head model.ELBlockSnapshot, module
 		}
 	}
 
+	if marker, ok := build.(AuditMarker); ok {
+		audited := s.auditedAt
+		if everyKey {
+			audited = head.BlockNumber
+		}
+		marker.SetAuditedBlock(audited)
+	}
 	publishStarted := time.Now()
 	if err := build.Publish(ctx, "latest", finalized); err != nil {
 		return err
@@ -689,6 +707,26 @@ func (s *Syncer) rebuild(ctx context.Context, head model.ELBlockSnapshot, module
 	s.log.Info("version published",
 		"block", head.BlockNumber, "modules", len(modules),
 		"scoped_to", len(inScope), "keys_read", result.KeysStaged, "keys_changed", result.KeysChanged)
+	return nil
+}
+
+// settleHold: a writer that comes up with the full read overdue may have been down long enough that
+// the newest version is far behind, so readers get 425 until the full read publishes.
+func (s *Syncer) settleHold(ctx context.Context, block, version int64) error {
+	holder, ok := s.store.(ServingHold)
+	if !ok {
+		s.holdSettled = true
+		return nil
+	}
+	due := s.cfg.MaxBlockGap > 0 && block-s.auditedAt >= s.cfg.MaxBlockGap
+	if err := holder.Hold(ctx, due); err != nil {
+		return err
+	}
+	s.holdSettled = true
+	if due {
+		s.log.Warn("full read overdue on start: latest and finalized answer 425 until it publishes",
+			"audited_at", s.auditedAt, "version", version, "block", block, "limit", s.cfg.MaxBlockGap)
+	}
 	return nil
 }
 

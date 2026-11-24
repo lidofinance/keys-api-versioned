@@ -207,6 +207,14 @@ func (s *Server) handleReady(w http.ResponseWriter, r *http.Request) {
 		ready = elMeta != nil
 		return nil
 	})
+	if err == nil && !ready {
+		// Held for an overdue full read: requests get 425 from here rather than no endpoint at all.
+		if held, ok := s.store.(interface {
+			Withheld(context.Context) (bool, error)
+		}); ok {
+			ready, err = held.Withheld(ctx)
+		}
+	}
 	if err != nil || !ready {
 		writeError(w, http.StatusServiceUnavailable, "no published version yet")
 		return
