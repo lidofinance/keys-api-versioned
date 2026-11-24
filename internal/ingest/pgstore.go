@@ -311,9 +311,10 @@ func (s *PGStore) PublishedModules(ctx context.Context, v StoredVersion) ([]mode
 	return out, rows.Err()
 }
 
-func (s *PGStore) Recent(ctx context.Context, limit int) ([]StoredVersion, error) {
+func (s *PGStore) Recent(ctx context.Context, below int64, limit int) ([]StoredVersion, error) {
 	rows, err := s.pool.Query(ctx, `select `+versionColumns+`
-		from versions order by id desc limit $1`, limit)
+		from versions where status in ('published', 'stale') and block_number < $1
+		order by id desc limit $2`, below, limit)
 	if err != nil {
 		return nil, fmt.Errorf("recent versions: %w", err)
 	}

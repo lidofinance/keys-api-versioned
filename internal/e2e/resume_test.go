@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"sync"
 	"testing"
 
@@ -80,6 +81,86 @@ func TestRowsOfAnAttemptOnADroppedBranchAreNotInherited(t *testing.T) {
 	verifyContent(t, db, src.salts)
 }
 
+// Failed attempts leave superseded rows above the published version. They must not use up the reorg
+// search and leave a version of a dropped branch served.
+func TestFailedAttemptsDoNotHideAnOrphanedVersion(t *testing.T) {
+	db := testpg.New(t)
+	ctx := context.Background()
+	src := newSpecSource(db.Block(0))
+	syncer := ingest.NewSyncer(src, db.Writer, ingest.SyncConfig{}, nil)
+	if r := syncer.Cycle(ctx); r.Err != nil {
+		t.Fatalf("cold sync: %v", r.Err)
+	}
+	orphan := src.hash(src.block)
+
+	src.salts[1] = 1
+	src.failKeys[1] = 21
+	for i := 0; i < 21; i++ {
+		if r := syncer.Cycle(ctx); r.Err == nil {
+			t.Fatalf("attempt %d should fail on module 1", i)
+		}
+	}
+	src.fork(src.block - 21)
+	src.salts[1] = 0
+	if r := syncer.Cycle(ctx); r.Err != nil {
+		t.Fatalf("cycle after the reorg: %v", r.Err)
+	}
+
+	var served int
+	if err := db.Writer.Pool().QueryRow(ctx, `select count(*) from versions
+		where block_hash = $1 and status in ('published', 'stale')`, orphan).Scan(&served); err != nil {
+		t.Fatal(err)
+	}
+	if served != 0 {
+		t.Error("the version on the dropped branch is still served")
+	}
+	verifyContent(t, db, src.salts)
+}
+
+// A module registered on a branch that is then dropped, after an attempt wrote its rows, must not be
+// published with the next version.
+func TestAModuleOfADroppedBranchIsNotPublished(t *testing.T) {
+	db := testpg.New(t)
+	ctx := context.Background()
+	src := newSpecSource(db.Block(0))
+	src.shape.Modules = 2
+	syncer := ingest.NewSyncer(src, db.Writer, ingest.SyncConfig{}, nil)
+	if r := syncer.Cycle(ctx); r.Err != nil {
+		t.Fatalf("cold sync: %v", r.Err)
+	}
+
+	// Module 3 appears and is written; module 1 changes and fails.
+	src.shape.Modules = 3
+	src.reversed = true
+	src.salts[1] = 1
+	src.failKeys[1] = 1
+	if r := syncer.Cycle(ctx); r.Err == nil {
+		t.Fatal("the attempt should fail on module 1")
+	}
+	var written int
+	if err := db.Writer.Pool().QueryRow(ctx, `select count(*) from key_version where module_id = 3`).Scan(&written); err != nil || written == 0 {
+		t.Fatalf("the attempt wrote %d keys of module 3 (err %v); the test needs some", written, err)
+	}
+
+	// The branch that registered module 3 is dropped; module 1 changes again on the other one.
+	src.fork(src.block)
+	src.shape.Modules = 2
+	src.salts[1] = 2
+	if r := syncer.Cycle(ctx); r.Err != nil || !r.Rebuilt {
+		t.Fatalf("rebuild of module 1: rebuilt %t, err %v", r.Rebuilt, r.Err)
+	}
+
+	var open int
+	if err := db.Writer.Pool().QueryRow(ctx, `select
+		(select count(*) from module_version where module_id = 3 and to_block is null) +
+		(select count(*) from key_version where module_id = 3 and to_block is null)`).Scan(&open); err != nil {
+		t.Fatal(err)
+	}
+	if open != 0 {
+		t.Errorf("%d rows of module 3 are open in the published version", open)
+	}
+}
+
 type specSource struct {
 	mu       sync.Mutex
 	shape    testreg.Spec
@@ -88,6 +169,8 @@ type specSource struct {
 	forked   map[int64]bool
 	failKeys map[int]int
 	keyReads map[int]int
+	// reversed lists modules from the highest id, so a failure on module 1 comes after the others.
+	reversed bool
 }
 
 func newSpecSource(block int64) *specSource {
@@ -130,6 +213,9 @@ func (s *specSource) Modules(context.Context, source.Ref) ([]model.StakingModule
 	out := make([]model.StakingModule, 0, s.shape.Modules)
 	for _, id := range s.shape.ModuleIDs() {
 		out = append(out, s.spec(id).Module(id))
+	}
+	if s.reversed {
+		slices.Reverse(out)
 	}
 	return out, nil
 }

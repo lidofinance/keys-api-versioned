@@ -15,8 +15,8 @@ type Store interface {
 	// Latest returns the newest published or stale version, nil when the store is empty.
 	Latest(ctx context.Context) (*StoredVersion, error)
 
-	// Recent returns versions newest first, including superseded ones.
-	Recent(ctx context.Context, limit int) ([]StoredVersion, error)
+	// Recent returns published and stale versions below block, newest first.
+	Recent(ctx context.Context, below int64, limit int) ([]StoredVersion, error)
 
 	// Begin opens a version invisible to readers until Publish. Rows left open by the previous
 	// version stay open, so a scoped rebuild inherits every other module for free.
