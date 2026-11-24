@@ -126,19 +126,19 @@ type Watcher struct {
 	mtime    int64
 	found    bool
 
-	// OnChange returning an error means nothing was applied; the previous values stay in force.
+	// OnChange returning an error is reported; the generation is not offered again.
 	OnChange func(values map[string]string) error
 	OnError  func(err error)
 }
 
-// NewWatcher starts from the current mtime, so the first poll does not re-apply startup values.
+// NewWatcher offers the file as it is now on the first poll: a rotation between the startup load and
+// the watcher's start would otherwise become its baseline unapplied. OnChange compares with what is
+// in force, so values startup already applied cost nothing.
 func NewWatcher(path string, interval time.Duration, onChange func(map[string]string) error, onError func(error)) *Watcher {
 	if interval <= 0 {
 		interval = DefaultPollInterval
 	}
-	w := &Watcher{path: path, interval: interval, OnChange: onChange, OnError: onError}
-	w.mtime, w.found = mtimeOf(path)
-	return w
+	return &Watcher{path: path, interval: interval, OnChange: onChange, OnError: onError}
 }
 
 func mtimeOf(path string) (int64, bool) {

@@ -123,3 +123,34 @@ func TestPoolAggregationAndInFlightAreExported(t *testing.T) {
 		}
 	}
 }
+
+// The age is taken at scrape: cycles that fail or stop leave no sample to go stale.
+func TestTheConfirmedAgeClimbsWhileNothingConfirms(t *testing.T) {
+	m := New("keys_api")
+	clock := time.Unix(10_000, 0)
+	m.now = func() time.Time { return clock }
+
+	if !strings.Contains(scrape(t, m), "keys_api_confirmed_age_seconds 0\n") {
+		t.Error("the age is not 0 before this process writes")
+	}
+	m.StartConfirming()
+	clock = clock.Add(30 * time.Second)
+	if !strings.Contains(scrape(t, m), "keys_api_confirmed_age_seconds 30\n") {
+		t.Error("a writer that never confirms does not age")
+	}
+
+	m.Confirmed(clock.Unix() - 5)
+	clock = clock.Add(1200 * time.Second)
+	if !strings.Contains(scrape(t, m), "keys_api_confirmed_age_seconds 1205\n") {
+		t.Errorf("twenty minutes without a confirmation:\n%s", grepLine(scrape(t, m), "confirmed_age"))
+	}
+}
+
+func grepLine(body, what string) string {
+	for _, line := range strings.Split(body, "\n") {
+		if strings.Contains(line, what) && !strings.HasPrefix(line, "#") {
+			return line
+		}
+	}
+	return ""
+}

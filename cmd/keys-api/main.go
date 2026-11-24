@@ -185,6 +185,7 @@ func run(log *slog.Logger, masker *logmask.Masker) error {
 			syncer := ingest.NewSyncer(provider, pgStore, cfg, log)
 			syncer.OnCycle = func(r ingest.CycleResult) { observeCycle(m, r) }
 			syncer.OnModule = func(r ingest.ModuleResult) { observeModule(m, r) }
+			m.StartConfirming()
 			return syncer
 		}
 	}
@@ -265,21 +266,30 @@ func run(log *slog.Logger, masker *logmask.Masker) error {
 		log.Info("shutting down")
 	case err := <-errs:
 		if err != nil && !errors.Is(err, context.Canceled) {
-			stop()
-			return err
+			exitErr = err
 		}
 	case exitErr = <-restart:
 		log.Warn("shutting down for a restart", "reason", exitErr)
 	}
 
+	stop()
 	if server != nil {
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		defer cancel()
-		if err := server.Shutdown(shutdownCtx); err != nil {
-			log.Warn("http shutdown", "err", err)
-		}
+		shutdownHTTP(server, httpDrainTimeout, log)
 	}
 	return exitErr
+}
+
+const httpDrainTimeout = 30 * time.Second
+
+// shutdownHTTP closes what is still open after the drain: a dump can run for minutes, and its pooled
+// connection would hold the pool's close, and the exit, until it ends.
+func shutdownHTTP(server *http.Server, drain time.Duration, log *slog.Logger) {
+	ctx, cancel := context.WithTimeout(context.Background(), drain)
+	defer cancel()
+	if err := server.Shutdown(ctx); err != nil {
+		log.Warn("http shutdown: closing the connections still open", "err", err)
+		server.Close()
+	}
 }
 
 // verifyChain refuses an endpoint on another chain, and waits with backoff while none answers
@@ -374,7 +384,8 @@ func addSecrets(masker *logmask.Masker, fileValues map[string]string) {
 
 // applyRotatedSecrets compares with the environment, which the file was loaded into at boot.
 // PROVIDERS_URLS applies live once it validates (the client copies endpoints per request);
-// DATABASE_URL asks for a restart, since the pool holds connections made with the old one.
+// DATABASE_URL asks for a restart, since the pool holds connections made with the old one. Each key
+// is applied or refused on its own: a broken database value must not keep a working endpoint out.
 func applyRotatedSecrets(
 	values map[string]string,
 	setEndpoints func(string) error,
@@ -382,21 +393,26 @@ func applyRotatedSecrets(
 	log *slog.Logger,
 	m *metrics.Metrics,
 ) error {
-	if value, ok := values["DATABASE_URL"]; ok && value != os.Getenv("DATABASE_URL") {
-		// The restart reads the file at boot: a value boot would reject stops every replica at once.
-		for key, value := range values {
-			if err := checkSecret(key, value); err != nil {
-				return fmt.Errorf("%s: %w; not restarting for the new DATABASE_URL", key, err)
-			}
-		}
-		m.SecretsReloads.WithLabelValues("restart_required").Inc()
-		select {
-		case restart <- errors.New("DATABASE_URL changed in the secrets file; exiting so the orchestrator restarts with it"):
-		default:
-		}
-		return nil
-	}
+	endpointsErr := applyRotatedEndpoints(values, setEndpoints, log, m)
 
+	if value, ok := values["DATABASE_URL"]; !ok || value == os.Getenv("DATABASE_URL") {
+		return endpointsErr
+	}
+	// The restart reads the file at boot: a value boot would reject stops every replica at once.
+	for key, value := range values {
+		if err := checkSecret(key, value); err != nil {
+			return errors.Join(endpointsErr, fmt.Errorf("%s: %w; not restarting for the new DATABASE_URL", key, err))
+		}
+	}
+	m.SecretsReloads.WithLabelValues("restart_required").Inc()
+	select {
+	case restart <- errors.New("DATABASE_URL changed in the secrets file; exiting so the orchestrator restarts with it"):
+	default:
+	}
+	return endpointsErr
+}
+
+func applyRotatedEndpoints(values map[string]string, setEndpoints func(string) error, log *slog.Logger, m *metrics.Metrics) error {
 	value, ok := values["PROVIDERS_URLS"]
 	if !ok || value == os.Getenv("PROVIDERS_URLS") || setEndpoints == nil {
 		return nil
@@ -581,7 +597,7 @@ func observeCycle(m *metrics.Metrics, r ingest.CycleResult) {
 		m.VersionAge.Set(float64(time.Now().Unix() - r.VersionTimestamp))
 	}
 	if r.Err == nil && r.HeadTimestamp > 0 {
-		m.ConfirmedAge.Set(float64(time.Now().Unix() - r.HeadTimestamp))
+		m.Confirmed(r.HeadTimestamp)
 	}
 	if r.Rebuilt {
 		m.RebuildsTotal.Inc()

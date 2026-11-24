@@ -143,6 +143,26 @@ func TestARotationBootWouldRejectDoesNotRestart(t *testing.T) {
 	}
 }
 
+// A DSN that cannot restart the replicas does not keep a working endpoint list out.
+func TestABrokenDatabaseURLDoesNotHoldBackARotatedEndpointList(t *testing.T) {
+	t.Setenv("DATABASE_URL", "postgres://u:old@db/keys")
+	t.Setenv("PROVIDERS_URLS", "http://old:8545")
+
+	var applied string
+	set := func(urls string) error { applied = urls; return nil }
+	restart := make(chan error, 1)
+	err := applyRotatedSecrets(map[string]string{
+		"DATABASE_URL":   "<no value>",
+		"PROVIDERS_URLS": "http://new:8545",
+	}, set, restart, discard(), metrics.New("keys_api"))
+	if err == nil || len(restart) != 0 {
+		t.Errorf("err %v, restart requested %t; want the DSN reported and no restart", err, len(restart) != 0)
+	}
+	if applied != "http://new:8545" {
+		t.Errorf("endpoints set to %q, want the rotated list", applied)
+	}
+}
+
 // At boot a rejected file value leaves the environment's own value in force.
 func TestBootKeepsTheEnvironmentForARejectedFileValue(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config")
