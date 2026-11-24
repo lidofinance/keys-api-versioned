@@ -120,6 +120,11 @@ func (a *App) DiffKeys(ctx context.Context, since, to string, moduleRef string, 
 	}
 	meta.Added = added
 
+	// A rollback committed after the additions side's check reads the survivor's additions under the
+	// destination's label. Not on ctx, as in Snapshot.
+	if err := snap.stillOnChain(context.WithoutCancel(ctx)); err != nil {
+		return meta, err
+	}
 	return meta, nil
 }
 

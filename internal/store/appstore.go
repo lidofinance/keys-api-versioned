@@ -324,9 +324,12 @@ func (s *appSnapshot) ELMeta(context.Context) (*model.ELBlockSnapshot, error) {
 // stillOnChain: a dump is one query per module, so a reorg rollback between them would leave
 // the rest empty and a complete-looking answer. One single-row select per module.
 func (s *appSnapshot) stillOnChain(ctx context.Context) error {
-	var status string
+	var (
+		status, hash string
+		block        int64
+	)
 	err := s.conn.QueryRow(ctx,
-		`select status, block_hash from versions where id = $1`, s.versionID).Scan(&status, &s.versionHash)
+		`select status, block_number, block_hash from versions where id = $1`, s.versionID).Scan(&status, &block, &hash)
 	if errors.Is(err, pgx.ErrNoRows) {
 		// The lease should have stopped retention; whatever dropped it, the pin is gone.
 		return ErrPruned{Ref: strconv.FormatInt(s.block, 10)}
@@ -334,6 +337,11 @@ func (s *appSnapshot) stillOnChain(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("re-check version %d: %w", s.block, err)
 	}
+	// Ids start over when a schema change recreates the store: the id may now name another version.
+	if block != s.block || status == StatusBuilding || (s.versionHash != "" && !strings.EqualFold(hash, s.versionHash)) {
+		return ErrPruned{Ref: strconv.FormatInt(s.block, 10)}
+	}
+	s.versionHash = hash
 	if status != StatusSuperseded {
 		return nil
 	}

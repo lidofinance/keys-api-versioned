@@ -112,6 +112,55 @@ func TestARollbackAfterTheLastReadFailsTheResponse(t *testing.T) {
 	}
 }
 
+// A schema change recreates the store and ids start over: the id a dump resolved now names a build at
+// another block, which must not pass the re-check.
+func TestAVersionIdTakenByAnotherVersionFailsTheResponse(t *testing.T) {
+	db := testpg.New(t)
+	ctx := context.Background()
+	spec := testreg.Spec{Modules: 2, OperatorsPerModule: 1, KeysPerOperator: 4}
+	spec.Publish(ctx, t, db.Writer, testreg.At(db.Block(0)))
+
+	err := db.Reader(t, "latest", 2).Snapshot(ctx, func(snap store.Snapshot) error {
+		if _, err := snap.KeysByPubkeys(ctx, testreg.ModuleAddress(1), []string{model.EncodeHex(testreg.Pubkey(1, 0, 0, 0))}); err != nil {
+			return err
+		}
+		_, err := db.Writer.Pool().Exec(ctx, `update versions
+			set block_number = block_number + 10, block_hash = $1, status = 'building'`,
+			fmt.Sprintf("0xc%063x", db.Block(10)))
+		return err
+	})
+	var pruned store.ErrPruned
+	if !errors.As(err, &pruned) {
+		t.Fatalf("snapshot returned %v, want ErrPruned", err)
+	}
+}
+
+// The same for a key diff: removals already read from the destination, additions from its survivor.
+func TestARollbackDuringTheAdditionsFailsTheDiff(t *testing.T) {
+	db := testpg.New(t)
+	ctx := context.Background()
+	spec := testreg.Spec{Modules: 2, OperatorsPerModule: 1, KeysPerOperator: 4}
+	from := testreg.At(db.Block(0))
+	spec.Publish(ctx, t, db.Writer, from)
+	at := testreg.At(db.Block(1))
+	spec.WithSalt(1).Publish(ctx, t, db.Writer, at)
+
+	rolled := false
+	_, err := db.Reader(t, "latest", 2).DiffKeys(ctx, from.BlockHash, "", "",
+		func(kind store.DiffKind, _ *model.Key) error {
+			if kind != store.DiffAdded || rolled {
+				return nil
+			}
+			rolled = true
+			_, err := db.Writer.SupersedeFrom(ctx, at.BlockNumber)
+			return err
+		})
+	var superseded store.ErrSuperseded
+	if !rolled || !errors.As(err, &superseded) {
+		t.Fatalf("diff returned %v (rolled back: %v), want ErrSuperseded", err, rolled)
+	}
+}
+
 // A client that hangs up after the last byte cancels the request mid re-check: the response failed
 // and pgx dropped the pooled connection.
 func TestAClientGoneAfterTheLastReadDoesNotFailTheResponse(t *testing.T) {
