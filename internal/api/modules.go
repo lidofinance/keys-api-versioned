@@ -49,7 +49,7 @@ func (s *Server) handleModules(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
-	writeBody(w, body)
+	s.writeBody(w, body)
 }
 
 func (s *Server) handleModule(w http.ResponseWriter, r *http.Request) {
@@ -92,7 +92,7 @@ func (s *Server) handleModule(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
-	writeBody(w, body)
+	s.writeBody(w, body)
 }
 
 func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
@@ -119,5 +119,5 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
-	writeBody(w, body)
+	s.writeBody(w, body)
 }

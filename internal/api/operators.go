@@ -107,7 +107,7 @@ func (s *Server) handleOperators(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
-	writeBody(w, body)
+	s.writeBody(w, body)
 }
 
 func (s *Server) handleModuleOperators(w http.ResponseWriter, r *http.Request) {
@@ -162,7 +162,7 @@ func (s *Server) handleModuleOperators(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
-	writeBody(w, body)
+	s.writeBody(w, body)
 }
 
 func (s *Server) handleModuleOperator(w http.ResponseWriter, r *http.Request) {
@@ -234,7 +234,7 @@ func (s *Server) handleModuleOperator(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
-	writeBody(w, body)
+	s.writeBody(w, body)
 }
 
 func asNotImplemented(err error) bool {
