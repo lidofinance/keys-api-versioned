@@ -8,6 +8,7 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/lidofinance/keys-api-versioned/internal/ingest"
 	"github.com/lidofinance/keys-api-versioned/internal/model"
@@ -536,5 +537,40 @@ func TestMigrateRefusesAStoreAnotherSourceWrote(t *testing.T) {
 	defer other.Close()
 	if err := other.Migrate(ctx); err == nil || !strings.Contains(err.Error(), "source") {
 		t.Errorf("migrate over another source's versions: got %v, want a refusal naming the source", err)
+	}
+}
+
+// An older release finds a newer store: it stops and drops nothing. A drop costs readers a cold sync,
+// and the newer writer another when it comes back.
+func TestAnOlderWriterLeavesANewerStoreAlone(t *testing.T) {
+	ctx := context.Background()
+	chainID := 900_000_000 + time.Now().UnixNano()%100_000_000
+	s, err := ingest.NewPGStore(ctx, testpg.DSN(t), ingest.PGOptions{Source: "lido-core", ChainID: chainID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		s.Pool().Exec(context.Background(), `drop schema if exists `+s.Schema()+` cascade`)
+		s.Close()
+	})
+	if err := s.Migrate(ctx); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+	if _, err := s.TakeEpoch(ctx); err != nil {
+		t.Fatal(err)
+	}
+	testreg.Spec{Modules: 1, OperatorsPerModule: 1, KeysPerOperator: 1}.Publish(ctx, t, s, testreg.At(1))
+	if _, err := s.Pool().Exec(ctx, `update schema_fingerprint set fingerprint = 'newer', version = $1`,
+		store.SchemaVersion+1); err != nil {
+		t.Fatal(err)
+	}
+
+	var newer ingest.ErrNewerStore
+	if err := s.Migrate(ctx); !errors.As(err, &newer) {
+		t.Fatalf("migrate over a newer store: %v, want ErrNewerStore", err)
+	}
+	var versions int
+	if err := s.Pool().QueryRow(ctx, `select count(*) from versions`).Scan(&versions); err != nil || versions != 1 {
+		t.Errorf("%d versions left (err %v), want the newer store's 1", versions, err)
 	}
 }

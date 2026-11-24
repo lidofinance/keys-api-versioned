@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -15,9 +16,14 @@ import (
 // never collide, and other advisory locks in the database are not read as leases.
 const leaseKey = `hashtext('keys-api lease ' || ` + SchemaKey + `), $1::int4`
 
-// SchemaKey names the schema unqualified tables resolve to, so every spelling of one search_path
-// takes one lock. Before that schema exists it is the raw search_path, which for chain_<id> is the same text.
-const SchemaKey = `coalesce((current_schemas(false))[1], current_setting('search_path'))`
+// SchemaKey names the schema that holds the versions table the session resolves, so every
+// search_path reaching one registry takes one lock; an empty schema ahead of it in the path does not
+// count. Before migration it is the first existing schema, then the raw search_path: for chain_<id>
+// all three are the same text.
+const SchemaKey = `coalesce(
+	(select n.nspname from pg_class c join pg_namespace n on n.oid = c.relnamespace
+	  where c.oid = to_regclass('versions')),
+	(current_schemas(false))[1], current_setting('search_path'))`
 
 // LeaseVersion's lock lives on the caller's connection: release it before the connection
 // returns to the pool.
@@ -29,8 +35,11 @@ func LeaseVersion(ctx context.Context, conn *pgxpool.Conn, block int64) (func(),
 		// Not on ctx: a cancelled request still has to give the lock back.
 		if _, err := conn.Exec(context.WithoutCancel(ctx),
 			`select pg_advisory_unlock_shared(`+leaseKey+`)`, block); err != nil {
-			// The lock goes with the connection anyway; at worst retention waits for that.
-			_ = err
+			// A statement timeout can fail the unlock on a session the pool would reuse, lease and all.
+			// The lock goes with the session, and the pool drops a closed one on release.
+			closeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+			defer cancel()
+			_ = conn.Conn().Close(closeCtx)
 		}
 	}, nil
 }

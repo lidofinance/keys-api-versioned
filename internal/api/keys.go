@@ -398,7 +398,7 @@ func (s *Server) findKeys(w http.ResponseWriter, r *http.Request, pubkeys []stri
 		}
 		return
 	}
-	writeBody(w, body)
+	s.writeBody(w, body)
 }
 
 func (s *Server) handleModuleKeysFind(w http.ResponseWriter, r *http.Request) {
@@ -461,5 +461,5 @@ func (s *Server) handleModuleKeysFind(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
-	writeBody(w, body)
+	s.writeBody(w, body)
 }

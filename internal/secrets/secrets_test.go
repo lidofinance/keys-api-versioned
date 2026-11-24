@@ -83,6 +83,9 @@ func TestWatcherSeesARenameOverThePath(t *testing.T) {
 		return nil
 	}, nil)
 
+	if !w.CheckOnce() || got["PROVIDERS_URLS"] != "http://one:8545" {
+		t.Fatalf("the first poll offers the file as it is, got %v", got)
+	}
 	if w.CheckOnce() {
 		t.Fatal("an unchanged file is not a rotation")
 	}

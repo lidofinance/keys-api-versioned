@@ -19,7 +19,8 @@ import (
 
 // memStore serves one module of generated keys and records how each key stream ended.
 type memStore struct {
-	keys int
+	keys      int
+	operators int
 	// early: no published version yet.
 	early bool
 
@@ -75,8 +76,13 @@ func (memSnapshot) KeysByPubkeys(_ context.Context, _ string, pubkeys []string) 
 	return []model.Key{}, nil
 }
 
-func (memSnapshot) Operators(context.Context, string, model.OperatorsFilter) ([]model.Operator, error) {
-	return nil, nil
+func (s memSnapshot) Operators(context.Context, string, model.OperatorsFilter) ([]model.Operator, error) {
+	out := make([]model.Operator, s.m.operators)
+	for i := range out {
+		out[i] = model.Operator{Index: int32(i), Name: fmt.Sprintf("operator-%d", i), Active: true,
+			RewardAddress: fmt.Sprintf("0x%040x", i), ModuleAddress: memModule.RawAddress()}
+	}
+	return out, nil
 }
 
 func memKey(i int) *model.Key {
@@ -201,5 +207,52 @@ func TestTheFindCountCapIsNotReachableByValidInputUnderTheBodyLimit(t *testing.T
 	element := len(`"0x` + strings.Repeat("ab", 48) + `",`)
 	if most := maxFindBodyBytes / element; most >= maxFindPubkeys {
 		t.Fatalf("%d valid keys fit the body limit, the cap of %d would reject some", most, maxFindPubkeys)
+	}
+}
+
+// A buffered body stays in memory while its client does not read it. Bodies being written share one
+// budget; past it a request answers 503 rather than holding one more.
+func TestBufferedBodiesOfStalledClientsShareABudget(t *testing.T) {
+	st := newMemStore(0)
+	st.operators = 50_000 // ~10 MiB, far above any socket buffer
+	server := httptest.NewServer(New(st, Config{ChainID: 1, MaxBufferedBytes: 1}).Handler())
+	defer server.Close()
+
+	stalled, err := net.Dial("tcp", server.Listener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	fmt.Fprintf(stalled, "GET /v1/operators HTTP/1.1\r\nHost: x\r\n\r\n")
+	if _, err := http.ReadResponse(bufio.NewReader(stalled), nil); err != nil {
+		t.Fatalf("read headers: %v", err)
+	}
+
+	resp, err := http.Get(server.URL + "/v1/operators")
+	if err != nil {
+		t.Fatal(err)
+	}
+	io.Copy(io.Discard, resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusServiceUnavailable || resp.Header.Get("Retry-After") == "" {
+		t.Errorf("with the budget held: status %d, Retry-After %q; want 503 with a retry hint",
+			resp.StatusCode, resp.Header.Get("Retry-After"))
+	}
+
+	stalled.Close()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		resp, err := http.Get(server.URL + "/v1/operators")
+		if err != nil {
+			t.Fatal(err)
+		}
+		io.Copy(io.Discard, resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode == http.StatusOK {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("status %d after the stalled client left, want the budget back", resp.StatusCode)
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
 }

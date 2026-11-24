@@ -126,7 +126,9 @@ func (s *PGStore) RunExclusive(ctx context.Context, o WriterLockOptions, fn func
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
-		if fenced := (ErrFenced{}); errors.As(err, &fenced) || errors.Is(err, ErrTakenOver) {
+		// A newer release's store stays newer: retrying cannot help, and exiting shows in the pod status.
+		if fenced, newer := (ErrFenced{}), (ErrNewerStore{}); errors.As(err, &fenced) || errors.Is(err, ErrTakenOver) ||
+			errors.As(err, &newer) {
 			return err
 		}
 		o.noWait = o.noWait || held

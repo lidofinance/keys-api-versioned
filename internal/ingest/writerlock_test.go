@@ -135,9 +135,28 @@ func TestWritersThatSpellOneSchemaDifferentlyWaitForEachOther(t *testing.T) {
 func TestALeaseUnderAnotherSpellingHoldsRetention(t *testing.T) {
 	testpg.Exclusive(t)
 	db := testpg.New(t)
+	leaseHoldsRetention(t, db, respell(t, db))
+}
+
+// An empty schema ahead of the registry's in the path is the first existing one, not the tables'.
+func TestALeaseBehindAnEmptySchemaHoldsRetention(t *testing.T) {
+	testpg.Exclusive(t)
+	db := testpg.New(t)
 	ctx := context.Background()
 
-	readers, err := pgxpool.New(ctx, respell(t, db))
+	empty := db.Schema + "_aux"
+	if _, err := db.Admin().Exec(ctx, `create schema `+empty); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { db.Admin().Exec(context.Background(), `drop schema `+empty+` cascade`) })
+	leaseHoldsRetention(t, db, strings.Replace(db.DSN, "search_path="+db.Schema,
+		"search_path="+url.QueryEscape(empty+","+db.Schema), 1))
+}
+
+func leaseHoldsRetention(t *testing.T, db *testpg.DB, readerDSN string) {
+	t.Helper()
+	ctx := context.Background()
+	readers, err := pgxpool.New(ctx, readerDSN)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -164,7 +183,7 @@ func TestALeaseUnderAnotherSpellingHoldsRetention(t *testing.T) {
 		t.Fatal(err)
 	}
 	if claimed {
-		t.Error("retention claimed a version a reader of the same schema leases under another spelling")
+		t.Error("retention claimed a version a reader of the same registry leases under another search_path")
 	}
 	if leases := db.Leases(t); !slices.Contains(leases, block) {
 		t.Errorf("leases are %v, want %d among them", leases, block)
@@ -453,5 +472,21 @@ func terminateWriterSessions(t *testing.T, db *testpg.DB, granted bool) {
 		 where locktype = 'advisory' and objsubid = 2 and classid = x'6b617069'::int::oid and granted = $1
 		   and database = (select oid from pg_database where datname = current_database())`, granted); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// A newer release's store stays newer, so the writer exits for the pod status to show it.
+func TestANewerStoreStopsTheWriterInsteadOfRetrying(t *testing.T) {
+	db := testpg.New(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	calls := 0
+	err := db.Writer.RunExclusive(ctx, ingest.WriterLockOptions{RetryDelay: time.Millisecond}, func(context.Context) error {
+		calls++
+		return ingest.ErrNewerStore{Stored: 2, Own: 1}
+	})
+	var newer ingest.ErrNewerStore
+	if !errors.As(err, &newer) || calls != 1 {
+		t.Errorf("RunExclusive returned %v after %d runs, want ErrNewerStore after one", err, calls)
 	}
 }

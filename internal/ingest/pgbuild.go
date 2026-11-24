@@ -24,7 +24,11 @@ type pgBuild struct {
 	// anyChanged decides the version-level lastChangedBlockHash.
 	anyChanged bool
 	nonces     map[string]int64
+	// audited is the newest full read's block; 0 records the version's own.
+	audited int64
 }
+
+func (b *pgBuild) SetAuditedBlock(block int64) { b.audited = block }
 
 func (b *pgBuild) Block() int64      { return b.at.BlockNumber }
 func (b *pgBuild) BlockHash() string { return b.hash }
@@ -522,11 +526,21 @@ func (b *pgBuild) Publish(ctx context.Context, label string, finalized int64) er
 		return fmt.Errorf("clear staleness on the previous head: %w", err)
 	}
 
+	audited := b.audited
+	if audited == 0 {
+		audited = b.at.BlockNumber
+	}
 	if _, err := tx.Exec(ctx, `update versions
 		   set status = 'published', label = $2, last_changed_block_hash = $3, module_nonces = $4,
-		       finalized_block_number = $5
-		 where id = $1`, b.id, label, lastChanged, nonces, finalized); err != nil {
+		       finalized_block_number = $5, audited_block = $6
+		 where id = $1`, b.id, label, lastChanged, nonces, finalized, audited); err != nil {
 		return fmt.Errorf("publish version: %w", err)
+	}
+	// A full read lifts the hold in the transaction that serves it.
+	if b.audited == b.at.BlockNumber {
+		if _, err := tx.Exec(ctx, `delete from serving_hold`); err != nil {
+			return fmt.Errorf("lift the serving hold: %w", err)
+		}
 	}
 
 	return tx.Commit(ctx)

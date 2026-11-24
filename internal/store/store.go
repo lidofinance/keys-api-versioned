@@ -9,6 +9,10 @@ import (
 	"github.com/lidofinance/keys-api-versioned/internal/model"
 )
 
+// SchemaVersion numbers the layout in ingest/schema.sql and only grows. A writer that finds a larger
+// one in the store is an older release and leaves it alone; a test pins it to the file.
+const SchemaVersion = 1
+
 // A version is invisible while written and becomes current by a status change, not by the
 // arrival of its rows.
 const (

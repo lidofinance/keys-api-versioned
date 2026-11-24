@@ -39,6 +39,9 @@
 create table if not exists schema_fingerprint (
     id          smallint    primary key default 1 check (id = 1),
     fingerprint text        not null,
+    -- store.SchemaVersion of the release that built it: a fingerprint says the layout differs, this
+    -- says which side is older, so an older writer refuses instead of dropping a newer store.
+    version     integer     not null,
     applied_at  timestamptz not null default now()
 );
 
@@ -93,6 +96,10 @@ create table if not exists versions (
     -- read per cycle compares them against head to decide whether the version is
     -- still current; nothing else is read to make that decision.
     module_nonces           jsonb       not null default '{}'::jsonb,
+    -- The newest block at which every key was read from the chain, carried from version to
+    -- version. The audit counts from it; in memory, a restart started the count over. Set at
+    -- publish.
+    audited_block           bigint      not null default 0,
     -- Which source produced it, so a store fed by more than one stays legible.
     source                  text        not null default '',
     created_at              timestamptz not null default now(),
@@ -101,6 +108,13 @@ create table if not exists versions (
 
 create index if not exists versions_status_id on versions (status, id desc);
 create index if not exists versions_block on versions (block_number desc);
+
+-- A row here makes `latest` and `finalized` answer 425: the writer came up with the full read
+-- overdue, so the newest version may be far behind the chain. The full read's publish deletes it.
+create table if not exists serving_hold (
+    id    smallint    primary key default 1 check (id = 1),
+    since timestamptz not null default now()
+);
 
 create table if not exists module_version (
     row_id                      bigserial primary key,

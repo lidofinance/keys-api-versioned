@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -27,6 +28,8 @@ type App struct {
 	Log  *slog.Logger
 	// AcquireTimeout: zero means acquireTimeout.
 	AcquireTimeout time.Duration
+	// notServingLogged: when a 425's cause was last logged; shared with pinned copies.
+	notServingLogged *atomic.Int64
 }
 
 func (a *App) logger() *slog.Logger {
@@ -53,11 +56,11 @@ func NewApp(ctx context.Context, dsn string, maxConns int32, pin string) (*App, 
 		pool.Close()
 		return nil, fmt.Errorf("ping: %w", err)
 	}
-	return &App{pool: pool, pin: defaultPin(pin)}, nil
+	return &App{pool: pool, pin: defaultPin(pin), notServingLogged: new(atomic.Int64)}, nil
 }
 
 func NewAppWithPool(pool *pgxpool.Pool, pin string) *App {
-	return &App{pool: pool, pin: defaultPin(pin)}
+	return &App{pool: pool, pin: defaultPin(pin), notServingLogged: new(atomic.Int64)}
 }
 
 func defaultPin(pin string) string {
@@ -107,6 +110,9 @@ func (a *App) Snapshot(ctx context.Context, fn func(Snapshot) error) error {
 		}
 		defer release()
 	}
+	if meta == nil {
+		a.logNotServing(ctx, conn)
+	}
 	snap := &appSnapshot{conn: conn, meta: meta, versionID: versionID, block: block,
 		stale: status == StatusStale, log: a.logger()}
 	if meta != nil {
@@ -131,7 +137,8 @@ func (a *App) Snapshot(ctx context.Context, fn func(Snapshot) error) error {
 }
 
 func (a *App) PinnedSnapshot(ctx context.Context, pin string, fn func(Snapshot) error) error {
-	return (&App{pool: a.pool, pin: defaultPin(pin), Log: a.Log, AcquireTimeout: a.AcquireTimeout}).Snapshot(ctx, fn)
+	return (&App{pool: a.pool, pin: defaultPin(pin), Log: a.Log, AcquireTimeout: a.AcquireTimeout,
+		notServingLogged: a.notServingLogged}).Snapshot(ctx, fn)
 }
 
 // Pins resolve on block_number (the version's identity); the meta shows the observed head, which
@@ -140,6 +147,97 @@ const appVersionCols = `id, block_number, coalesce(nullif(head_block_number, 0),
 	coalesce(nullif(head_block_hash, ''), block_hash),
 	coalesce(nullif(head_timestamp, 0), timestamp),
 	last_changed_block_hash, status`
+
+// notHeld: while the writer holds serving for an overdue full read, `latest` and `finalized` resolve to
+// nothing, as before the first publish. A pin by number or hash names its block and stays served.
+const notHeld = `not exists (select 1 from serving_hold)`
+
+// Withheld reports a serving hold: a version exists, so the pod is ready and answers 425 itself.
+func (a *App) Withheld(ctx context.Context) (bool, error) {
+	var held bool
+	err := a.pool.QueryRow(ctx, `select exists (select 1 from serving_hold)`).Scan(&held)
+	if missingSchema(err) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("serving hold: %w", err)
+	}
+	return held, nil
+}
+
+// NotServingReason says why `latest` resolves to nothing, for a log line or a readiness body that a
+// third-party operator can act on. Empty when something is served.
+func (a *App) NotServingReason(ctx context.Context) (string, error) {
+	conn, err := a.acquire(ctx)
+	if err != nil {
+		return "", err
+	}
+	defer conn.Release()
+	return notServingReason(ctx, conn)
+}
+
+func notServingReason(ctx context.Context, conn pinReader) (string, error) {
+	var hasVersions, hasMeta, hasHold bool
+	if err := conn.QueryRow(ctx, `select to_regclass('versions') is not null,
+		to_regclass('schema_fingerprint') is not null, to_regclass('serving_hold') is not null`).
+		Scan(&hasVersions, &hasMeta, &hasHold); err != nil {
+		return "", fmt.Errorf("not serving: %w", err)
+	}
+	if !hasVersions {
+		return "no store in this schema: the writer has not created it; check that it runs with the same DATABASE_URL and CHAIN_ID", nil
+	}
+	version := 0
+	if hasMeta {
+		// to_jsonb: a store from before the version column has none, which reads as 0.
+		if err := conn.QueryRow(ctx, `select coalesce((to_jsonb(f)->>'version')::int, 0)
+			from schema_fingerprint f where id = 1`).Scan(&version); err != nil && !errors.Is(err, pgx.ErrNoRows) {
+			return "", fmt.Errorf("not serving: %w", err)
+		}
+	}
+	switch {
+	case version < SchemaVersion:
+		return fmt.Sprintf("the store has schema version %d and this server needs %d: the writer runs an older release", version, SchemaVersion), nil
+	case version > SchemaVersion:
+		return fmt.Sprintf("the store has schema version %d and this server knows %d: this server runs an older release than the writer", version, SchemaVersion), nil
+	}
+	if hasHold {
+		var since time.Time
+		err := conn.QueryRow(ctx, `select since from serving_hold`).Scan(&since)
+		if err == nil {
+			return fmt.Sprintf("held since %s: the writer came up with its full re-read overdue and serves again when that publishes", since.UTC().Format(time.RFC3339)), nil
+		}
+		if !errors.Is(err, pgx.ErrNoRows) {
+			return "", fmt.Errorf("not serving: %w", err)
+		}
+	}
+	var published bool
+	if err := conn.QueryRow(ctx, `select exists (select 1 from versions
+		where status in ('`+StatusPublished+`', '`+StatusStale+`'))`).Scan(&published); err != nil {
+		return "", fmt.Errorf("not serving: %w", err)
+	}
+	if !published {
+		return "no published version yet: the writer's first sync has not finished", nil
+	}
+	return "", nil
+}
+
+const notServingLogEvery = time.Minute
+
+// logNotServing names the cause of a 425 at most once a minute; the queries run only then.
+func (a *App) logNotServing(ctx context.Context, conn pinReader) {
+	if a.notServingLogged != nil {
+		now := time.Now().UnixNano()
+		last := a.notServingLogged.Load()
+		if now-last < int64(notServingLogEvery) || !a.notServingLogged.CompareAndSwap(last, now) {
+			return
+		}
+	}
+	reason, err := notServingReason(ctx, conn)
+	if err != nil || reason == "" {
+		return
+	}
+	a.logger().Warn("answering 425: "+reason, "pin", a.pin)
+}
 
 // resolveAppPin reports the status too, so the API can flag a known-stale read.
 func resolveAppPin(ctx context.Context, conn pinReader, pin string) (*model.ELBlockSnapshot, int64, int64, string, error) {
@@ -150,13 +248,13 @@ func resolveAppPin(ctx context.Context, conn pinReader, pin string) (*model.ELBl
 	switch {
 	case pin == "latest":
 		q = `select ` + appVersionCols + ` from versions
-		     where status in ('` + StatusPublished + `', '` + StatusStale + `')
+		     where status in ('` + StatusPublished + `', '` + StatusStale + `') and ` + notHeld + `
 		     order by id desc limit 1`
 	case pin == "finalized":
 		// By predicate, not a label a writer must move (the old `safe` label was never set and answered
 		// 425 forever). Never answers 409; the finalized block comes from versions, not a node.
 		q = `select ` + appVersionCols + ` from versions
-		     where status in ('` + StatusPublished + `', '` + StatusStale + `')
+		     where status in ('` + StatusPublished + `', '` + StatusStale + `') and ` + notHeld + `
 		       and block_number <= (select max(finalized_block_number) from versions)
 		     order by id desc limit 1`
 	case strings.HasPrefix(pin, "0x"):
@@ -324,9 +422,12 @@ func (s *appSnapshot) ELMeta(context.Context) (*model.ELBlockSnapshot, error) {
 // stillOnChain: a dump is one query per module, so a reorg rollback between them would leave
 // the rest empty and a complete-looking answer. One single-row select per module.
 func (s *appSnapshot) stillOnChain(ctx context.Context) error {
-	var status string
+	var (
+		status, hash string
+		block        int64
+	)
 	err := s.conn.QueryRow(ctx,
-		`select status, block_hash from versions where id = $1`, s.versionID).Scan(&status, &s.versionHash)
+		`select status, block_number, block_hash from versions where id = $1`, s.versionID).Scan(&status, &block, &hash)
 	if errors.Is(err, pgx.ErrNoRows) {
 		// The lease should have stopped retention; whatever dropped it, the pin is gone.
 		return ErrPruned{Ref: strconv.FormatInt(s.block, 10)}
@@ -334,6 +435,11 @@ func (s *appSnapshot) stillOnChain(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("re-check version %d: %w", s.block, err)
 	}
+	// Ids start over when a schema change recreates the store: the id may now name another version.
+	if block != s.block || status == StatusBuilding || (s.versionHash != "" && !strings.EqualFold(hash, s.versionHash)) {
+		return ErrPruned{Ref: strconv.FormatInt(s.block, 10)}
+	}
+	s.versionHash = hash
 	if status != StatusSuperseded {
 		return nil
 	}

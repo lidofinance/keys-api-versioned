@@ -9,7 +9,9 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/lidofinance/keys-api-versioned/internal/store"
@@ -34,12 +36,17 @@ type Config struct {
 	StreamWait time.Duration
 	// StreamMaxDuration: zero means streamMaxDuration.
 	StreamMaxDuration time.Duration
+	// MaxBufferedBytes caps the bodies of buffered responses being written at once; zero means
+	// maxBufferedBytes.
+	MaxBufferedBytes int64
 }
 
 type Server struct {
 	store   store.Store
 	cfg     Config
 	streams chan struct{}
+	// buffered: bytes of buffered bodies being written now.
+	buffered atomic.Int64
 }
 
 func New(s store.Store, cfg Config) *Server {
@@ -54,6 +61,9 @@ func New(s store.Store, cfg Config) *Server {
 	}
 	if cfg.StreamMaxDuration <= 0 {
 		cfg.StreamMaxDuration = streamMaxDuration
+	}
+	if cfg.MaxBufferedBytes <= 0 {
+		cfg.MaxBufferedBytes = maxBufferedBytes
 	}
 	srv := &Server{store: s, cfg: cfg}
 	if cfg.MaxStreams > 0 {
@@ -197,8 +207,24 @@ func (s *Server) handleReady(w http.ResponseWriter, r *http.Request) {
 		ready = elMeta != nil
 		return nil
 	})
+	if err == nil && !ready {
+		// Held for an overdue full read: requests get 425 from here rather than no endpoint at all.
+		if held, ok := s.store.(interface {
+			Withheld(context.Context) (bool, error)
+		}); ok {
+			ready, err = held.Withheld(ctx)
+		}
+	}
 	if err != nil || !ready {
-		writeError(w, http.StatusServiceUnavailable, "no published version yet")
+		reason := "no published version yet"
+		if explains, ok := s.store.(interface {
+			NotServingReason(context.Context) (string, error)
+		}); ok && err == nil {
+			if why, whyErr := explains.NotServingReason(ctx); whyErr == nil && why != "" {
+				reason = why
+			}
+		}
+		writeError(w, http.StatusServiceUnavailable, reason)
 		return
 	}
 	w.WriteHeader(http.StatusOK)
@@ -226,14 +252,38 @@ func deferJSON(body *[]byte, v any) error {
 	return nil
 }
 
+// maxBufferedBytes: the operator list is ~220 KB on mainnet, so this is ~300 clients that stopped
+// reading; their bodies stay in memory until the write deadline.
+const maxBufferedBytes = 64 << 20
+
 // writeBody writes nothing for a nil body: the snapshot already answered (425, 404).
-func writeBody(w http.ResponseWriter, body []byte) {
+func (s *Server) writeBody(w http.ResponseWriter, body []byte) {
 	if body == nil {
 		return
 	}
+	n := int64(len(body))
+	if !s.takeBuffered(n) {
+		w.Header().Set("Retry-After", strconv.Itoa(int(streamRetryAfter/time.Second)))
+		writeStatusMessage(w, http.StatusServiceUnavailable, "Too many responses waiting for their clients, retry later")
+		return
+	}
+	defer s.buffered.Add(-n)
 	w.Header().Set("Content-Type", "application/json")
-	extendWriteDeadline(w, streamWriteTimeout)
+	extendWriteDeadline(w, s.cfg.StreamWriteTimeout)
 	w.Write(body)
+}
+
+// takeBuffered lets one body through on an empty budget, however large.
+func (s *Server) takeBuffered(n int64) bool {
+	for {
+		used := s.buffered.Load()
+		if used > 0 && used+n > s.cfg.MaxBufferedBytes {
+			return false
+		}
+		if s.buffered.CompareAndSwap(used, used+n) {
+			return true
+		}
+	}
 }
 
 // writeJSON writes no trailing newline (json.Encoder adds one, Fastify does not): byte-identical

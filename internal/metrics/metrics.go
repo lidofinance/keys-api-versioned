@@ -5,6 +5,7 @@ package metrics
 import (
 	"net/http"
 	"strconv"
+	"sync/atomic"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -21,9 +22,13 @@ type Metrics struct {
 	KeysRead      prometheus.Counter
 	KeysChanged   prometheus.Counter
 
-	VersionBlock  prometheus.Gauge
-	VersionAge    prometheus.Gauge
-	ConfirmedAge  prometheus.Gauge
+	VersionBlock prometheus.Gauge
+	VersionAge   prometheus.Gauge
+	ConfirmedAge prometheus.GaugeFunc
+	// confirmedAt is the unix time of the block the last good cycle confirmed; the age is taken at
+	// scrape, so it climbs while cycles fail or stop.
+	confirmedAt   atomic.Int64
+	now           func() time.Time
 	HeadBlock     prometheus.Gauge
 	BlocksBehind  prometheus.Gauge
 	VersionStale  prometheus.Gauge
@@ -82,6 +87,7 @@ func New(namespace string) *Metrics {
 
 	m := &Metrics{
 		registry: reg,
+		now:      time.Now,
 		CyclesTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Namespace: namespace, Name: "sync_cycles_total",
 			Help: "Sync cycles by action (extend, rebuild, supersede) and outcome.",
@@ -111,10 +117,7 @@ func New(namespace string) *Metrics {
 			Namespace: namespace, Name: "published_version_age_seconds",
 			Help: "Seconds since the published version's own block: how old the data is. Climbs while the chain is quiet, so not an alert on its own.",
 		}),
-		ConfirmedAge: prometheus.NewGauge(prometheus.GaugeOpts{
-			Namespace: namespace, Name: "confirmed_age_seconds",
-			Help: "Seconds since a cycle last confirmed the version against the chain. This is the alerting signal: it climbs for a stalled node, a failing rebuild or a dead writer alike.",
-		}),
+
 		HeadBlock: prometheus.NewGauge(prometheus.GaugeOpts{
 			Namespace: namespace, Name: "chain_head_block",
 			Help: "Block number the source reports as head.",
@@ -233,6 +236,17 @@ func New(namespace string) *Metrics {
 			Help: "Amount of keys by sr module and operator id. Refreshed for the modules a rebuild read, not on every cycle.",
 		}, []string{"operator", "srModuleId", "used"}),
 	}
+
+	m.ConfirmedAge = prometheus.NewGaugeFunc(prometheus.GaugeOpts{
+		Namespace: namespace, Name: "confirmed_age_seconds",
+		Help: "Seconds since a cycle last confirmed the version against the chain. This is the alerting signal: it climbs for a stalled node, a failing rebuild or a dead writer alike. 0 until this process writes.",
+	}, func() float64 {
+		at := m.confirmedAt.Load()
+		if at == 0 {
+			return 0
+		}
+		return float64(m.now().Unix() - at)
+	})
 
 	reg.MustRegister(m.CyclesTotal, m.CyclePanics, m.CycleDuration, m.KeysRead, m.KeysChanged,
 		m.VersionBlock, m.VersionAge, m.ConfirmedAge, m.HeadBlock, m.BlocksBehind, m.VersionStale,
@@ -382,6 +396,12 @@ func (m *Metrics) SetBuildCommit(namespace, version, commit string) {
 	m.registry.MustRegister(info)
 	info.WithLabelValues(version, commit).Set(1)
 }
+
+// Confirmed records the timestamp of the block a cycle confirmed the version at.
+func (m *Metrics) Confirmed(blockTimestamp int64) { m.confirmedAt.Store(blockTimestamp) }
+
+// StartConfirming starts the age when a writer starts, so one that never confirms still climbs.
+func (m *Metrics) StartConfirming() { m.confirmedAt.CompareAndSwap(0, m.now().Unix()) }
 
 func (m *Metrics) Handler() http.Handler {
 	return promhttp.HandlerFor(m.registry, promhttp.HandlerOpts{})

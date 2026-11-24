@@ -4,6 +4,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
+	"net/http"
+	"slices"
 	"sync"
 	"testing"
 
@@ -80,6 +83,86 @@ func TestRowsOfAnAttemptOnADroppedBranchAreNotInherited(t *testing.T) {
 	verifyContent(t, db, src.salts)
 }
 
+// Failed attempts leave superseded rows above the published version. They must not use up the reorg
+// search and leave a version of a dropped branch served.
+func TestFailedAttemptsDoNotHideAnOrphanedVersion(t *testing.T) {
+	db := testpg.New(t)
+	ctx := context.Background()
+	src := newSpecSource(db.Block(0))
+	syncer := ingest.NewSyncer(src, db.Writer, ingest.SyncConfig{}, nil)
+	if r := syncer.Cycle(ctx); r.Err != nil {
+		t.Fatalf("cold sync: %v", r.Err)
+	}
+	orphan := src.hash(src.block)
+
+	src.salts[1] = 1
+	src.failKeys[1] = 21
+	for i := 0; i < 21; i++ {
+		if r := syncer.Cycle(ctx); r.Err == nil {
+			t.Fatalf("attempt %d should fail on module 1", i)
+		}
+	}
+	src.fork(src.block - 21)
+	src.salts[1] = 0
+	if r := syncer.Cycle(ctx); r.Err != nil {
+		t.Fatalf("cycle after the reorg: %v", r.Err)
+	}
+
+	var served int
+	if err := db.Writer.Pool().QueryRow(ctx, `select count(*) from versions
+		where block_hash = $1 and status in ('published', 'stale')`, orphan).Scan(&served); err != nil {
+		t.Fatal(err)
+	}
+	if served != 0 {
+		t.Error("the version on the dropped branch is still served")
+	}
+	verifyContent(t, db, src.salts)
+}
+
+// A module registered on a branch that is then dropped, after an attempt wrote its rows, must not be
+// published with the next version.
+func TestAModuleOfADroppedBranchIsNotPublished(t *testing.T) {
+	db := testpg.New(t)
+	ctx := context.Background()
+	src := newSpecSource(db.Block(0))
+	src.shape.Modules = 2
+	syncer := ingest.NewSyncer(src, db.Writer, ingest.SyncConfig{}, nil)
+	if r := syncer.Cycle(ctx); r.Err != nil {
+		t.Fatalf("cold sync: %v", r.Err)
+	}
+
+	// Module 3 appears and is written; module 1 changes and fails.
+	src.shape.Modules = 3
+	src.reversed = true
+	src.salts[1] = 1
+	src.failKeys[1] = 1
+	if r := syncer.Cycle(ctx); r.Err == nil {
+		t.Fatal("the attempt should fail on module 1")
+	}
+	var written int
+	if err := db.Writer.Pool().QueryRow(ctx, `select count(*) from key_version where module_id = 3`).Scan(&written); err != nil || written == 0 {
+		t.Fatalf("the attempt wrote %d keys of module 3 (err %v); the test needs some", written, err)
+	}
+
+	// The branch that registered module 3 is dropped; module 1 changes again on the other one.
+	src.fork(src.block)
+	src.shape.Modules = 2
+	src.salts[1] = 2
+	if r := syncer.Cycle(ctx); r.Err != nil || !r.Rebuilt {
+		t.Fatalf("rebuild of module 1: rebuilt %t, err %v", r.Rebuilt, r.Err)
+	}
+
+	var open int
+	if err := db.Writer.Pool().QueryRow(ctx, `select
+		(select count(*) from module_version where module_id = 3 and to_block is null) +
+		(select count(*) from key_version where module_id = 3 and to_block is null)`).Scan(&open); err != nil {
+		t.Fatal(err)
+	}
+	if open != 0 {
+		t.Errorf("%d rows of module 3 are open in the published version", open)
+	}
+}
+
 type specSource struct {
 	mu       sync.Mutex
 	shape    testreg.Spec
@@ -88,6 +171,8 @@ type specSource struct {
 	forked   map[int64]bool
 	failKeys map[int]int
 	keyReads map[int]int
+	// reversed lists modules from the highest id, so a failure on module 1 comes after the others.
+	reversed bool
 }
 
 func newSpecSource(block int64) *specSource {
@@ -130,6 +215,9 @@ func (s *specSource) Modules(context.Context, source.Ref) ([]model.StakingModule
 	out := make([]model.StakingModule, 0, s.shape.Modules)
 	for _, id := range s.shape.ModuleIDs() {
 		out = append(out, s.spec(id).Module(id))
+	}
+	if s.reversed {
+		slices.Reverse(out)
 	}
 	return out, nil
 }
@@ -227,4 +315,95 @@ func TestARetriedAuditMovesTheRefreshSignal(t *testing.T) {
 	if lastChanged != hash {
 		t.Errorf("version %s reports lastChangedBlockHash %s, want its own hash %s: module 2 changed", block, lastChanged, hash)
 	}
+}
+
+// The audit's count survives a restart: counted from the version instead, restarts more often than
+// the window put the audit off for good.
+func TestRestartsDoNotPutTheAuditOff(t *testing.T) {
+	db := testpg.New(t)
+	ctx := context.Background()
+	src := newSpecSource(db.Block(0))
+	cfg := ingest.SyncConfig{MaxBlockGap: 4}
+	if r := ingest.NewSyncer(src, db.Writer, cfg, nil).Cycle(ctx); r.Err != nil {
+		t.Fatalf("cold sync: %v", r.Err)
+	}
+	for i := 1; i <= 6; i++ {
+		src.salts[2] = uint64(i)
+		r := ingest.NewSyncer(src, db.Writer, cfg, nil).Cycle(ctx)
+		if r.Err != nil {
+			t.Fatalf("restart %d: %v", i, r.Err)
+		}
+		if r.Audit {
+			return
+		}
+	}
+	t.Fatal("no audit across 6 restarts with a gap limit of 4")
+}
+
+// A writer that comes up with the full read overdue may have been down for long: latest answers 425
+// until the full read publishes. The pod stays ready, and a version pinned by number is still served.
+func TestAnOverdueFullReadOnStartWithholdsLatest(t *testing.T) {
+	db := testpg.New(t)
+	ctx := context.Background()
+	src := newSpecSource(db.Block(0))
+	cfg := ingest.SyncConfig{MaxBlockGap: 4}
+	if r := ingest.NewSyncer(src, db.Writer, cfg, nil).Cycle(ctx); r.Err != nil {
+		t.Fatalf("cold sync: %v", r.Err)
+	}
+	version := src.block
+	srv := testpg.NewServer(t, db.Reader(t, "latest", 3))
+
+	src.block += 10
+	src.failKeys[1] = 1
+	restarted := ingest.NewSyncer(src, db.Writer, cfg, nil)
+	if r := restarted.Cycle(ctx); r.Err == nil {
+		t.Fatal("the full read should fail on module 1")
+	}
+	for path, want := range map[string]int{
+		"/v1/keys":      http.StatusTooEarly,
+		"/health/ready": http.StatusOK,
+		fmt.Sprintf("/ext/v1/keys?snapshot=%d&limit=1", version): http.StatusOK,
+	} {
+		if got := statusOf(t, srv, path); got != want {
+			t.Errorf("%s while the full read is pending: status %d, want %d", path, got, want)
+		}
+	}
+
+	if r := restarted.Cycle(ctx); r.Err != nil || !r.Audit {
+		t.Fatalf("the retry: audit %t, err %v", r.Audit, r.Err)
+	}
+	if got := statusOf(t, srv, "/v1/keys"); got != http.StatusOK {
+		t.Errorf("/v1/keys after the full read: status %d, want 200", got)
+	}
+}
+
+// A start with the full read not due lifts a hold a previous writer left.
+func TestAStartWithTheFullReadNotDueLiftsTheHold(t *testing.T) {
+	db := testpg.New(t)
+	ctx := context.Background()
+	src := newSpecSource(db.Block(0))
+	if r := ingest.NewSyncer(src, db.Writer, ingest.SyncConfig{MaxBlockGap: 4}, nil).Cycle(ctx); r.Err != nil {
+		t.Fatalf("cold sync: %v", r.Err)
+	}
+	srv := testpg.NewServer(t, db.Reader(t, "latest", 3))
+
+	src.block += 10
+	src.failKeys[1] = 1
+	if r := ingest.NewSyncer(src, db.Writer, ingest.SyncConfig{MaxBlockGap: 4}, nil).Cycle(ctx); r.Err == nil {
+		t.Fatal("the full read should fail on module 1")
+	}
+	if r := ingest.NewSyncer(src, db.Writer, ingest.SyncConfig{MaxBlockGap: 1000}, nil).Cycle(ctx); r.Err != nil {
+		t.Fatalf("start with a wider window: %v", r.Err)
+	}
+	if got := statusOf(t, srv, "/v1/keys"); got != http.StatusOK {
+		t.Errorf("/v1/keys: status %d, want 200", got)
+	}
+}
+
+func statusOf(t *testing.T, srv *testpg.Server, path string) int {
+	t.Helper()
+	resp := srv.Get(t, path)
+	io.Copy(io.Discard, resp.Body)
+	resp.Body.Close()
+	return resp.StatusCode
 }

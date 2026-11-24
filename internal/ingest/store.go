@@ -15,8 +15,8 @@ type Store interface {
 	// Latest returns the newest published or stale version, nil when the store is empty.
 	Latest(ctx context.Context) (*StoredVersion, error)
 
-	// Recent returns versions newest first, including superseded ones.
-	Recent(ctx context.Context, limit int) ([]StoredVersion, error)
+	// Recent returns published and stale versions below block, newest first.
+	Recent(ctx context.Context, below int64, limit int) ([]StoredVersion, error)
 
 	// Begin opens a version invisible to readers until Publish. Rows left open by the previous
 	// version stay open, so a scoped rebuild inherits every other module for free.
@@ -80,6 +80,18 @@ type PrefixKeeper interface {
 	KeepPrefix(keep map[int32]int32)
 }
 
+// AuditMarker (optional on Build) records the block of the newest full read the version descends
+// from, so the audit's count survives a restart.
+type AuditMarker interface {
+	SetAuditedBlock(block int64)
+}
+
+// ServingHold (optional on Store) makes `latest` and `finalized` answer 425 until a full read
+// publishes; Hold(false) lifts it without one.
+type ServingHold interface {
+	Hold(ctx context.Context, on bool) error
+}
+
 // PublishedModules (optional on Store) returns the module rows a version serves. A writer that just
 // started compares them with what the router reports; without it, the first rebuild sets the baseline.
 type PublishedModules interface {
@@ -129,6 +141,8 @@ type StoredVersion struct {
 	Label                string
 	Status               string
 	ModuleNonces         map[string]int64
+	// AuditedBlock: the newest block every key was read at (0 = not recorded).
+	AuditedBlock int64
 }
 
 func (v StoredVersion) AsVersion() Version {

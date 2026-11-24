@@ -514,10 +514,12 @@ func (s *fakeStore) Close()                        {}
 
 func (s *fakeStore) Latest(context.Context) (*StoredVersion, error) { return s.latest, nil }
 
-func (s *fakeStore) Recent(_ context.Context, limit int) ([]StoredVersion, error) {
+func (s *fakeStore) Recent(_ context.Context, below int64, limit int) ([]StoredVersion, error) {
 	out := make([]StoredVersion, 0, len(s.published))
 	for i := len(s.published) - 1; i >= 0 && len(out) < limit; i-- {
-		out = append(out, s.published[i])
+		if v := s.published[i]; v.BlockNumber < below && (v.Status == "published" || v.Status == "stale") {
+			out = append(out, v)
+		}
 	}
 	return out, nil
 }
@@ -755,6 +757,79 @@ func (f *finalSource) FinalizedBlock(context.Context) (model.ELBlockSnapshot, er
 func (f *finalSource) BlockHashAt(ctx context.Context, block int64) (string, error) {
 	f.probes++
 	return f.fakeSource.BlockHashAt(ctx, block)
+}
+
+// Built at head while finality was unknown, the version is not relabelled with an earlier finalized
+// block: its rows may be newer than that block.
+func TestAFinalizedBlockBelowTheVersionDoesNotConfirmIt(t *testing.T) {
+	src := &finalSource{fakeSource: newFakeSource(2)}
+	store := newFakeStore()
+	s := NewSyncer(src, store, SyncConfig{BuildAtFinalized: true}, nil)
+
+	if r := s.Cycle(context.Background()); r.Err != nil {
+		t.Fatalf("cold start at head: %v", r.Err)
+	}
+	version := store.latest.BlockNumber
+
+	for i := 0; i < 8; i++ {
+		src.advance()
+	}
+	src.final = version - 64
+	r := s.Cycle(context.Background())
+	if r.Err != nil {
+		t.Fatalf("cycle: %v", r.Err)
+	}
+	if store.latest.HeadBlockNumber != version {
+		t.Errorf("the version is confirmed at block %d, below its own %d", store.latest.HeadBlockNumber, version)
+	}
+	if r.HeadTimestamp != 0 {
+		t.Errorf("the cycle reports a confirmation at %d", r.HeadTimestamp)
+	}
+}
+
+// eventSource reports operator events at the blocks the test sets.
+type eventSource struct {
+	*fakeSource
+	events map[int64]bool
+}
+
+func (e *eventSource) OperatorsChanged(_ context.Context, _ model.StakingModule, from, to int64) (bool, error) {
+	for b := from; b <= to; b++ {
+		if e.events[b] {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// An empty scan above the version is undone by a reorg the version survives: an event the new branch
+// carries in those blocks must still be found.
+func TestAReorgAboveTheVersionUndoesAnEmptyScan(t *testing.T) {
+	src := &eventSource{fakeSource: newFakeSource(2), events: map[int64]bool{}}
+	store := newFakeStore()
+	s := NewSyncer(src, store, SyncConfig{}, nil)
+	if r := s.Cycle(context.Background()); r.Err != nil {
+		t.Fatalf("cold start: %v", r.Err)
+	}
+	version := store.latest.BlockNumber
+
+	for i := 0; i < 3; i++ {
+		src.advance()
+	}
+	if r := s.Cycle(context.Background()); r.Err != nil || r.Action != ActionExtend {
+		t.Fatalf("empty scan: action %q (%s), err %v", r.Action, r.Reason, r.Err)
+	}
+
+	for b := version + 1; b <= version+3; b++ {
+		src.forkAt(b)
+	}
+	src.events[version+2] = true
+	src.advance()
+	r := s.Cycle(context.Background())
+	if r.Err != nil || r.Action != ActionRebuild {
+		t.Fatalf("after the reorg: action %q (%s), err %v; want a rebuild for the event at %d",
+			r.Action, r.Reason, r.Err, version+2)
+	}
 }
 
 // A version orphaned while the writer was down is rolled back on the first cycle back, though final.

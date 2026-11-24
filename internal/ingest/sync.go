@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"math/rand/v2"
 	"runtime/debug"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -28,6 +29,9 @@ type Syncer struct {
 	// modules' operators unread does not move it, so the next scan still covers its blocks. Not
 	// persisted: a restart scans from the version's block.
 	scannedTo int64
+	// scannedHash is the hash at scannedTo: blocks above the version can be replaced by a reorg the
+	// version survives, and an empty scan of them then vouches for nothing.
+	scannedHash string
 
 	// sourceChange is kept until a rebuild publishes: the source reports a change once, and a failed
 	// rebuild must not lose it.
@@ -46,9 +50,11 @@ type Syncer struct {
 	// confirmedHash: the version the last reorg probe found on chain; finalHash: one known on chain at or
 	// below finality. In memory only, so a restart probes again.
 	confirmedHash, finalHash string
-	// auditedAt is the block of the last rebuild that read every key from the chain. Not persisted: a
-	// restart starts it at the published version, as the block-gap rule always counted from there.
+	// auditedAt is the block of the last rebuild that read every key from the chain, loaded from the
+	// published version on start.
 	auditedAt int64
+	// holdSettled: this process has decided whether readers wait for an overdue full read.
+	holdSettled bool
 
 	now func() time.Time
 	// wait sleeps between cycles; tests replace it to record the schedule.
@@ -286,7 +292,16 @@ func (s *Syncer) Cycle(ctx context.Context) (result CycleResult) {
 	result.VersionBlock = latest.BlockNumber
 	result.VersionTimestamp = latest.Timestamp
 	if s.auditedAt == 0 {
-		s.auditedAt = latest.BlockNumber
+		s.auditedAt = latest.AuditedBlock
+		if s.auditedAt == 0 {
+			s.auditedAt = latest.BlockNumber
+		}
+	}
+	if !s.holdSettled {
+		if err := s.settleHold(ctx, readAt.BlockNumber, latest.BlockNumber); err != nil {
+			result.Err = err
+			return result
+		}
 	}
 
 	// Head behind the published version: a rolled-back node or a lagging replica. Wait, don't undo it.
@@ -345,7 +360,7 @@ func (s *Syncer) Cycle(ctx context.Context) (result CycleResult) {
 			"rows_dropped", rolled.Dropped, "rows_reopened", rolled.Reopened)
 		result.ReorgFrom = forkPoint
 
-		s.scannedTo = 0
+		s.scannedTo, s.scannedHash = 0, ""
 		s.routerFields = nil
 
 		// Decide against the survivor: a one-block fork that changed nothing costs no key reads, where an
@@ -375,10 +390,22 @@ func (s *Syncer) Cycle(ctx context.Context) (result CycleResult) {
 		}
 	}
 
+	// A version built at head while finality was unknown: a finalized block below it confirms nothing,
+	// and relabelling the version with that block would date its rows too early. Probed above meanwhile.
+	if readAt.BlockNumber < latest.BlockNumber {
+		result.Action = ActionExtend
+		result.HeadTimestamp = 0
+		result.Reason = fmt.Sprintf("finalized block %d is below the version %d, waiting",
+			readAt.BlockNumber, latest.BlockNumber)
+		s.log.Debug("waiting for finality to reach the version", "finalized", readAt.BlockNumber,
+			"version", latest.BlockNumber)
+		return result
+	}
+
 	// Without a mark (a restart, a rollback) the version's block is the floor, fixed now: a rebuild on
 	// this cycle that reads no operators moves the version, and must not move the floor with it.
 	if s.scannedTo == 0 {
-		s.scannedTo = latest.BlockNumber
+		s.scannedTo, s.scannedHash = latest.BlockNumber, latest.BlockHash
 	}
 	s.loadRouterFields(ctx, *latest)
 	state := HeadState{
@@ -407,6 +434,7 @@ func (s *Syncer) Cycle(ctx context.Context) (result CycleResult) {
 			"last_scan", s.lastScanAt, "epoch", s.cfg.EpochDuration.String())
 	} else if decision.Action == ActionExtend {
 		s.lastScanAt = s.now()
+		s.checkScanMark(ctx, *latest)
 		from := s.scanFloor(latest.BlockNumber)
 		state.OperatorEvents, err = s.operatorEvents(ctx, modules, from, head.BlockNumber)
 		switch {
@@ -419,7 +447,7 @@ func (s *Syncer) Cycle(ctx context.Context) (result CycleResult) {
 			s.log.Debug("operator events found, leaving the scan mark",
 				"from", from+1, "to", head.BlockNumber, "mark", s.scannedTo)
 		default:
-			s.scannedTo = head.BlockNumber
+			s.scannedTo, s.scannedHash = head.BlockNumber, head.BlockHash
 		}
 		decision = Evaluate(latest.AsVersion(), state, s.cfg.MaxBlockGap)
 	}
@@ -500,6 +528,15 @@ func (s *Syncer) rebuild(ctx context.Context, head model.ELBlockSnapshot, module
 	leftovers, err := s.leftovers(ctx, published)
 	if err != nil {
 		return err
+	}
+	// The loop below visits only modules the router lists. An attempt's rows for one it no longer lists
+	// (registered on a dropped branch) would be published as they are.
+	if gone := goneModules(leftovers, modules); len(gone) > 0 {
+		s.log.Warn("dropping an unfinished attempt: it wrote modules the router no longer lists", "modules", gone)
+		if _, err := s.store.SupersedeFrom(ctx, published+1); err != nil {
+			return err
+		}
+		leftovers = nil
 	}
 
 	build, err := s.store.Begin(ctx, head)
@@ -636,6 +673,13 @@ func (s *Syncer) rebuild(ctx context.Context, head model.ELBlockSnapshot, module
 		}
 	}
 
+	if marker, ok := build.(AuditMarker); ok {
+		audited := s.auditedAt
+		if everyKey {
+			audited = head.BlockNumber
+		}
+		marker.SetAuditedBlock(audited)
+	}
 	publishStarted := time.Now()
 	if err := build.Publish(ctx, "latest", finalized); err != nil {
 		return err
@@ -646,7 +690,9 @@ func (s *Syncer) rebuild(ctx context.Context, head model.ELBlockSnapshot, module
 		s.auditedAt = head.BlockNumber
 	}
 	if everyOperator {
-		s.scannedTo = max(s.scannedTo, head.BlockNumber)
+		if head.BlockNumber >= s.scannedTo {
+			s.scannedTo, s.scannedHash = head.BlockNumber, head.BlockHash
+		}
 	}
 	// Read at a final block: no reorg can take it, so no probe needs to vouch for it.
 	if finalized > 0 && head.BlockNumber <= finalized {
@@ -661,6 +707,26 @@ func (s *Syncer) rebuild(ctx context.Context, head model.ELBlockSnapshot, module
 	s.log.Info("version published",
 		"block", head.BlockNumber, "modules", len(modules),
 		"scoped_to", len(inScope), "keys_read", result.KeysStaged, "keys_changed", result.KeysChanged)
+	return nil
+}
+
+// settleHold: a writer that comes up with the full read overdue may have been down long enough that
+// the newest version is far behind, so readers get 425 until the full read publishes.
+func (s *Syncer) settleHold(ctx context.Context, block, version int64) error {
+	holder, ok := s.store.(ServingHold)
+	if !ok {
+		s.holdSettled = true
+		return nil
+	}
+	due := s.cfg.MaxBlockGap > 0 && block-s.auditedAt >= s.cfg.MaxBlockGap
+	if err := holder.Hold(ctx, due); err != nil {
+		return err
+	}
+	s.holdSettled = true
+	if due {
+		s.log.Warn("full read overdue on start: latest and finalized answer 425 until it publishes",
+			"audited_at", s.auditedAt, "version", version, "block", block, "limit", s.cfg.MaxBlockGap)
+	}
 	return nil
 }
 
@@ -691,6 +757,21 @@ func (s *Syncer) leftovers(ctx context.Context, published int64) (map[int32]Left
 		out[left.ModuleID] = left
 	}
 	return out, nil
+}
+
+func goneModules(leftovers map[int32]Leftover, modules []model.StakingModule) []int32 {
+	listed := make(map[int32]bool, len(modules))
+	for _, m := range modules {
+		listed[m.ID] = true
+	}
+	var gone []int32
+	for id := range leftovers {
+		if !listed[id] {
+			gone = append(gone, id)
+		}
+	}
+	slices.Sort(gone)
+	return gone
 }
 
 // settledKeys is nil when either side cannot read or keep a prefix.
@@ -766,20 +847,15 @@ func (s *Syncer) detectReorg(ctx context.Context, latest StoredVersion) (bool, i
 		return false, 0, nil
 	}
 
-	versions, err := s.store.Recent(ctx, s.cfg.ReorgSearchDepth)
+	// Only served versions anchor: a superseded one matches again when the chain returns to its
+	// branch, and would keep the losing branch's version at the same height. Failed attempts and
+	// earlier rollbacks leave rows of that kind, which must not use up the search.
+	versions, err := s.store.Recent(ctx, latest.BlockNumber, s.cfg.ReorgSearchDepth)
 	if err != nil {
 		return true, latest.BlockNumber, err
 	}
 
 	for _, v := range versions {
-		if v.BlockNumber >= latest.BlockNumber {
-			continue
-		}
-		// Only served versions anchor: a superseded one matches again when the chain returns to its
-		// branch, and would keep the losing branch's version at the same height.
-		if v.Status != "published" && v.Status != "stale" {
-			continue
-		}
 		hash, err := s.source.BlockHashAt(ctx, v.BlockNumber)
 		if err != nil {
 			return true, latest.BlockNumber, err
@@ -789,11 +865,16 @@ func (s *Syncer) detectReorg(ctx context.Context, latest StoredVersion) (bool, i
 		}
 	}
 
+	// Every served version is off chain. With the search cut short, older ones went unchecked: they go
+	// too, rather than becoming the survivor.
 	oldest := latest.BlockNumber
 	if len(versions) > 0 {
 		oldest = versions[len(versions)-1].BlockNumber
 	}
-	s.log.Warn("reorg deeper than the retained window", "oldest_version", oldest)
+	if len(versions) == s.cfg.ReorgSearchDepth {
+		oldest = 0
+	}
+	s.log.Warn("no served version is on chain, rebuilding from scratch", "searched", len(versions), "from", oldest)
 	return true, oldest, nil
 }
 
@@ -849,6 +930,23 @@ func (s *Syncer) dueForEpochRead(last time.Time) bool {
 		return true
 	}
 	return s.now().Sub(last) >= s.cfg.EpochDuration
+}
+
+// checkScanMark costs one block read per scan, and only while the mark is above the version: the
+// reorg probe already vouches for the version's own block.
+func (s *Syncer) checkScanMark(ctx context.Context, latest StoredVersion) {
+	_, grouped := s.source.(source.GroupedOperatorWatcher)
+	_, single := s.source.(source.OperatorWatcher)
+	if s.scannedTo <= latest.BlockNumber || !grouped && !single {
+		return
+	}
+	hash, err := s.source.BlockHashAt(ctx, s.scannedTo)
+	if err == nil && hash != "" && sameHash(hash, s.scannedHash) {
+		return
+	}
+	s.log.Info("the scan mark is not on chain, scanning from the version",
+		"mark", s.scannedTo, "version", latest.BlockNumber, "err", err)
+	s.scannedTo, s.scannedHash = latest.BlockNumber, latest.BlockHash
 }
 
 // scanFloor is not the version's block once a mark exists: a rebuild scoped to other modules moves
