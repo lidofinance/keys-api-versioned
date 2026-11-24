@@ -19,23 +19,22 @@ type KeyCursor struct {
 	ModuleID      int32
 	OperatorIndex int32
 	KeyIndex      int32
-	// Hash tells apart two versions a reorg left at one height. Empty in cursors issued before it,
-	// which resume by height.
+	// Hash tells apart two versions a reorg left at one height.
 	Hash string
 }
 
 // String is readable rather than opaque, so a stuck consumer's position is visible.
 func (c KeyCursor) String() string {
-	s := fmt.Sprintf("%d.%d.%d.%d", c.Block, c.ModuleID, c.OperatorIndex, c.KeyIndex)
-	if c.Hash != "" {
-		s += "." + c.Hash
-	}
-	return s
+	return fmt.Sprintf("%d.%d.%d.%d.%s", c.Block, c.ModuleID, c.OperatorIndex, c.KeyIndex, c.Hash)
 }
 
 func ParseKeyCursor(s string) (KeyCursor, error) {
 	parts := strings.Split(s, ".")
-	if len(parts) != 4 && len(parts) != 5 {
+	// Resumed by height, it would continue on whichever branch a reorg left there.
+	if len(parts) == 4 {
+		return KeyCursor{}, fmt.Errorf("cursor %q names no version hash: it predates them, start the walk again", s)
+	}
+	if len(parts) != 5 {
 		return KeyCursor{}, fmt.Errorf("cursor must be block.module.operator.index.hash, got %q", s)
 	}
 	var (
@@ -57,12 +56,10 @@ func ParseKeyCursor(s string) (KeyCursor, error) {
 	c.ModuleID = int32(values[1])
 	c.OperatorIndex = int32(values[2])
 	c.KeyIndex = int32(values[3])
-	if len(parts) == 5 {
-		if !isBlockHash(parts[4]) {
-			return KeyCursor{}, fmt.Errorf("cursor part 5 is not a block hash: %q", parts[4])
-		}
-		c.Hash = strings.ToLower(parts[4])
+	if !isBlockHash(parts[4]) {
+		return KeyCursor{}, fmt.Errorf("cursor part 5 is not a block hash: %q", parts[4])
 	}
+	c.Hash = strings.ToLower(parts[4])
 	return c, nil
 }
 

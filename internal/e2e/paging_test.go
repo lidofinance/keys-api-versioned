@@ -121,7 +121,7 @@ func TestACursorNamingAnUnknownVersion(t *testing.T) {
 
 	srv := testpg.NewServer(t, db.Reader(t, "latest", 2))
 
-	cursor := fmt.Sprintf("%d.1.0.0", db.Block(999))
+	cursor := fmt.Sprintf("%d.1.0.0.%s", db.Block(999), testreg.HashAt(db.Block(999)))
 	resp := srv.Get(t, "/ext/v1/keys?limit=10&cursor="+cursor)
 	defer resp.Body.Close()
 

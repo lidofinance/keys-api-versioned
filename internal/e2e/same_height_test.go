@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strings"
 	"testing"
 
 	"github.com/lidofinance/keys-api-versioned/internal/model"
@@ -178,5 +179,21 @@ func TestAClientGoneAfterTheLastReadDoesNotFailTheResponse(t *testing.T) {
 	})
 	if err != nil {
 		t.Fatalf("snapshot returned %v after its last read, want nil", err)
+	}
+}
+
+// A cursor without the version hash would resume by height, on the replacement branch after the reorg
+// above: it answers 400 and tells the consumer to start again.
+func TestAHashlessCursorAnswers400(t *testing.T) {
+	db := testpg.New(t)
+	spec := testreg.Spec{Modules: 2, OperatorsPerModule: 1, KeysPerOperator: 4}
+	sameHeightReorg(t, db, spec, nil)
+	srv := testpg.NewServer(t, db.Reader(t, "latest", 3))
+
+	resp := srv.Get(t, fmt.Sprintf("/ext/v1/keys?cursor=%d.1.0.1", db.Block(1)))
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest || !strings.Contains(string(body), "start the walk again") {
+		t.Errorf("hashless cursor: status %d, body %s; want 400 telling the consumer to restart", resp.StatusCode, body)
 	}
 }
