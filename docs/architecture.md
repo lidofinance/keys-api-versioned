@@ -103,6 +103,8 @@ Over block ranges this is two predicates rather than a comparison of two dumps: 
 
 ## Pointing consumers at it
 
+Every known consumer, what it reads and what it checks is in [migrating-from-canonical.md](migrating-from-canonical.md). Two examples:
+
 `ethereum-validators-monitoring` reads `/v1/keys?used=true`, `/v1/operators`, `/v1/modules` and `/v1/status`:
 
 ```
@@ -135,7 +137,7 @@ With no chain at all, from a registry file — up in a second, and it exercises 
 docker compose --profile static up -d --build keys-api-static
 ```
 
-Environment variables are listed at the top of `cmd/keys-api/main.go`; the names that exist in the canonical service are reused. `KEYS_API_MODE=server` serves without syncing and `KEYS_API_MODE=ingest` syncs without serving, so several read replicas can sit behind one writer. Running more than one writer on a schema is safe: one holds the writer lock and the others wait. A writer whose lock session died cannot commit once another has taken over (`writer_fence`), and it exits instead of queueing behind it.
+Environment variables are listed in [operations.md](operations.md#configuration); the names that exist in the canonical service are reused. `KEYS_API_MODE=server` serves without syncing and `KEYS_API_MODE=ingest` syncs without serving, so several read replicas can sit behind one writer. Running more than one writer on a schema is safe: one holds the writer lock and the others wait. A writer whose lock session died cannot commit once another has taken over (`writer_fence`), and it exits instead of queueing behind it.
 
 `/metrics` carries the sync and request series. The one to alert on is `keys_api_confirmed_age_seconds` — how long since a cycle last confirmed the version against the chain — which rises whether the cause is a stalled node, a failing rebuild or a dead writer. It is taken at scrape time, so it keeps climbing while cycles fail, and reads 0 on a process that has not held the writer lock. Do not alert on `keys_api_published_version_age_seconds`: that is how old the *data* is, and it legitimately climbs whenever the registry is quiet.
 
