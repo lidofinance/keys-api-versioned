@@ -30,7 +30,6 @@ The council daemon's `docker-compose.yml` runs the canonical image with its own 
 | Throttling, CORS | `GLOBAL_THROTTLE_*`, `CORS_WHITELIST_REGEXP` | none: a browser origin or a rate limit has to come from the ingress |
 | Extra response headers | | `X-Ignored-Parameters` when a request sends `snapshot`, `limit` or `cursor` to `/v1`; `X-Snapshot-Stale: true` while a rebuild replaces a version known to be behind |
 | Error status codes | | identical across the 21 cases `cmd/diff -errors` checks |
-| `POST …/keys/find` with an empty or non-JSON body, or `pubkeys` not an array | `Body cannot be empty…`, `Body is not valid JSON…`, or all three field messages | `pubkeys must be an array`; same status, different body |
 
 Everything this service adds — pinned versions, paging, diffs, operator groups — is under `/ext/v1` and only there; the README's "Two surfaces" section describes it.
 
@@ -41,6 +40,7 @@ Last compared on 2026-11-27: `main` against keys-api.lido.fi (6.0.0) on mainnet.
 - `/v1/keys` (all, `used=true`, `operatorIndex=1`), `/v1/modules`, `/v1/modules/1`, `/v1/modules/1/keys`, `/v1/modules/keys`, `/v1/operators`, `/v1/modules/1/operators`: equal.
 - `/v1/status`: differs only in `clBlockSnapshot`.
 - `/v2/modules/operators/keys`: 526,397 records on each side at the same block, equal within every module and in the same order; only the order of modules differs.
-- `cmd/diff -errors`: status codes equal in 21 of 21 cases; bodies differ only for the malformed `find` bodies in the table above.
+- `cmd/diff -errors`: status codes equal in 21 of 21 cases.
+- `POST …/keys/find`: the same body on both routes for 58 malformed or unusual bodies and content types; `internal/api/findbody_test.go` pins them.
 
 Run the same comparison against each new canonical release before moving `ContractVersion`.

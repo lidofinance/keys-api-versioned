@@ -133,7 +133,7 @@ And one systematic difference the run surfaced that no single case is about: **e
 
 Also confirmed, because the whole `/ext/v1` split rests on it: the canonical service really does ignore a query parameter it does not declare — `?limit=3`, `?snapshot=12345` and `?nonsense=1` all answer 200 there, which is why `/v1` ignores ours instead of answering 400.
 
-`POST …/keys/find` bodies are capped at 1 MiB, Fastify's default and so the canonical service's, and an oversized one gets its answer: 413 `{"statusCode":413,"message":"Request body is too large"}`. The per-module route validates the list exactly like the global one (it used to drop malformed keys silently and answer an empty list with 200).
+`POST …/keys/find` bodies are capped at 1 MiB, Fastify's default and so the canonical service's, and an oversized one gets its answer: 413 `{"statusCode":413,"message":"Request body is too large"}`. The per-module route validates the list exactly like the global one (it used to drop malformed keys silently and answer an empty list with 200). A malformed body gets the canonical answer as well: Fastify's own message for an empty or invalid JSON body, 415 for a media type it has no parser for, and class-validator's messages for whatever parses; `internal/api/findbody_test.go` pins each case.
 
 The expectations are pinned hermetically in `internal/e2e/surface_test.go`, so they hold without a canonical service running; the live run is what discovers a new one.
 

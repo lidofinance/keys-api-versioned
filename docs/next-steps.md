@@ -40,7 +40,6 @@ The security and weakness review of November 2026 is closed except for the items
 
 The service replaces `lido-keys-api` and goes to that service's owners; oracle operators and guardians will run it themselves. Not done yet:
 
-- **Malformed `find` bodies.** Canonical 6.0.0 answers an empty body and invalid JSON with Fastify's own messages (`Body cannot be empty when content-type is set to 'application/json'`, `Body is not valid JSON but content-type is set to 'application/json'`) and a non-array `pubkeys` with all three field messages; this service answers `pubkeys must be an array` to all of them. Same 400, different body. `cmd/diff -errors` compares status codes only.
 - **A public image and a release process.** CI pushes to Lido's internal registry only; third parties pull canonical from Docker Hub by the digest on docs.lido.fi. The build still calls itself `0.1.0-poc` (`cmd/keys-api/main.go`, `info.version` in `openapi.yaml`), there are no tags and no changelog.
 - **Ownership in the repository**: `CODEOWNERS`, and where to report a vulnerability.
 - **Validator ejector.** It reads the exit routes, which answer 500 here; node operators running it need the canonical service until it is retired or the routes are built.
