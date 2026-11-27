@@ -1,10 +1,13 @@
 # keys-api-versioned
 
-A Keys API written in Go that keeps the registry as **published versions** in its own Postgres schema, plus a stand that runs it next to the canonical `lido-keys-api` on the same chain so the two can be compared.
+A Keys API written in Go that keeps the registry as **published versions** in its own Postgres schema. It replaces the canonical `lido-keys-api`: `/v1` and `/v2` are byte-identical to it, framing whitespace included, apart from the differences listed in [docs/migrating-from-canonical.md](docs/migrating-from-canonical.md), so moving a consumer is a URL change. A stand runs the two side by side on one chain so they can be compared.
 
-It is meant to be droppable under `ethereum-validators-monitoring` and `lido-mev-monitoring`: the endpoints they call are implemented, and responses are byte-identical to the canonical service, framing whitespace included. Pointing one of them here is a URL change.
-
-How it is put together — the source seam, the schema, one cycle, paging and diffs — is in [docs/architecture.md](docs/architecture.md). Where the work stands and what comes next is in [docs/next-steps.md](docs/next-steps.md).
+| | |
+|---|---|
+| [docs/operations.md](docs/operations.md) | deploying it: requirements, every variable, the canonical-to-here mapping, upgrades, what to alert on |
+| [docs/migrating-from-canonical.md](docs/migrating-from-canonical.md) | which consumer reads what, and the differences a consumer can see |
+| [docs/architecture.md](docs/architecture.md) | how it is put together: the source seam, the schema, one cycle, paging and diffs |
+| [docs/next-steps.md](docs/next-steps.md) | what is not done |
 
 ## Running it
 
@@ -27,7 +30,7 @@ docker compose --profile static up -d --build keys-api-static
 
 It shares the database with the chain-fed service but writes schema `static_<chain id>`, so the demo registry never lands among the mainnet rows. A process refuses to start on a store another source has written.
 
-Ours listens on 3010, the canonical service on 3000. Environment variables are documented at the top of [cmd/keys-api/main.go](cmd/keys-api/main.go); the names the canonical service already uses are reused. `KEYS_API_MODE=server` serves without syncing and `KEYS_API_MODE=ingest` syncs without serving, so several read replicas can sit behind one writer. Running more than one writer on a schema is safe: one holds the writer lock and the others wait. A writer whose lock session died cannot commit once another has taken over (`writer_fence`), and it exits instead of queueing behind it.
+Ours listens on 3010, the canonical service on 3000. Environment variables are listed in [docs/operations.md](docs/operations.md#configuration); the names the canonical service already uses are reused. `KEYS_API_MODE=server` serves without syncing and `KEYS_API_MODE=ingest` syncs without serving, so several read replicas can sit behind one writer. Running more than one writer on a schema is safe: one holds the writer lock and the others wait. A writer whose lock session died cannot commit once another has taken over (`writer_fence`), and it exits instead of queueing behind it.
 
 Generate load from inside the compose network. Through a published port on Docker Desktop the host hop caps everything at ~188 MiB/s and every service looks identical.
 
@@ -130,13 +133,13 @@ And one systematic difference the run surfaced that no single case is about: **e
 
 Also confirmed, because the whole `/ext/v1` split rests on it: the canonical service really does ignore a query parameter it does not declare — `?limit=3`, `?snapshot=12345` and `?nonsense=1` all answer 200 there, which is why `/v1` ignores ours instead of answering 400.
 
-`POST …/keys/find` bodies are capped at 1 MiB, Fastify's default and so the canonical service's, and an oversized one gets its answer: 413 `{"statusCode":413,"message":"Request body is too large"}`. The per-module route validates the list exactly like the global one (it used to drop malformed keys silently and answer an empty list with 200).
+`POST …/keys/find` bodies are capped at 1 MiB, Fastify's default and so the canonical service's, and an oversized one gets its answer: 413 `{"statusCode":413,"message":"Request body is too large"}`. The per-module route validates the list exactly like the global one (it used to drop malformed keys silently and answer an empty list with 200). A malformed body gets the canonical answer as well: Fastify's own message for an empty or invalid JSON body, 415 for a media type it has no parser for, and class-validator's messages for whatever parses; `internal/api/findbody_test.go` pins each case.
 
 The expectations are pinned hermetically in `internal/e2e/surface_test.go`, so they hold without a canonical service running; the live run is what discovers a new one.
 
 Byte-identical covers the framing whitespace and the JSON property order of the canonical DTOs. Where the diff reports "equal ignoring key order", the row order out of Postgres differed between the two queries — neither service sorts, so consumers must not depend on order.
 
-Two differences are structural rather than accidental, and `-live` accounts for both. **Module order:** the canonical service returns modules in physical row order (1, 2, 4, 3 on mainnet) and this one sorts by id, so the runner sorts module, operator and grouped arrays before comparing — without that it read module 4 against module 3 and called every field wrong. **Per-module `lastChangedBlockHash`:** it cannot match by design, since there it moves on every re-read and here only when the module's content changed.
+Two differences are structural rather than accidental, and `-live` accounts for both. **Module order:** the canonical service returns modules in physical row order (3, 1, 2, 4, 5 on mainnet in November 2026) and this one sorts by id, so the runner sorts module, operator and grouped arrays before comparing — without that it read module 4 against module 3 and called every field wrong. **Per-module `lastChangedBlockHash`:** it cannot match by design, since there it moves on every re-read and here only when the module's content changed.
 
 One thing a live pair does show honestly: a module mid-deposit differs on its counters. CSM deposits every minute or two, its rebuild took about 70 s in a 1-CPU container, so this service sat one nonce behind on that module — two consecutive runs went `OK` then `FAIL .data[2].nonce: 5213 vs 5212`. That is lag, not disagreement; the key sets matched byte for byte in both runs. CSM's chain reads are now under 4 s rather than 51 s (see below), so what remains of the 70 s is the writer; whether the lag actually closes needs a fresh live-pair run.
 

@@ -34,14 +34,22 @@ The security and weakness review of November 2026 is closed except for the items
 - **Event logs for the incremental path.** `eth_getLogs` over a range returns key additions without per-operator calls; `used`/`vetted` are state, so calls still supply the rest. `eth_subscribe("logs")` could replace polling in steady state.
 - **Erigon against geth** for wide log ranges: only geth was measured.
 - **E8, a lean TypeScript baseline** (bare HTTP, streaming query, hand-rolled serializer) against the same seeded database, to settle the language question with a number. Threshold: within 3× of the Go p50 and under 100 MiB peak at 1 CPU / 512 MiB.
-- **Validator ingest** from the consensus layer is not built: the exit routes answer "registry disabled". No known consumer reads them — the council daemon and the oracle do not.
+- **Validator ingest** from the consensus layer is not built: the exit routes answer "registry disabled". Of the known consumers only the validator ejector reads them (see Handover); the council daemon and the oracle do not.
+
+## Handover
+
+The service replaces `lido-keys-api` and goes to that service's owners; oracle operators and guardians will run it themselves. Not done yet:
+
+- **A public image and a release process.** CI pushes to Lido's internal registry only; third parties pull canonical from Docker Hub by the digest on docs.lido.fi. The build still calls itself `0.1.0-poc` (`cmd/keys-api/main.go`, `info.version` in `openapi.yaml`), there are no tags and no changelog.
+- **Ownership in the repository**: `CODEOWNERS`, and where to report a vulnerability.
+- **Validator ejector.** It reads the exit routes, which answer 500 here; node operators running it need the canonical service until it is retired or the routes are built.
+- **Postgres 14**, which the council daemon's compose file runs, is not tested.
 
 ## Decisions that need a person
 
 - Where `safe` comes from: reorg depth in blocks, a CL justified checkpoint, or a configured lag. A CL endpoint would become a hard dependency.
 - How deep the retention window is, and who pays for the storage.
-- Whether the canonical service adopts published snapshots. It is a contract change on a protocol-critical service and belongs to its owners.
-- Whether this becomes a service we run for other consumers, which decides how far the extension surface goes.
+- How far the extension surface (`/ext/v1`) goes, now that this is the service everyone runs.
 
 ## Bringing the stand up
 
