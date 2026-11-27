@@ -638,7 +638,8 @@
               }
             ],
             "description": "Key of staking router module",
-            "nullable": true
+            "nullable": true,
+            "type": "object"
           },
           "meta": {
             "allOf": [
@@ -647,7 +648,8 @@
               }
             ],
             "description": "Meta",
-            "nullable": true
+            "nullable": true,
+            "type": "object"
           },
           "operator": {
             "allOf": [
@@ -656,7 +658,8 @@
               }
             ],
             "description": "Operator of staking router module",
-            "nullable": true
+            "nullable": true,
+            "type": "object"
           },
           "stakingModule": {
             "allOf": [
@@ -665,7 +668,8 @@
               }
             ],
             "description": "Staking Router module",
-            "nullable": true
+            "nullable": true,
+            "type": "object"
           }
         },
         "required": [
@@ -811,7 +815,8 @@
               }
             ],
             "description": "Consensus layer block information",
-            "nullable": true
+            "nullable": true,
+            "type": "object"
           },
           "elBlockSnapshot": {
             "allOf": [
@@ -820,7 +825,8 @@
               }
             ],
             "description": "Execution layer block information",
-            "nullable": true
+            "nullable": true,
+            "type": "object"
           }
         },
         "required": [
@@ -860,7 +866,7 @@
     "contact": {},
     "description": "",
     "title": "Lido Node Operators keys service",
-    "version": "5.0.0"
+    "version": "6.0.0"
   },
   "openapi": "3.0.0",
   "paths": {
