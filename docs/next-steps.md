@@ -4,7 +4,7 @@ Written to be picked up cold. Measurements and the reasoning behind decisions li
 
 ## State
 
-The service is `cmd/keys-api`: ingest plus API in one process (`KEYS_API_MODE=all`), or split into a writer (`ingest`) and any number of readers (`server`) over one Postgres. `/v1` and `/v2` are held byte-identical to canonical keys-api 5.0.0 by `cmd/diff` (`-live` for responses, `-errors` for the error surface, key order included); everything this service adds is under `/ext/v1`. A cold mainnet sync (525 488 keys, 5 modules) takes about 30 s against a hosted provider.
+The service is `cmd/keys-api`: ingest plus API in one process (`KEYS_API_MODE=all`), or split into a writer (`ingest`) and any number of readers (`server`) over one Postgres. `/v1` and `/v2` are held byte-identical to canonical keys-api 6.0.0 by `cmd/diff` (`-live` for responses, `-errors` for the error surface, key order included); everything this service adds is under `/ext/v1`. A cold mainnet sync (525 488 keys, 5 modules) takes about 30 s against a hosted provider.
 
 The security and weakness review of November 2026 is closed except for the items below.
 

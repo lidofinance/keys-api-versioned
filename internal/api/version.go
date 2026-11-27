@@ -4,4 +4,4 @@ package api
 // testdata/canonical-openapi.json. /v1/status reports it as appVersion, and consumers refuse a
 // service below their minimum: the council daemon wants 5.0.0 (semver), the oracle 1.5.0 (PEP 440,
 // which rejects suffixes such as "-poc").
-const ContractVersion = "5.0.0"
+const ContractVersion = "6.0.0"

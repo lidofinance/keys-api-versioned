@@ -12,7 +12,7 @@ import (
 	"github.com/lidofinance/keys-api-versioned/internal/ethaddr"
 )
 
-// Bodies of the 400s are what keys-api.lido.fi (5.0.0) answered on 2026-11-20. Where it answered
+// Bodies of the 400s are what keys-api.lido.fi answered: 5.0.0 on 2026-11-20, 6.0.0 the same on 2026-11-27. Where it answered
 // 200 or 404, the request passed validation, and a deployment without its registry answers the 500.
 func TestExitRoutesValidateLikeTheCanonicalServiceThenAnswerRegistryDisabled(t *testing.T) {
 	const disabled = `{"message":"Validators Registry is disabled. Check environment variables","error":"Internal Server Error","statusCode":500}`
