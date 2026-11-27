@@ -1,8 +1,6 @@
 package api
 
 import (
-	"encoding/json"
-	"errors"
 	"net/http"
 	"strconv"
 	"strings"
@@ -296,54 +294,6 @@ const maxFindBodyBytes = 1 << 20
 // One valid element is at least 101 bytes (a quoted pubkey and a comma), so under the body limit
 // this cap is never reached by valid input; it holds if the limit is raised.
 const maxFindPubkeys = maxFindBodyBytes/101 + 1
-
-// decodeFindBody validates like canonical's class-validator, reporting every failed constraint at
-// once; an empty list or wrong field used to answer 200 with no keys.
-func decodeFindBody(w http.ResponseWriter, r *http.Request) ([]string, bool) {
-	if r.ContentLength > maxFindBodyBytes {
-		bodyTooLarge(w)
-		return nil, false
-	}
-	var body struct {
-		Pubkeys *[]string `json:"pubkeys"`
-	}
-	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxFindBodyBytes)).Decode(&body); err != nil {
-		var tooLarge *http.MaxBytesError
-		if errors.As(err, &tooLarge) {
-			bodyTooLarge(w)
-			return nil, false
-		}
-		writeError(w, http.StatusBadRequest, []string{"pubkeys must be an array"})
-		return nil, false
-	}
-	if body.Pubkeys == nil {
-		// Missing or the wrong field name: every constraint on the field failed, and
-		// canonical reports all three.
-		writeError(w, http.StatusBadRequest, []string{
-			badPubkeyMessage,
-			"pubkeys must contain at least 1 elements",
-			"pubkeys must be an array",
-		})
-		return nil, false
-	}
-	pubkeys := *body.Pubkeys
-	if len(pubkeys) == 0 {
-		writeError(w, http.StatusBadRequest, []string{"pubkeys must contain at least 1 elements"})
-		return nil, false
-	}
-	for _, pubkey := range pubkeys {
-		// Case-sensitive prefix, as canonical's startsWith('0x').
-		if !validPubkey(pubkey) {
-			writeError(w, http.StatusBadRequest, []string{badPubkeyMessage})
-			return nil, false
-		}
-	}
-	if len(pubkeys) > maxFindPubkeys {
-		bodyTooLarge(w)
-		return nil, false
-	}
-	return pubkeys, true
-}
 
 // bodyTooLarge is what NestJS makes of Fastify's body-limit error.
 func bodyTooLarge(w http.ResponseWriter) {

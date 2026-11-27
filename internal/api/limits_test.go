@@ -164,6 +164,7 @@ func TestKeysFindRejectsAnOversizedBodyOnBothRoutes(t *testing.T) {
 			"chunked":       io.MultiReader(strings.NewReader(oversized)),
 		} {
 			req := httptest.NewRequest(http.MethodPost, path, body)
+			req.Header.Set("Content-Type", "application/json")
 			if name == "chunked" {
 				req.ContentLength = -1
 			}
@@ -191,11 +192,13 @@ func TestBothFindRoutesValidateTheSameWay(t *testing.T) {
 		{`{"pubkeys":["0x1234"]}`, http.StatusBadRequest, badPubkeyMessage},
 		{`{"pubkeys":[]}`, http.StatusBadRequest, "pubkeys must contain at least 1 elements"},
 		{`{"keys":["` + valid + `"]}`, http.StatusBadRequest, "pubkeys must be an array"},
-		{`not json`, http.StatusBadRequest, "pubkeys must be an array"},
+		{`not json`, http.StatusBadRequest, invalidJSONMessage},
 	} {
 		for _, path := range []string{"/v1/keys/find", "/v1/modules/1/keys/find"} {
+			req := httptest.NewRequest(http.MethodPost, path, strings.NewReader(tc.body))
+			req.Header.Set("Content-Type", "application/json")
 			rec := httptest.NewRecorder()
-			handler.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, path, strings.NewReader(tc.body)))
+			handler.ServeHTTP(rec, req)
 			if rec.Code != tc.status || !strings.Contains(rec.Body.String(), tc.want) {
 				t.Errorf("%s %.40s: got %d %s, want %d containing %q", path, tc.body, rec.Code, rec.Body.String(), tc.status, tc.want)
 			}
