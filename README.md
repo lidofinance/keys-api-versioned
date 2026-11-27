@@ -71,10 +71,11 @@ Not implemented: validator ingest from the consensus layer (the exit routes answ
 | `groupId` on an operator | node operator group from the module's `META_REGISTRY` |
 
 - The canonical `/v2` endpoint is mirrored as `/ext/v1/modules/operators/keys`; the `/v1`/`/v2` split does not carry over.
+- Checked on canonical: `?limit=3`, `?snapshot=12345` and `?nonsense=1` all answer 200 there.
 - `snapshot`, `limit` or `cursor` sent to `/v1` are ignored and named in `X-Ignored-Parameters`. A `400` would differ from canonical, and silence would hide that `?limit=100` streamed the whole 216 MiB dump.
 - `X-Snapshot-Stale: true` (both surfaces): the served version is known to be behind while a rebuild runs.
-- `groupId` exists only for `curated-onchain-v2`: absent where the module has no group registry, `null` for an operator in no group (`NO_GROUP_ID`, `0` on chain), a number otherwise. Mainnet module 4: 45 operators, 38 in 27 groups.
-- Default version: `/v1` and `/v2` serve `latest`, as canonical does (`KEYS_API_PIN`). `/ext/v1` serves `finalized` (`KEYS_API_EXT_PIN`), or `latest` when the source has no finality.
+- `groupId` exists only for `curated-onchain-v2`: absent where the module has no group registry, `null` for an operator in no group (`NO_GROUP_ID`, `0` on chain), a number otherwise. Mainnet module 4: 45 operators, 38 in 27 groups, 7 in none.
+- Default version: `/v1` and `/v2` serve `latest`, as canonical does (`KEYS_API_PIN`). `/ext/v1` serves `finalized` (`KEYS_API_EXT_PIN`), or `latest` when the source has no finality (there a `finalized` pin answers 501).
 - Not `/v3`: canonical versions per endpoint with NestJS URI versioning, so `/v3` belongs to its owners. `/ext/v1` cannot collide with it.
 
 Tests hold the boundary:
@@ -97,20 +98,24 @@ The store lives in schema `chain_<chain id>` (`chain_1`, `chain_560048`).
 
 Tracked canonical release: 6.0.0. Results of the latest run and the differences a consumer can see are in [docs/migrating-from-canonical.md](docs/migrating-from-canonical.md).
 
+- 6.0.0 released the `develop` fixes to operator names and change detection this service already carried (through `71fc5b3`); its OpenAPI document differs from 5.0.0 only in `type: object` next to six schema references. Since 4.0.1: `totalWithdrawnKeys` on every operator, the `invalidName<index>` placeholder for undecodable names, CMv2 renames from the `META_REGISTRY` event, `Cache-Control` on reads.
+- The first error-surface run, against 4.0.1 on Hoodi, agreed on 17 of 21; now 21 of 21. The four fixed: `GET /v1/keys/not-a-pubkey` (400 there, 404 here), `find` with `{"pubkeys":[]}` and with a wrong field name (400 there, 200 with no keys here), `POST /v1/keys` (404 there, 405 here). Every error body also lacked `error`.
+- Hoodi run after the read path rewrite: all eight endpoints equal, 37.1 MiB of `/v1/keys` on each side; module 5's 74 operators compared by hand, names included.
+
 - Contract: the canonical OpenAPI document as served by the mainnet deployment, in `internal/api/testdata/canonical-openapi.json`. `internal/api/canonical_spec_test.go` requires every canonical operation, parameter, status and field in `openapi.yaml` with a compatible type; deliberate gaps (the exit routes' 200/404/425, `clBlockSnapshot`) are listed with reasons, and a gap that closes fails the test. A weekly workflow compares the file with the deployment; `make canonical-spec` takes a new release.
 - `cmd/diff` fetches an endpoint from both services and compares the bodies. `-live` allows the two to be at different blocks and leaves out `meta` and per-module `lastChangedBlockHash`.
 - `cmd/diff -errors` compares 21 failing requests: bad references, pubkeys, parameters, bodies, methods, unrouted paths. Error bodies are `{message, error, statusCode}`; the 425 and 500 are `{statusCode, message}`, as canonical sends them.
-- `POST …/keys/find`: bodies over 1 MiB get 413, as Fastify's default. Malformed bodies get Fastify's and class-validator's answers; `internal/api/findbody_test.go` pins them.
+- `POST …/keys/find`: bodies over 1 MiB get 413, as Fastify's default. Malformed bodies get Fastify's answers (400 for empty or invalid JSON, 415 for a media type without a parser) and class-validator's messages; `internal/api/findbody_test.go` pins them.
 - Hermetic copies of these expectations are in `internal/e2e/surface_test.go`, so they hold without a canonical service.
-- In `-live`, a module mid-deposit (CSM deposits every minute or two) can be one nonce behind. That is lag; the key sets matched.
-- Pubkeys are not unique on chain. Hoodi's CSM has 9 repeated pubkeys, some under different operators with different `used`. Both services return all rows, so key a response by pubkey with care.
+- In `-live`, a module mid-deposit can be one nonce behind: CSM deposits every minute or two, and its rebuild took ~70 s in a 1-CPU container before read packing. Two consecutive runs went `OK`, then `FAIL .data[2].nonce: 5213 vs 5212`, with key sets equal in both.
+- Pubkeys are not unique on chain. Hoodi's CSM has 9 repeated pubkeys, 11 rows over the distinct count; six are shared between different operators with different `used`. Both services return all rows, so key a response by pubkey with care.
 
 ## Consistency while streaming
 
 A reader selects rows by validity range at its pinned block, so concurrent writes cannot change a response. Deletes can, and two mechanisms cover them:
 
-- Retention: a request holds a shared advisory lock on its version's block, and retention keeps everything at or above the oldest held one instead of waiting. A write that does not reach the socket in 30 s ends the request, so a stalled client gives the lease back; a request that finds the pool exhausted fails after 10 s. A long-held lease is logged.
-- Reorg: rollback deletes the losing branch's rows. Each per-module query in a response re-checks the version's status first. Before the first flush the answer is 409 with the new head; after it, the connection is aborted (`http.ErrAbortHandler`), so a cut-off dump never looks complete. The check is per module, so a rollback during module 1 (92 % of a mainnet dump) is noticed when module 2 starts; rows already streaming come from a portal opened before the delete.
+- Retention: a request holds a shared advisory lock on its version's block, and retention keeps everything at or above the oldest held one instead of waiting. A write that does not reach the socket in 30 s ends the request, so a stalled client gives the lease back; a request that finds the pool exhausted fails after 10 s. A long-held lease is logged. Before the lease, retention running inside a reader's snapshot made it stream 0 keys instead of 1.
+- Reorg: rollback deletes the losing branch's rows. Each per-module query in a response re-checks the version's status first: one single-row select, four per mainnet dump. Before the first flush the answer is 409 with the new head; after it, the connection is aborted (`http.ErrAbortHandler`), so a cut-off dump never looks complete. The check is per module, so a rollback during module 1 (92 % of a mainnet dump) is noticed when module 2 starts; rows already streaming come from a portal opened before the delete.
 
 ## Measurements
 
@@ -122,6 +127,8 @@ Mainnet registry: 511 877 keys, 731 operators, 4 modules, 216.7 MiB per dump.
 |---|---|---|---|---|
 | canonical TS/NestJS | 7.29 s | 27.13 s | 54.6 s | 347–355 MiB |
 | this service | 288 ms | 1.01 s | 2.11 s | 24–37 MiB |
+
+20× sequentially, 27× at 4 concurrent. On an unconstrained laptop the gap is 11× / 19×: canonical needs several cores to hide its serialization cost.
 
 During a registry rewrite, which is most of the time in production:
 
@@ -139,19 +146,21 @@ Go gives 15×; published versions remove the slowdown under writes. That is why 
 
 | | now | before read packing |
 |---|---|---|
-| empty database to published version | 49 s | 2 m 28 s – 4 m 15 s |
+| empty database to published version | 49 s | 2 m 28 s – 4 m 15 s (107 s on the host) |
 | module 1: 471 732 keys, 39 operators | 40.5 s | 47 s |
 | module 2: 14 205 keys, 82 operators | 1.5 s | 8 s |
 | module 3 (CSM): 25 940 keys, 609 operators | 3.5 s keys, 2.3 s operators | 51 s |
 | module 4 (CMv2): 0 keys, 1 operator | 0.4 s | 0.5 s |
 | on disk | keys 105 MB, key indexes 97 MB, database 211 MB | |
-| idle memory | 26 MiB | |
+| idle memory | 26 MiB of 512 | |
 | quiet cycle | 0.70 s mean | 0.81 s |
 
-- The node is the bottleneck. Module 1's chain read is 83 % of the sync; chain reads alone, with no database, took 49.6 s. Batch 100 / concurrency 8 cuts reads to 37.7 s.
-- One CPU is enough: a cold sync used 9.95 CPU-seconds with zero throttled periods out of 769.
+- The node is the bottleneck. Module 1's chain read is 83 % of the sync. Chain reads alone, with no database, took 49.6 s in one run against a 49.0 s full sync in another; module 1 alone came back at 40.5, 43.4 and 46.4 s in three runs an hour apart. The writer costs single-digit seconds at most.
+- Batch 100 / concurrency 8 cuts chain reads to 37.7 s. A read-only run at those settings (37 s) against a throttled 58 s sync once looked like a Postgres bottleneck; the gap was the throttling.
+- One CPU is enough: a cold sync used 9.95 CPU-seconds with zero throttled periods out of 769, about 6 % average and 0.3 of a core at peak. Cold syncs at 2 and 4 CPU took 210 s and 72 s, a 1-CPU control minutes later 165 s: wall clock measured the node.
 - The shared node drifted 3–4× within an afternoon (module 1 between 40.5 s and 193 s on the same code). Compare only runs taken together.
-- Hoodi (5 modules, 87 717 keys, Sandbox and CMv2 with keys): empty database to published version in 14 s.
+- Before packing, sync time followed round trips, not keys: CSM's 26 000 keys over 609 operators took 51 s, module 1's 472 000 over 39 operators 47 s.
+- Hoodi (5 modules, 87 717 keys, 41 + 5 + 4 + 467 + 74 operators, Sandbox and CMv2 with keys): chain reads 13.6 s, empty database to published version 14 s.
 
 ### Read packing
 
@@ -160,8 +169,17 @@ Key reads are packed across operators into a JSON-RPC batch or one `Multicall3.a
 | | CSM: 25 940 keys, 609 operators | all modules: 511 877 keys |
 |---|---|---|
 | one read per request | 58.2 s, 606 requests | — |
-| JSON-RPC batches | 3.8 s, 29 requests | 39.2 s, 273 requests |
-| Multicall3 | 3.7 s, 44 requests | 37.7 s, 306 requests |
+| JSON-RPC batches | 3.8 s, 29 requests | 39.2 s, 273 requests, 9.5 calls per request |
+| Multicall3 | 3.7 s, 44 requests | 37.7 s, 306 requests, 8.5 calls per request |
+
+Module 1 barely moves (33.2 s against 30.9 s): it is bound by execution on the node, about 0.5 s per 1100-key read. At the stand's batch of 40, Multicall3 takes CSM from 5.78 s / 53 requests to 4.44 s / 35.
+
+Hosted provider whose free plan refuses batches over 3, module 2 (14 205 keys), concurrency 2:
+
+| | |
+|---|---|
+| no aggregation, batch capped at 3 | 8.96 s, 86 requests, 2.8 calls per request |
+| Multicall3 | 2.50 s, 18 requests, 10.7 calls per request |
 
 Hoodi CSM, 1386 calls, by batch cap:
 
@@ -172,12 +190,12 @@ Hoodi CSM, 1386 calls, by batch cap:
 
 - With a node of our own, batching is the whole win. Aggregating calls that fit one batch is slightly slower (0.99 s against 0.87 s per quiet cycle), so by default the client aggregates only when the plain path needs more than one request.
 - `PROVIDER_METERED=true` (the default) aggregates every multi-call read: a hosted provider bills each call inside a batch, so a quiet cycle drops from 11 billed calls to 2. Forgetting it on a hosted provider empties a daily quota in hours; leaving it on against an own node costs 120 ms. A stand with its own node sets it to `false`.
-- Calls in one aggregate share one `eth_call` gas budget, so aggregates are sized by keys returned (`Call.Cost`), not by call count. Two 1100-key reads in one aggregate run out of gas on mainnet geth.
+- Calls in one aggregate share one `eth_call` gas budget, so aggregates are sized by keys returned (`Call.Cost`), not by call count. Two 1100-key reads in one aggregate run out of gas on mainnet geth; 200 one-key reads are fine. Sizing by count bisected every module 1 group and carried the lowered cap into CSM, turning 22 requests into 908.
 - A refused aggregate (`out of gas`, a response size limit) is bisected and the budget lowered. Transport errors, non-2xx and unrecognised errors do not shrink it. Three refusals of a single read in ten minutes pause aggregation for 30 minutes. `PROVIDER_MULTICALL=false` turns it off.
 
 ### Provider failover
 
-`PROVIDERS_URLS` is a fallback list. Hosted providers report quota errors inside a 200 OK, so the client classifies each error by whether another endpoint would answer differently (`internal/eth/rpcerror.go`):
+`PROVIDERS_URLS` is a fallback list. Hosted providers report quota errors inside a 200 OK; when failover reacted only to transport errors, one exhausted key stopped ingest for a day with a healthy endpoint next in the list. So the client classifies each error by whether another endpoint would answer differently (`internal/eth/rpcerror.go`):
 
 | Next endpoint | Return the error |
 |---|---|
@@ -204,7 +222,7 @@ Four mainnet modules, nothing changed. Counted by `keys_api_rpc_requests_total{m
 | total | 6; 1 if the head has not moved | ~25; 1 if the head has not moved |
 
 - An unchanged head stops the cycle after one request, as canonical does, so cost follows blocks, not polls.
-- The finalized block and the operator-event scan are paced by the epoch (`SECONDS_PER_SLOT × SLOTS_PER_EPOCH`); a fresh process reads both on its first cycle.
+- The finalized block and the operator-event scan are paced by the epoch (`SECONDS_PER_SLOT × SLOTS_PER_EPOCH`, 12 × 32 by default); a fresh process reads both on its first cycle.
 - The event scan covers only blocks since operators were last known current, and runs only when cheaper signals show no change.
 - Locator and router contract version are re-read every cycle inside the module-set request. A change bumps `keys_api_staking_router_changes_total` / `keys_api_staking_router_contract_version` and rewrites module rows, not keys.
 - `eth_getBlockByHash` for the head timestamp is still there and removable.
@@ -245,7 +263,7 @@ Pubkeys and signatures as `bytea`, a two-byte module id instead of the address:
 | dump, p50 at 4 concurrent | 1.11 s | 1.53 s |
 | peak container memory | 27 MiB | 17 MiB |
 
-Encoding is free sequentially and costs ~37 % when one CPU serves four dumps; paging and diffs remove that workload.
+Encoding is free sequentially (estimated at +15–25 %; half the bytes travel from Postgres) and costs ~37 % when one CPU serves four dumps; paging and diffs remove that workload.
 
 ## Findings for the canonical service
 

@@ -39,7 +39,7 @@ Four tables, created on boot from `internal/ingest/schema.sql`.
 where from_block <= :block and (to_block is null or to_block > :block)
 ```
 
-A new version writes only what moved and inherits the rest. A version stamp per row would mean a full copy, ~100 MB per version on mainnet. On the static fixture, a cold build wrote 33 key rows for 33 keys, and the next version, one key added, wrote 1 row.
+A new version writes only what moved and inherits the rest. A version stamp per row would mean a full copy, ~100 MB per version on mainnet. On the static fixture, a cold build wrote 33 key rows for 33 keys, and the next version, one key added to one module, read 19 keys and wrote 1 row.
 
 `versions` holds what the data tables cannot say:
 
